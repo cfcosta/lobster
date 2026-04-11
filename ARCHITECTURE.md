@@ -185,6 +185,17 @@ It stores:
 - deterministic replay-friendly persistence
 - suitable for append-heavy event capture and typed records
 
+### Write-coordinator policy
+
+`redb` is concurrent-reader / single-writer. Only one `WriteTransaction` can be active at a time (`begin_write` blocks until the previous one commits or aborts). Since Lobster wants raw-event appends, episode finalization, artifact persistence, retry bookkeeping, and status updates all in one binary, writes must be carefully coordinated:
+
+1. **Keep write transactions very short.** Never hold a `redb` write transaction across model inference, Grafeo projection, or network I/O.
+2. **Funnel nontrivial writes through a dedicated writer task** in the long-lived MCP process. Other components (hook handlers, embedding workers, extraction workers) send write requests to this task via a channel.
+3. **Batch related writes into a single transaction** where possible (e.g., episode finalization: persist episode shell + summary artifact + decision records in one transaction, then release the lock before starting Grafeo projection).
+4. **Short-lived hook invocations** should only append raw events. They must not attempt long write transactions that could block other hooks.
+
+If the writer task is not running (e.g., no long-lived MCP process), short-lived hook invocations acquire the write lock briefly for event appends only, under the same repo-local lease and wall-clock budget defined for background maintenance.
+
 ### Canonical rule
 
 If Grafeo or any retrieval index is lost, Lobster must be able to rebuild semantic state from `redb`.
@@ -261,6 +272,23 @@ In v1 it should embed mainly:
 `pylate-rs` is an inference runtime, not a full retrieval architecture by itself.
 
 For v1, that is acceptable because Lobster retrieves over distilled artifacts, not raw full-history spans. A dedicated late-interaction code index can be added later as an optional subsystem.
+
+### Model ownership rule
+
+`ColBERT::encode()` takes `&mut self`, so a single global model instance cannot serve concurrent ingestion-time embedding and retrieval-time reranking. Lobster must define explicit model ownership:
+
+- one model instance per embedding/rerank worker, or a bounded pool keyed by backend/device
+- the long-lived MCP process owns the pool; short-lived hook invocations do not load models
+- CPU is the canonical fixture/determinism baseline; GPU backends are opt-in performance modes
+
+### Proxy-vector reduction rule
+
+The architecture requires a "pooled single-vector proxy" for each distilled artifact, but the reduction from PyLate per-token embeddings to a single vector must be explicitly defined and frozen for determinism:
+
+- v1 reduction: mean-pool all non-padding token embeddings from the PyLate encoder output into a single vector
+- the reduction function is versioned alongside the embedding model revision
+- the reduced vector dimensions must match what Grafeo's HNSW index expects
+- fixture tests must verify that the same input produces the same proxy vector per Lobster release
 
 ### Explicit v1 retrieval contract
 
@@ -472,13 +500,19 @@ Target sub-second total processing for common finalized episodes, but never at t
 
 Summarization should use the same architectural discipline as extraction.
 
-Use a swappable interface:
+Use a swappable async interface:
 
 ```rust
-trait Summarizer {
-    fn summarize(&self, input: SummaryInput) -> Result<SummaryArtifact, SummaryError>;
+trait Summarizer: Send + Sync {
+    async fn summarize(&self, input: SummaryInput) -> Result<SummaryArtifact, SummaryError>;
 }
 ```
+
+### Why async
+
+The primary summarizer implementation wraps `rig-core`, which is Tokio-based. Synchronous trait signatures would force `block_on` calls into hook handling and MCP request paths. Making the trait async from the start avoids that.
+
+`rig-core` is used **only** as an adapter for LLM calls (summarization and extraction). It does not own retrieval, vector stores, or the MCP surface. Those remain with Lobster's own Grafeo, PyLate, and `memory_*` contracts.
 
 Persist the accepted `SummaryArtifact` in `redb` with:
 
@@ -525,19 +559,24 @@ The extractor may reference existing decisions and emit graph relations around t
 
 Lobster should not hard-code a specific model backend into the architecture.
 
-Use a swappable interface:
+Use a swappable async interface:
 
 ```rust
-trait Extractor {
-    fn extract(&self, input: ExtractionInput) -> Result<ExtractionOutput, ExtractionError>;
+trait Extractor: Send + Sync {
+    async fn extract(&self, input: ExtractionInput) -> Result<ExtractionOutput, ExtractionError>;
 }
 ```
 
 Possible implementations:
 
 - deterministic heuristic extractor
+- `rig-core`-backed LLM extractor (using Rig's `Extractor` API for structured output)
 - Candle-backed local model extractor
 - future Qwen-compatible extractor
+
+### Rig-core scope constraint
+
+`rig-core` is an adapter for the model call only. It provides the prompt-to-structured-output path. Lobster does not use Rig's agents, dynamic context, vector stores, tools, or MCP features. Those capabilities overlap with Lobster's own stack and would dilute the redb/Grafeo/PyLate architecture.
 
 ## Required output shape
 
@@ -564,7 +603,15 @@ Example:
 
 ## Deterministic compiler
 
-Lobster compiles extractor output into a **tiny fixed insert/update template set** for Grafeo.
+Lobster compiles extractor output into typed graph mutations executed through **Grafeo's programmatic CRUD API** (`create_node`, `set_node_property`, `create_edge`, etc.), not through GQL query strings.
+
+### Why programmatic, not GQL
+
+Grafeo exposes a complete direct API for node/edge/property creation, sessions, and transactions. Since the extractor already emits typed facts, the cleanest deterministic compiler converts those facts into typed graph operations. This removes a whole class of string-assembly errors, makes the projection layer easier to fixture-test, and keeps the serialization format under Lobster's control.
+
+GQL is reserved for debugging, admin inspection, and read-side queries (e.g., `memory_neighbors` traversal). It is not used for projection writes.
+
+### Validation
 
 Validation must include:
 
@@ -987,9 +1034,10 @@ These are intentionally deferred.
 
 Lobster v1 is a **deterministic layered memory system** for Claude Code:
 
-- `redb` stores durable truth
-- `Grafeo` serves semantic memory
-- `pylate-rs` powers local semantic retrieval over distilled artifacts
+- `redb` stores durable truth, coordinated through a single-writer task
+- `Grafeo` serves semantic memory, projected via its programmatic CRUD API
+- `pylate-rs` powers local semantic retrieval over distilled artifacts, with pooled model ownership and a frozen proxy-vector reduction rule
+- `rig-core` adapts LLM calls for summarization and extraction only, behind async trait interfaces
 - extractors emit typed facts, not raw queries
 - hooks surface tiny high-confidence recall
 - MCP tools expose deep memory exploration
