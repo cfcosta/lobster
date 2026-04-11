@@ -2,5 +2,6 @@
 
 pub mod classifier;
 pub mod evidence;
+pub mod retrieval;
 pub mod route;
 pub mod scoring;
