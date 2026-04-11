@@ -3,3 +3,4 @@
 pub mod canon;
 pub mod ids;
 pub mod schema;
+pub mod tables;
