@@ -1,0 +1,263 @@
+//! Hook recall: query construction, retrieval, and output assembly.
+//!
+//! When a hook fires (e.g., `UserPromptSubmit`), this module:
+//! 1. Constructs a recall query from the hook context
+//! 2. Runs retrieval via the route execution pipeline
+//! 3. Expands evidence windows on results
+//! 4. Assembles a tiny output payload (1-3 items)
+
+use std::time::Instant;
+
+use grafeo::GrafeoDB;
+use redb::Database;
+use serde::Serialize;
+
+use crate::{
+    hooks::events::{HookEvent, HookType},
+    rank::{
+        evidence::{
+            DecisionEvidence,
+            SummaryEvidence,
+            expand_decision,
+            expand_summary,
+        },
+        routes::{RetrievalResult, execute_query},
+    },
+};
+
+/// Maximum items in automatic recall output.
+const MAX_RECALL_ITEMS: usize = 3;
+
+/// Maximum time budget for hook recall in milliseconds.
+const RECALL_BUDGET_MS: u128 = 500;
+
+/// The recall output payload returned to Claude Code.
+#[derive(Debug, Clone, Serialize)]
+pub struct RecallPayload {
+    pub items: Vec<RecallItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<bool>,
+    pub latency_ms: u64,
+}
+
+/// A single recall item.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type")]
+pub enum RecallItem {
+    Decision(DecisionEvidence),
+    Summary(SummaryEvidence),
+    Hint { text: String },
+}
+
+/// Run the recall pipeline for a hook event.
+///
+/// Returns a JSON-serializable payload with 0-3 high-confidence
+/// recall items. Returns empty payload if no relevant memories
+/// found or if the latency budget is exceeded.
+#[must_use]
+pub fn run_recall(
+    event: &HookEvent,
+    db: &Database,
+    grafeo: &GrafeoDB,
+) -> RecallPayload {
+    let start = Instant::now();
+
+    // Construct query from hook context
+    let Some(query) = construct_query(event) else {
+        return RecallPayload {
+            items: vec![],
+            truncated: None,
+            latency_ms: 0,
+        };
+    };
+
+    // Execute retrieval
+    let results = execute_query(&query, db, grafeo, false);
+
+    // Check latency budget
+    let elapsed = start.elapsed().as_millis();
+    if elapsed > RECALL_BUDGET_MS {
+        tracing::warn!(
+            elapsed_ms = elapsed,
+            budget_ms = RECALL_BUDGET_MS,
+            "recall exceeded latency budget"
+        );
+        return RecallPayload {
+            items: vec![],
+            truncated: Some(true),
+            latency_ms: u64::try_from(elapsed).unwrap_or(u64::MAX),
+        };
+    }
+
+    // Assemble output payload
+    let items: Vec<RecallItem> = results
+        .iter()
+        .take(MAX_RECALL_ITEMS)
+        .map(result_to_item)
+        .collect();
+
+    let truncated = if results.len() > MAX_RECALL_ITEMS {
+        Some(true)
+    } else {
+        None
+    };
+
+    let latency_ms =
+        u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+    RecallPayload {
+        items,
+        truncated,
+        latency_ms,
+    }
+}
+
+/// Construct a recall query from hook context.
+///
+/// Returns `None` for hook types that don't need recall.
+#[must_use]
+pub fn construct_query(event: &HookEvent) -> Option<String> {
+    match event.hook_type {
+        HookType::UserPromptSubmit => event.user_prompt.clone(),
+        HookType::PostToolUse | HookType::PostToolUseFailure => {
+            // Use tool name as query context
+            event.tool_name.clone()
+        }
+        HookType::NotificationPost => None,
+    }
+}
+
+fn result_to_item(result: &RetrievalResult) -> RecallItem {
+    match result.artifact_type.as_str() {
+        "decision" => RecallItem::Decision(expand_decision(
+            "recalled decision",
+            "",
+            "unknown",
+            &[],
+            None,
+        )),
+        "summary" => RecallItem::Summary(expand_summary(
+            "recalled summary",
+            &result.episode_id.to_string(),
+            &[],
+        )),
+        _ => RecallItem::Hint {
+            text: format!(
+                "Related {} (score: {:.2})",
+                result.artifact_type, result.score
+            ),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{graph::db as grafeo_db, store::db};
+
+    fn make_prompt_event(prompt: &str) -> HookEvent {
+        HookEvent {
+            hook_type: HookType::UserPromptSubmit,
+            session_id: "test-session".into(),
+            tool_name: None,
+            tool_input: None,
+            tool_output: None,
+            user_prompt: Some(prompt.into()),
+            assistant_response: None,
+            working_directory: Some("/test".into()),
+            timestamp_ms: 1_700_000_000_000,
+        }
+    }
+
+    fn make_tool_event(tool: &str) -> HookEvent {
+        HookEvent {
+            hook_type: HookType::PostToolUse,
+            session_id: "test-session".into(),
+            tool_name: Some(tool.into()),
+            tool_input: None,
+            tool_output: None,
+            user_prompt: None,
+            assistant_response: None,
+            working_directory: Some("/test".into()),
+            timestamp_ms: 1_700_000_000_000,
+        }
+    }
+
+    #[test]
+    fn test_construct_query_from_prompt() {
+        let event = make_prompt_event("fix the auth bug");
+        let query = construct_query(&event);
+        assert_eq!(query.as_deref(), Some("fix the auth bug"));
+    }
+
+    #[test]
+    fn test_construct_query_from_tool() {
+        let event = make_tool_event("Write");
+        let query = construct_query(&event);
+        assert_eq!(query.as_deref(), Some("Write"));
+    }
+
+    #[test]
+    fn test_construct_query_notification_returns_none() {
+        let event = HookEvent {
+            hook_type: HookType::NotificationPost,
+            session_id: "test".into(),
+            tool_name: None,
+            tool_input: None,
+            tool_output: None,
+            user_prompt: None,
+            assistant_response: None,
+            working_directory: None,
+            timestamp_ms: 0,
+        };
+        assert!(construct_query(&event).is_none());
+    }
+
+    #[test]
+    fn test_run_recall_empty_db() {
+        let database = db::open_in_memory().unwrap();
+        let grafeo = grafeo_db::new_in_memory();
+        let event = make_prompt_event("test query");
+
+        let payload = run_recall(&event, &database, &grafeo);
+        assert!(payload.items.is_empty());
+        assert!(payload.latency_ms < 1000);
+    }
+
+    #[test]
+    fn test_run_recall_notification_noop() {
+        let database = db::open_in_memory().unwrap();
+        let grafeo = grafeo_db::new_in_memory();
+        let event = HookEvent {
+            hook_type: HookType::NotificationPost,
+            session_id: "test".into(),
+            tool_name: None,
+            tool_input: None,
+            tool_output: None,
+            user_prompt: None,
+            assistant_response: None,
+            working_directory: None,
+            timestamp_ms: 0,
+        };
+
+        let payload = run_recall(&event, &database, &grafeo);
+        assert!(payload.items.is_empty());
+        assert_eq!(payload.latency_ms, 0);
+    }
+
+    #[test]
+    fn test_recall_payload_serializes_to_json() {
+        let payload = RecallPayload {
+            items: vec![RecallItem::Hint {
+                text: "test hint".into(),
+            }],
+            truncated: None,
+            latency_ms: 42,
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(json.contains("test hint"));
+        assert!(json.contains("42"));
+        // truncated should not appear when None
+        assert!(!json.contains("truncated"));
+    }
+}

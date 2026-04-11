@@ -74,14 +74,13 @@ async fn main() -> Result<()> {
 #[allow(clippy::unused_async)]
 async fn cmd_hook(
     storage_dir: &std::path::Path,
-    hook_type: &str,
+    _hook_type: &str,
 ) -> Result<()> {
     std::fs::create_dir_all(storage_dir).context("create storage dir")?;
 
     let db_path = lobster::app::config::db_path(storage_dir);
-    let _db = lobster::store::db::open(&db_path).context("open database")?;
-
-    tracing::debug!(hook_type, "hook invoked");
+    let db = lobster::store::db::open(&db_path).context("open database")?;
+    let grafeo = lobster::graph::db::new_in_memory();
 
     // Read hook payload from stdin
     let mut input = String::new();
@@ -89,12 +88,18 @@ async fn cmd_hook(
         .context("read stdin")?;
 
     // Parse the hook event
-    let _event: lobster::hooks::events::HookEvent =
+    let event: lobster::hooks::events::HookEvent =
         serde_json::from_str(&input).context("parse hook event")?;
 
-    // TODO: capture event, run segmentation, run recall
-    // For now, output empty JSON (no recall hints)
-    println!("{{}}");
+    tracing::debug!(hook_type = ?event.hook_type, "hook invoked");
+
+    // Run the recall pipeline
+    let payload = lobster::hooks::recall::run_recall(&event, &db, &grafeo);
+
+    // Output recall payload as JSON to stdout
+    let json =
+        serde_json::to_string(&payload).context("serialize recall payload")?;
+    println!("{json}");
 
     Ok(())
 }
