@@ -2,3 +2,4 @@
 
 pub mod db;
 pub mod projection;
+pub mod rebuild;
