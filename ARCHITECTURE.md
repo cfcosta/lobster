@@ -267,10 +267,13 @@ For v1, that is acceptable because Lobster retrieves over distilled artifacts, n
 Because PyLate-style late interaction and Grafeo's vector search are not identical retrieval models, Lobster must define a bridging contract explicitly:
 
 1. persist a pooled single-vector proxy for each distilled artifact
-2. project that proxy vector into Grafeo
-3. use Grafeo hybrid search to fetch top-K candidates
-4. rerank those candidates in-process with exact PyLate similarity
-5. apply graph support, task overlap, and recency heuristics for final ordering
+2. persist `late_interaction_bytes` for artifact classes that participate in exact PyLate reranking
+3. project the pooled proxy vector into Grafeo
+4. use Grafeo hybrid search to fetch top-K candidates
+5. rerank those candidates in-process with exact PyLate similarity derived from the persisted late-interaction representation
+6. apply graph support, task overlap, and recency heuristics for final ordering
+
+If an artifact class does not persist late-interaction state in v1, Lobster must treat it as pooled-vector reranking only and label that path clearly in code and tests.
 
 This gives Lobster a practical v1 path without requiring a second dedicated multi-vector index on day one.
 
@@ -298,7 +301,6 @@ struct Episode {
     start_seq: u64,
     end_seq: u64,
     task_id: Option<TaskId>,
-    summary: String,
     processing_state: ProcessingState,
     finalized_ts_utc_ms: i64,
 }
@@ -352,6 +354,7 @@ struct EmbeddingArtifact {
     backend: EmbeddingBackend,
     quantization: Option<String>,
     pooled_vector_bytes: Vec<u8>,
+    late_interaction_bytes: Option<Vec<u8>>,
     payload_checksum: [u8; 32],
 }
 ```
@@ -372,6 +375,7 @@ enum ProcessingState {
 - **Raw events are durable truth**.
 - **Episodes are durable derived artifacts**, not the only truth layer.
 - **Summaries, extraction outputs, and embeddings are also durable artifacts**.
+- **The accepted summary lives in `SummaryArtifact`, not on `Episode` itself**.
 - **Decisions must include evidence**.
 - **Temporal validity matters** for decision timelines and changing constraints.
 - **Tasks and decisions use deterministic canonicalization**.
@@ -500,6 +504,12 @@ Signals may include:
 - test outcome tied to a selected path
 - stated constraints or non-goals
 
+### Canonical ownership rule
+
+In v1, canonical `Decision` records are created only by the decision-detection pipeline.
+
+The extractor may reference existing decisions and emit graph relations around them, but it does not create new canonical `Decision` records. If Lobster later experiments with model-suggested decisions, they should be stored as a separate non-canonical proposal artifact until explicitly promoted.
+
 ### Promotion policy
 
 - high-confidence decisions may be auto-promoted
@@ -533,25 +543,21 @@ Possible implementations:
 
 The extractor must emit **typed structured facts**, not freeform Grafeo queries.
 
+In v1, extractor output may reference already-created canonical decisions, but it does not create new ones.
+
 Example:
 
 ```json
 {
   "task_refs": ["task:build-memory-search"],
-  "decisions": [
-    {
-      "statement": "Use Grafeo as semantic serving layer",
-      "rationale": "It already supports hybrid retrieval",
-      "confidence": "high",
-      "evidence": ["ep:123#span:4-8"]
-    }
-  ],
+  "decision_refs": ["decision:9d2"],
   "entities": [
     { "kind": "component", "name": "Grafeo" },
     { "kind": "constraint", "name": "offline-first" }
   ],
   "relations": [
-    { "type": "task_decision", "from": "task:build-memory-search", "to": "decision:auto:9d2" }
+    { "type": "task_decision", "from": "task:build-memory-search", "to": "decision:9d2" },
+    { "type": "decision_entity", "from": "decision:9d2", "to": "entity:component:grafeo" }
   ]
 }
 ```
@@ -641,7 +647,7 @@ For v1, candidate retrieval should work like this:
 
 1. query Grafeo hybrid search over pooled single-vector proxies + BM25 text
 2. fetch a small top-K candidate set
-3. rerank that set in-process with exact PyLate similarity
+3. rerank that set in-process with exact PyLate similarity when `late_interaction_bytes` are available, otherwise same-model pooled-vector reranking
 4. apply graph/task/recency heuristics
 5. intersect the result set with the `redb` ready set before anything is surfaced
 
@@ -787,6 +793,18 @@ The required protocol is:
 
 This prevents ghost graph state, half-projected artifacts, and recall skew after crashes or retries.
 
+### Visibility scope
+
+In v1, readiness is **episode-scoped**. Derived summaries, decisions, entities, and graph relations inherit the visibility state of their parent episode for automatic and normal explicit recall.
+
+### State transitions
+
+- `Pending -> Ready` only after accepted artifacts are in `redb`, Grafeo projection succeeds, and projection metadata is recorded
+- `Pending -> RetryQueued` on failed embedding, extraction, or projection when retry budget remains
+- `RetryQueued -> Ready` on successful retry and projection
+- `RetryQueued -> FailedFinal` when retry budget is exhausted
+- `FailedFinal` items remain out of normal recall until repaired by an explicit maintenance path
+
 ### States
 
 - `Pending`: persisted but not fully processed
@@ -869,6 +887,10 @@ The following should be versioned:
 - ranking feature set where practical
 
 Behavioral tests are necessary, but they should not be the only compatibility mechanism.
+
+### Telemetry rule
+
+Retrieval and surfacing telemetry is observational only in v1 unless a telemetry-derived signal is explicitly promoted into the versioned ranking feature set. This keeps fixture-based determinism intact.
 
 ---
 
