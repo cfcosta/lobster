@@ -2,6 +2,9 @@
 name = "lobster"
 version = "0.1.0"
 edition = "2024"
+description = "A local, deterministic, per-repo memory system for Claude Code"
+license = "MIT"
+rust-version = "1.86"
 
 [dependencies]
 grafeo = "0.5.34"
@@ -13,6 +16,16 @@ serde_json = "1"
 tantivy = "0.26.0"
 tokio = { version = "1.51.1", features = ["full"] }
 
+[dev-dependencies]
+hegeltest = "0.4"
+
 [features]
 default = []
 cuda = ["pylate-rs/cuda"]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
