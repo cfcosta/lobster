@@ -8,6 +8,7 @@ rust-version = "1.86"
 
 [dependencies]
 anyhow = "1"
+chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
 grafeo = "0.5.34"
 pylate-rs = { version = "1.0.4", git = "https://github.com/cfcosta/pylate-rs" }

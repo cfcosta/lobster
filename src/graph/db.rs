@@ -219,9 +219,9 @@ mod tests {
 
         // Edge exists
         assert_eq!(db.edge_count(), 1);
-
-        // Check that we created a valid edge (edge ID is valid)
-        assert!(edge.0 > 0 || edge.0 == 0);
+        // Edge ID was returned (compiler enforces this, but
+        // we keep the binding to prove it's used)
+        let _ = edge;
     }
 
     #[test]
