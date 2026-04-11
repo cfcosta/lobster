@@ -196,6 +196,11 @@ It stores:
 
 If the writer task is not running (e.g., no long-lived MCP process), short-lived hook invocations acquire the write lock briefly for event appends only, under the same repo-local lease and wall-clock budget defined for background maintenance.
 
+### Durability policy
+
+- **`Durability::Immediate`** for: raw events, episode records, accepted artifacts, visibility-state flips. These must survive crashes.
+- **`Durability::None`** only for: clearly rebuildable batches like telemetry bursts, projection metadata updates, and statistics refreshes. A subsequent `Immediate` commit flushes these.
+
 ### Canonical rule
 
 If Grafeo or any retrieval index is lost, Lobster must be able to rebuild semantic state from `redb`.
@@ -218,27 +223,33 @@ This makes Grafeo a rebuildable serving projection rather than the only keeper o
 
 ## 2. Semantic serving layer: `Grafeo`
 
-`Grafeo` is not just the graph layer. In v1 it acts as the **semantic serving layer** for:
+`Grafeo` is not just the graph layer. In v1 it acts as a **materialized semantic index** for:
 
 - nodes: episodes, tasks, decisions, entities
-- evidence-backed edges
-- searchable distilled artifacts
-- hybrid retrieval support
+- evidence-backed edges with temporal validity
+- searchable distilled artifacts (via explicit text and vector indexes)
+- hybrid retrieval: HNSW vector search, BM25, filtered search, MMR diversity
 - graph neighborhood traversal
-- graph-backed context assembly
+- graph-backed context assembly and reranking support
 
 ### Why `Grafeo`
 
-It already matches the serving needs better than forcing `redb` to become a graph/vector/text retrieval engine.
+It already matches the serving needs better than forcing `redb` to become a graph/vector/text retrieval engine. It provides HNSW, BM25, hybrid search, MMR, sessions, transactions, and an embeddable Rust API.
 
-### What belongs in Grafeo
+### Grafeo as materialized index, not second truth
+
+Grafeo is a **rebuildable projection** of the canonical state in `redb`. It is not a second source of truth, and it is not a string-query target for generated writes.
+
+What belongs in Grafeo:
 
 - promoted semantic facts
 - searchable summaries and decisions
-- graph relationships with evidence back-links
+- graph relationships with evidence back-links and temporal validity metadata
 - graph-time adjacency and semantic neighborhood data
+- explicit text indexes on summary/decision text fields
+- explicit vector indexes on pooled proxy vectors
 
-### What does not make Grafeo the source of truth
+What does not belong in Grafeo (stays in `redb`):
 
 - raw events
 - job queues
@@ -247,7 +258,22 @@ It already matches the serving needs better than forcing `redb` to become a grap
 - accepted summary/extraction/embedding artifacts
 - audit completeness guarantees
 
-Those stay in `redb`.
+### Temporal edge metadata
+
+Edges in Grafeo carry temporal validity, not just decisions. Every projected edge should include:
+
+- `valid_from_ts_utc_ms`: when the relationship became true
+- `valid_to_ts_utc_ms`: when the relationship became invalid (null if still valid)
+
+This preserves changing relationships over time (e.g., "component X depends on Y" may become invalid after a refactor). Graph traversal and `memory_neighbors` must filter on temporal validity by default.
+
+### Index requirements
+
+Lobster must create explicit indexes in Grafeo for its retrieval paths:
+
+- **Vector index**: HNSW on pooled proxy vectors for decision, summary, and task artifact nodes. Cosine metric, dimensions matching the PyLate proxy vector.
+- **Text index**: BM25 on summary text and decision statement fields.
+- **Property index**: on `artifact_type`, `repo_id`, `task_id` for fast filtering.
 
 ### Embedding integration rule
 
@@ -290,18 +316,31 @@ The architecture requires a "pooled single-vector proxy" for each distilled arti
 - the reduced vector dimensions must match what Grafeo's HNSW index expects
 - fixture tests must verify that the same input produces the same proxy vector per Lobster release
 
+### Artifact-specific pooling policy
+
+Not all artifact classes benefit equally from full late-interaction reranking. Pooling is a storage/quality trade-off tuned per class:
+
+| Artifact class             | `late_interaction_bytes` | Pooling | Rationale                                        |
+| -------------------------- | ------------------------ | ------- | ------------------------------------------------ |
+| Decisions                  | full (no pooling)        | none    | High-value, short text, most critical for recall |
+| Active task summaries      | light (pool_factor=2)    | light   | Medium-value, moderate length                    |
+| Durable constraints        | full (no pooling)        | none    | High-value, rarely change                        |
+| Episode summaries (recent) | light (pool_factor=2)    | light   | Moderate value, moderate length                  |
+| Episode summaries (old)    | none (proxy only)        | heavy   | Bulk, lower recall priority                      |
+
+Artifact classes without `late_interaction_bytes` use pooled-vector reranking only and must be labeled clearly in code and tests.
+
 ### Explicit v1 retrieval contract
 
 Because PyLate-style late interaction and Grafeo's vector search are not identical retrieval models, Lobster must define a bridging contract explicitly:
 
 1. persist a pooled single-vector proxy for each distilled artifact
-2. persist `late_interaction_bytes` for artifact classes that participate in exact PyLate reranking
+2. persist `late_interaction_bytes` per the artifact-specific pooling policy above
 3. project the pooled proxy vector into Grafeo
 4. use Grafeo hybrid search to fetch top-K candidates
-5. rerank those candidates in-process with exact PyLate similarity derived from the persisted late-interaction representation
-6. apply graph support, task overlap, and recency heuristics for final ordering
-
-If an artifact class does not persist late-interaction state in v1, Lobster must treat it as pooled-vector reranking only and label that path clearly in code and tests.
+5. rerank those candidates in-process with exact PyLate similarity when `late_interaction_bytes` are available, otherwise pooled-vector reranking
+6. apply graph support, task overlap, recency heuristics, and MMR diversity for final ordering
+7. reject candidates below the confidence threshold (see retrieval routing spec)
 
 This gives Lobster a practical v1 path without requiring a second dedicated multi-vector index on day one.
 
@@ -665,15 +704,23 @@ Invalid output never writes directly to Grafeo.
 
 ### Edge rule
 
-Every persisted edge must be evidence-backed.
+Every persisted edge must be evidence-backed and temporally annotated.
 
-This keeps graph navigation explainable and supports `memory_neighbors` safely.
+- `valid_from_ts_utc_ms`: when the relationship became true
+- `valid_to_ts_utc_ms`: when the relationship became invalid (null if still valid)
+- `evidence`: one or more `EvidenceRef` back-links
+
+This keeps graph navigation explainable, supports `memory_neighbors` safely, and prevents stale relationships from corrupting retrieval.
 
 ---
 
 ## Retrieval architecture
 
-Lobster has two retrieval paths.
+Lobster has **query-routed** retrieval, not one-size-fits-all. The retrieval path is selected by a deterministic route classifier before any search runs. See `docs/RETRIEVAL_ROUTING.md` for the full routing spec, thresholds, candidate budgets, and eval matrix.
+
+### Why query routing
+
+GraphRAG underperforms plain RAG on simple tasks. Always invoking graph expansion or always trusting a dense retriever wastes budget and reduces precision. A deterministic router selects the cheapest path that satisfies the query class.
 
 ## 1. Automatic recall path
 
@@ -690,15 +737,17 @@ Automatic recall should search only over distilled ready artifacts:
 
 ### Candidate generation contract
 
-For v1, candidate retrieval should work like this:
+For v1, candidate retrieval uses the route selected by the classifier:
 
-1. query Grafeo hybrid search over pooled single-vector proxies + BM25 text
-2. fetch a small top-K candidate set
-3. rerank that set in-process with exact PyLate similarity when `late_interaction_bytes` are available, otherwise same-model pooled-vector reranking
-4. apply graph/task/recency heuristics
-5. intersect the result set with the `redb` ready set before anything is surfaced
+1. **classify the query** into a retrieval route (exact, hybrid, hybrid+graph, or abstain)
+2. execute the route-specific search against Grafeo
+3. rerank the candidate set in-process with exact PyLate similarity when `late_interaction_bytes` are available, otherwise pooled-vector reranking
+4. apply graph/task/recency heuristics and MMR diversity control
+5. **reject candidates below the confidence threshold** (hard "say nothing" rule)
+6. intersect the result set with the `redb` ready set before anything is surfaced
+7. **expand evidence windows** for surfaced decisions: include local rationale and supporting evidence, not detached snippets
 
-This keeps the hot path fast while preserving a strict visibility gate.
+This keeps the hot path fast while preserving a strict visibility gate and ensuring surfaced results carry enough context to be useful.
 
 ### Ranking model
 
@@ -714,6 +763,23 @@ Stable tie-breakers:
 2. timestamp
 3. stable ID
 
+### Rejection rule
+
+If no candidate exceeds the route-specific confidence threshold after reranking, automatic recall returns **nothing**. Surfacing weak results is worse than silence. The threshold is defined per route in the retrieval routing spec.
+
+### Diversity control
+
+Use Grafeo's MMR (Maximal Marginal Relevance) support to avoid near-duplicate items in automatic recall. The diversity parameter is tunable per route.
+
+### Evidence-window expansion
+
+When a decision or summary is surfaced, automatic recall must expand the result to include its local evidence window:
+
+- for decisions: the rationale, supporting evidence refs, and compact task context
+- for summaries: the summary text plus the decision(s) it supports, if any
+
+This prevents surfacing detached snippets that lack the context to be actionable.
+
 ### Output budget
 
 - default: 1-3 short high-confidence items
@@ -725,7 +791,7 @@ Stable tie-breakers:
 
 Purpose: richer recall and graph exploration.
 
-This path may search more broadly and return larger structured payloads, but it still respects the same visibility rule: only artifacts marked `Ready` in `redb` are eligible for normal retrieval results.
+This path may search more broadly, use the full set of retrieval routes, and return larger structured payloads. It still respects the same visibility rule: only artifacts marked `Ready` in `redb` are eligible for normal retrieval results. It uses the same routing classifier but with wider candidate budgets and lower rejection thresholds.
 
 ---
 
@@ -797,6 +863,10 @@ Use for non-blocking maintenance only:
 Async hooks are not the mechanism for same-turn context injection.
 
 When no long-lived MCP process is active, async/background work may run opportunistically under a repo-local lease and a fixed wall-clock budget so that multiple short-lived hook invocations do not fight over maintenance ownership.
+
+### MCP logging constraint
+
+The MCP server uses stdio for JSON-RPC transport. All Lobster logging must go to **stderr or files only**. Writing to stdout corrupts JSON-RPC traffic and breaks the MCP protocol.
 
 ---
 
