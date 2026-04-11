@@ -39,6 +39,14 @@ The core product bet is:
 - Hidden model downloads during hook execution
 - LLM-generated freeform database queries
 
+## Superseding architecture decisions
+
+These decisions intentionally supersede earlier questionnaire wording where the two conflict.
+
+- **Raw events in `redb` are the canonical truth layer.** Episodes remain first-class durable artifacts, but they are derived from the raw event stream rather than replacing it.
+- **Typed extraction output supersedes model-generated freeform Grafeo queries.** Models may propose facts, but Lobster alone compiles those facts into fixed graph updates.
+- **Explicit local model install supersedes hidden first-use downloads.** Hook execution must not surprise users with network access or long setup work.
+
 ---
 
 ## Design principles
@@ -47,23 +55,27 @@ The core product bet is:
 
 The canonical state must be replayable from durable local records. Search indexes and graph projections can be rebuilt.
 
-### 2. Evidence before abstraction
+### 2. Persist derived artifacts, not just source text
+
+Summaries, accepted extraction outputs, embedding artifacts, and projection metadata are themselves durable records. Rebuilds should prefer persisted artifacts over re-running models whenever possible.
+
+### 3. Evidence before abstraction
 
 Every promoted decision, entity relation, and graph edge should trace back to one or more concrete source episodes or spans.
 
-### 3. Distill before recall
+### 4. Distill before recall
 
 Automatic recall should search over distilled artifacts first: decisions, summaries, active tasks, and durable constraints.
 
-### 4. Embeddings retrieve, graphs explain
+### 5. Embeddings retrieve, graphs explain
 
 Candidate generation is embedding-led; graph links, temporal context, and heuristics rerank and expand.
 
-### 5. Small by default
+### 6. Small by default
 
 Automatic recall should be tiny and high confidence. Uncertain or bulky history stays behind explicit MCP tools.
 
-### 6. Dreaming means maintenance
+### 7. Dreaming means maintenance
 
 Background work in v1 should summarize, retry, merge, enrich, and compress. It should not invent TODOs or speculative insights.
 
@@ -119,12 +131,26 @@ Lobster v1 runs as a **single local binary** with internal components:
 - MCP server handlers
 - redb storage layer
 - episode segmentation logic
+- summarization worker
 - embedding worker
 - extraction worker
 - dreaming / retry worker
 - Grafeo projection and query layer
 
-There is no required external daemon in v1. Internal background tasks may run within the process when Claude Code invokes Lobster.
+There is no required external daemon in v1, but the binary has two explicit runtime modes:
+
+- `lobster hook ...` for one-shot hook execution
+- `lobster mcp` for long-lived MCP service execution
+
+### Process ownership
+
+Background maintenance must not be assumed to run inside short-lived hook invocations.
+
+- Same-turn recall belongs to hook execution.
+- Deep explicit recall belongs to the long-lived MCP process.
+- Maintenance, retries, and dreaming belong to the long-lived process when available, or run opportunistically under a repo-local lease with a strict time budget.
+
+This keeps lifecycle ownership explicit without requiring a separate daemon architecture in v1.
 
 ---
 
@@ -138,14 +164,19 @@ It stores:
 
 - raw hook events
 - episode records
+- summary artifacts
 - task records
 - decision records
+- accepted extraction artifacts
+- embedding artifacts
 - entity canonicalization metadata
 - provenance/evidence refs
 - processing jobs and retry state
-- extractor prompt/version metadata
+- summarizer and extractor version metadata
+- embedding model/backend/quantization metadata
+- projection version and applied-at metadata
 - retrieval statistics and surfacing telemetry
-- repo config and operational status
+- repo config, ignore rules, and operational status
 
 ### Why `redb`
 
@@ -157,6 +188,20 @@ It stores:
 ### Canonical rule
 
 If Grafeo or any retrieval index is lost, Lobster must be able to rebuild semantic state from `redb`.
+
+That rebuild should not depend on re-running summarization or extraction by default. The canonical artifact layer in `redb` should contain enough accepted summary, extraction, and embedding data to replay projection deterministically and audit what happened.
+
+### Durable artifact layer
+
+At minimum, persist these versioned artifacts in `redb`:
+
+- summary text + summarizer version/revision
+- accepted `ExtractionOutput` + extractor version/revision
+- embedding artifact metadata: model revision, backend, quantization, checksum
+- canonical serialized embedding representation or vector bytes
+- projection state: projection version, applied-at timestamp, projection checksum/state
+
+This makes Grafeo a rebuildable serving projection rather than the only keeper of semantic state.
 
 ---
 
@@ -188,9 +233,14 @@ It already matches the serving needs better than forcing `redb` to become a grap
 - job queues
 - retry state
 - canonical ingestion state
+- accepted summary/extraction/embedding artifacts
 - audit completeness guarantees
 
 Those stay in `redb`.
+
+### Embedding integration rule
+
+Lobster v1 should not rely on Grafeo's built-in embedding generation path. Embeddings are produced by Lobster's own runtime and projected into Grafeo explicitly, which avoids hidden model downloads and keeps model provenance under Lobster's control.
 
 ---
 
@@ -211,6 +261,18 @@ In v1 it should embed mainly:
 `pylate-rs` is an inference runtime, not a full retrieval architecture by itself.
 
 For v1, that is acceptable because Lobster retrieves over distilled artifacts, not raw full-history spans. A dedicated late-interaction code index can be added later as an optional subsystem.
+
+### Explicit v1 retrieval contract
+
+Because PyLate-style late interaction and Grafeo's vector search are not identical retrieval models, Lobster must define a bridging contract explicitly:
+
+1. persist a pooled single-vector proxy for each distilled artifact
+2. project that proxy vector into Grafeo
+3. use Grafeo hybrid search to fetch top-K candidates
+4. rerank those candidates in-process with exact PyLate similarity
+5. apply graph support, task overlap, and recency heuristics for final ordering
+
+This gives Lobster a practical v1 path without requiring a second dedicated multi-vector index on day one.
 
 ---
 
@@ -269,6 +331,29 @@ struct Entity {
     kind: EntityKind,
     canonical_name: String,
 }
+
+struct SummaryArtifact {
+    episode_id: EpisodeId,
+    revision: String,
+    summary_text: String,
+    payload_checksum: [u8; 32],
+}
+
+struct ExtractionArtifact {
+    episode_id: EpisodeId,
+    revision: String,
+    output_json: Vec<u8>,
+    payload_checksum: [u8; 32],
+}
+
+struct EmbeddingArtifact {
+    artifact_id: ArtifactId,
+    revision: String,
+    backend: EmbeddingBackend,
+    quantization: Option<String>,
+    pooled_vector_bytes: Vec<u8>,
+    payload_checksum: [u8; 32],
+}
 ```
 
 ## Processing state
@@ -286,6 +371,7 @@ enum ProcessingState {
 
 - **Raw events are durable truth**.
 - **Episodes are durable derived artifacts**, not the only truth layer.
+- **Summaries, extraction outputs, and embeddings are also durable artifacts**.
 - **Decisions must include evidence**.
 - **Temporal validity matters** for decision timelines and changing constraints.
 - **Tasks and decisions use deterministic canonicalization**.
@@ -326,6 +412,19 @@ High-value event classes:
 - tests and failures
 - plans and task transitions
 
+### Redaction and ignore rules
+
+Even in a local-only system, Lobster should not persist obvious secrets or useless large blobs by default.
+
+v1 should include a deterministic filter layer for:
+
+- ignored paths and file patterns
+- obvious secret/token-like strings
+- `.env`-style sensitive content
+- large binary payloads
+
+Filtering decisions should be deterministic, logged, and repo-configurable.
+
 ## Episode segmentation
 
 Episodes are built from raw events using deterministic rules:
@@ -341,14 +440,16 @@ Tie-breaks must be stable and testable.
 
 When an episode closes:
 
-1. persist finalized episode shell in `redb`
-2. produce deterministic summary
-3. detect/promote decisions using heuristics + confidence buckets
-4. persist decisions/tasks/artifacts in `redb`
-5. enqueue embedding and graph extraction jobs
-6. run those jobs in parallel
-7. mark episode `Ready` only when both succeed
-8. if extraction fails twice, mark `RetryQueued` and keep it out of normal recall
+1. persist finalized episode shell in `redb` as `Pending`
+2. produce a versioned `SummaryArtifact`
+3. persist the accepted summary artifact in `redb`
+4. detect/promote decisions using heuristics + confidence buckets
+5. persist decisions/tasks/artifacts in `redb`
+6. enqueue embedding and graph extraction jobs
+7. persist accepted `EmbeddingArtifact` and `ExtractionArtifact` outputs in `redb`
+8. project the ready semantic view into Grafeo
+9. mark episode `Ready` only after projection succeeds
+10. if extraction fails twice, mark `RetryQueued` and keep it out of normal recall
 
 ### Why this flow
 
@@ -362,6 +463,27 @@ It preserves:
 ### Latency target
 
 Target sub-second total processing for common finalized episodes, but never at the expense of corrupt or opaque state transitions.
+
+## Summarization contract
+
+Summarization should use the same architectural discipline as extraction.
+
+Use a swappable interface:
+
+```rust
+trait Summarizer {
+    fn summarize(&self, input: SummaryInput) -> Result<SummaryArtifact, SummaryError>;
+}
+```
+
+Persist the accepted `SummaryArtifact` in `redb` with:
+
+- summary text
+- summarizer version/revision
+- model/runtime identity when applicable
+- deterministic checksum of the output payload
+
+The summary is not just a transient pre-processing step. It is a first-class durable artifact used for rebuilds, auditability, and retrieval.
 
 ---
 
@@ -513,6 +635,18 @@ Automatic recall should search only over distilled ready artifacts:
 - recent high-value episode summaries
 - durable constraints/components
 
+### Candidate generation contract
+
+For v1, candidate retrieval should work like this:
+
+1. query Grafeo hybrid search over pooled single-vector proxies + BM25 text
+2. fetch a small top-K candidate set
+3. rerank that set in-process with exact PyLate similarity
+4. apply graph/task/recency heuristics
+5. intersect the result set with the `redb` ready set before anything is surfaced
+
+This keeps the hot path fast while preserving a strict visibility gate.
+
 ### Ranking model
 
 A deterministic composite score:
@@ -538,7 +672,7 @@ Stable tie-breakers:
 
 Purpose: richer recall and graph exploration.
 
-This path may search more broadly and return larger structured payloads.
+This path may search more broadly and return larger structured payloads, but it still respects the same visibility rule: only artifacts marked `Ready` in `redb` are eligible for normal retrieval results.
 
 ---
 
@@ -585,6 +719,8 @@ MCP is the deep recall surface. Hooks should not attempt to expose full history 
 
 Use only for tiny same-turn recall hints.
 
+Primary home: `UserPromptSubmit`-style entry points before response generation.
+
 ## Post-tool / milestone hooks
 
 Use for lightweight reminders after:
@@ -593,6 +729,8 @@ Use for lightweight reminders after:
 - failures
 - test results
 - major task transitions
+
+Primary homes: `PostToolUse`, `PostToolUseFailure`, and task lifecycle events.
 
 ## Async/background hooks
 
@@ -604,6 +742,8 @@ Use for non-blocking maintenance only:
 - statistics refresh
 
 Async hooks are not the mechanism for same-turn context injection.
+
+When no long-lived MCP process is active, async/background work may run opportunistically under a repo-local lease and a fixed wall-clock budget so that multiple short-lived hook invocations do not fight over maintenance ownership.
 
 ---
 
@@ -632,6 +772,21 @@ Not allowed by default:
 
 Memories that are not fully processed should not silently disappear.
 
+## Cross-store visibility protocol
+
+Because `redb` and Grafeo are separate stores, retrieval visibility is controlled by `redb`, not by whatever semantic data happens to exist in Grafeo.
+
+The required protocol is:
+
+1. persist episode and derived artifacts in `redb` as `Pending`
+2. persist accepted summary/extraction/embedding artifacts in `redb`
+3. apply Grafeo projection
+4. record projection metadata in `redb`
+5. flip the episode/artifacts to `Ready`
+6. intersect all Grafeo retrieval candidates with the `redb` ready set before returning them
+
+This prevents ghost graph state, half-projected artifacts, and recall skew after crashes or retries.
+
 ### States
 
 - `Pending`: persisted but not fully processed
@@ -646,6 +801,9 @@ Lobster should expose internal visibility for degraded state, for example:
 - warning on failure/open-fail mode
 - status summary in logs or CLI
 - optional pending-aware admin/debug query paths
+- `lobster status`
+- `lobster reset --repo`
+- optional `memory_status` debug/admin MCP surface
 
 This avoids opaque behavior when graph extraction lags or fails.
 
@@ -678,6 +836,16 @@ Lobster must prove two things in tests:
 1. same inputs produce the same durable state
 2. same memory/query context produces the same ranking outputs
 
+### Determinism boundary
+
+Determinism is promised per:
+
+- Lobster release
+- summarizer/extractor/embedding model revision
+- backend/runtime choice
+
+CPU-backed execution should be the canonical fixture/golden-test mode in v1. Faster GPU or platform-specific backends may exist, but they should be treated as performance modes rather than the canonical determinism baseline.
+
 ## Required test layers
 
 - fixture-driven event ingestion tests
@@ -692,8 +860,11 @@ Lobster must prove two things in tests:
 
 The following should be versioned:
 
+- summary artifact schema
+- summarizer behavior contract
 - extraction schema
 - prompt/extractor behavior contract
+- embedding artifact schema
 - graph template set
 - ranking feature set where practical
 
@@ -744,6 +915,7 @@ src/
     mod.rs
     segmenter.rs
     summary.rs
+    summarizer.rs
     decisions.rs
   embeddings/
     mod.rs
