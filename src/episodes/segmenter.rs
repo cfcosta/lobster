@@ -173,6 +173,7 @@ mod tests {
     fn prop_first_event_boundary(tc: TestCase) {
         let n: usize =
             tc.draw(gs::integers::<usize>().min_value(1).max_value(10));
+        #[allow(clippy::cast_possible_wrap)]
         let events: Vec<RawEvent> = (0..n)
             .map(|i| make_event(i as u64, i as i64 * 1000, b"repo"))
             .collect();
