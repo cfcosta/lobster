@@ -282,6 +282,7 @@ pub async fn finalize_episode(
     }
 }
 
+#[allow(clippy::match_same_arms)]
 fn parse_entity_kind(kind: &str) -> crate::store::schema::EntityKind {
     match kind {
         "concept" => crate::store::schema::EntityKind::Concept,
