@@ -9,4 +9,4 @@ A claude hooks thing that keeps memory of everything on your claude code session
 - "Dreaming" AI by default
 - plugs on Claude Code hooks
 
-See `ARCHITECTURE.md` for the v1 system design.
+See `ARCHITECTURE.md` for the system design.

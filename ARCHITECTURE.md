@@ -1,10 +1,10 @@
-# Lobster v1 architecture spec
+# Lobster architecture spec
 
 ## Summary
 
 Lobster is a local, deterministic, per-repo memory system for Claude Code.
 
-Its v1 architecture is **layered memory**:
+Its architecture is **layered memory**:
 
 1. **`redb`** is the canonical source of truth for raw events, episodes, tasks, decisions, jobs, and provenance.
 2. **`Grafeo`** is the semantic serving layer for graph facts, hybrid retrieval, and graph-backed expansion.
@@ -30,7 +30,7 @@ The core product bet is:
 - Broad history retention with distilled higher-value artifacts
 - Graph as the semantic model, not the only retrieval primitive
 
-## Non-goals for v1
+## Non-goals
 
 - Cloud sync or hosted backends
 - Multi-user memory sharing
@@ -77,7 +77,7 @@ Automatic recall should be tiny and high confidence. Uncertain or bulky history 
 
 ### 7. Dreaming means maintenance
 
-Background work in v1 should summarize, retry, merge, enrich, and compress. It should not invent TODOs or speculative insights.
+Background work should summarize, retry, merge, enrich, and compress. It should not invent TODOs or speculative insights.
 
 ---
 
@@ -125,7 +125,7 @@ Dreaming / idle worker   --> retries, merges, consolidation
 
 ## Runtime shape
 
-Lobster v1 runs as a **single local binary** with internal components:
+Lobster runs as a **single local binary** with internal components:
 
 - hook ingestion handlers
 - MCP server handlers
@@ -137,7 +137,7 @@ Lobster v1 runs as a **single local binary** with internal components:
 - dreaming / retry worker
 - Grafeo projection and query layer
 
-There is no required external daemon in v1, but the binary has two explicit runtime modes:
+There is no required external daemon, but the binary has two explicit runtime modes:
 
 - `lobster hook ...` for one-shot hook execution
 - `lobster mcp` for long-lived MCP service execution
@@ -150,7 +150,7 @@ Background maintenance must not be assumed to run inside short-lived hook invoca
 - Deep explicit recall belongs to the long-lived MCP process.
 - Maintenance, retries, and dreaming belong to the long-lived process when available, or run opportunistically under a repo-local lease with a strict time budget.
 
-This keeps lifecycle ownership explicit without requiring a separate daemon architecture in v1.
+This keeps lifecycle ownership explicit without requiring a separate daemon architecture.
 
 ---
 
@@ -223,7 +223,7 @@ This makes Grafeo a rebuildable serving projection rather than the only keeper o
 
 ## 2. Semantic serving layer: `Grafeo`
 
-`Grafeo` is not just the graph layer. In v1 it acts as a **materialized semantic index** for:
+`Grafeo` is not just the graph layer. It acts as a **materialized semantic index** for:
 
 - nodes: episodes, tasks, decisions, entities
 - evidence-backed edges with temporal validity
@@ -277,7 +277,7 @@ Lobster must create explicit indexes in Grafeo for its retrieval paths:
 
 ### Embedding integration rule
 
-Lobster v1 should not rely on Grafeo's built-in embedding generation path. Embeddings are produced by Lobster's own runtime and projected into Grafeo explicitly, which avoids hidden model downloads and keeps model provenance under Lobster's control.
+Lobster should not rely on Grafeo's built-in embedding generation path. Embeddings are produced by Lobster's own runtime and projected into Grafeo explicitly, which avoids hidden model downloads and keeps model provenance under Lobster's control.
 
 ---
 
@@ -285,7 +285,7 @@ Lobster v1 should not rely on Grafeo's built-in embedding generation path. Embed
 
 `pylate-rs` is the local embedding inference component.
 
-In v1 it should embed mainly:
+It should embed mainly:
 
 - decisions
 - decision + rationale + compact task context
@@ -297,7 +297,7 @@ In v1 it should embed mainly:
 
 `pylate-rs` is an inference runtime, not a full retrieval architecture by itself.
 
-For v1, that is acceptable because Lobster retrieves over distilled artifacts, not raw full-history spans. A dedicated late-interaction code index can be added later as an optional subsystem.
+This is acceptable because Lobster retrieves over distilled artifacts, not raw full-history spans. A dedicated late-interaction code index can be added later as an optional subsystem.
 
 ### Model ownership rule
 
@@ -311,7 +311,7 @@ For v1, that is acceptable because Lobster retrieves over distilled artifacts, n
 
 The architecture requires a "pooled single-vector proxy" for each distilled artifact, but the reduction from PyLate per-token embeddings to a single vector must be explicitly defined and frozen for determinism:
 
-- v1 reduction: mean-pool all non-padding token embeddings from the PyLate encoder output into a single vector
+- reduction: mean-pool all non-padding token embeddings from the PyLate encoder output into a single vector
 - the reduction function is versioned alongside the embedding model revision
 - the reduced vector dimensions must match what Grafeo's HNSW index expects
 - fixture tests must verify that the same input produces the same proxy vector per Lobster release
@@ -330,7 +330,7 @@ Not all artifact classes benefit equally from full late-interaction reranking. P
 
 Artifact classes without `late_interaction_bytes` use pooled-vector reranking only and must be labeled clearly in code and tests.
 
-### Explicit v1 retrieval contract
+### Explicit retrieval contract
 
 Because PyLate-style late interaction and Grafeo's vector search are not identical retrieval models, Lobster must define a bridging contract explicitly:
 
@@ -342,7 +342,7 @@ Because PyLate-style late interaction and Grafeo's vector search are not identic
 6. apply graph support, task overlap, recency heuristics, and MMR diversity for final ordering
 7. reject candidates below the confidence threshold (see retrieval routing spec)
 
-This gives Lobster a practical v1 path without requiring a second dedicated multi-vector index on day one.
+This gives Lobster a practical path without requiring a second dedicated multi-vector index on day one.
 
 ---
 
@@ -452,7 +452,7 @@ enum ProcessingState {
 
 ## Identity and canonicalization
 
-### Strict in v1
+### Strict canonicalization
 
 Deterministic canonicalization should be strong for:
 
@@ -461,7 +461,7 @@ Deterministic canonicalization should be strong for:
 - decisions
 - file references when exact path identity exists
 
-### Conservative in v1
+### Conservative canonicalization
 
 General semantic entities may be inserted conservatively and merged later if the merge is evidence-backed and deterministic.
 
@@ -487,7 +487,7 @@ High-value event classes:
 
 Even in a local-only system, Lobster should not persist obvious secrets or useless large blobs by default.
 
-v1 should include a deterministic filter layer for:
+Lobster should include a deterministic filter layer for:
 
 - ignored paths and file patterns
 - obvious secret/token-like strings
@@ -566,7 +566,7 @@ The summary is not just a transient pre-processing step. It is a first-class dur
 
 ## Decision detection
 
-Decision detection is **heuristics-first** in v1.
+Decision detection is **heuristics-first**.
 
 Signals may include:
 
@@ -579,7 +579,7 @@ Signals may include:
 
 ### Canonical ownership rule
 
-In v1, canonical `Decision` records are created only by the decision-detection pipeline.
+Canonical `Decision` records are created only by the decision-detection pipeline.
 
 The extractor may reference existing decisions and emit graph relations around them, but it does not create new canonical `Decision` records. If Lobster later experiments with model-suggested decisions, they should be stored as a separate non-canonical proposal artifact until explicitly promoted.
 
@@ -621,7 +621,7 @@ Possible implementations:
 
 The extractor must emit **typed structured facts**, not freeform Grafeo queries.
 
-In v1, extractor output may reference already-created canonical decisions, but it does not create new ones.
+Extractor output may reference already-created canonical decisions, but it does not create new ones.
 
 Example:
 
@@ -737,7 +737,7 @@ Automatic recall should search only over distilled ready artifacts:
 
 ### Candidate generation contract
 
-For v1, candidate retrieval uses the route selected by the classifier:
+Candidate retrieval uses the route selected by the classifier:
 
 1. **classify the query** into a retrieval route (exact, hybrid, hybrid+graph, or abstain)
 2. execute the route-specific search against Grafeo
@@ -872,7 +872,7 @@ The MCP server uses stdio for JSON-RPC transport. All Lobster logging must go to
 
 ## Dreaming / background synthesis
 
-In v1, dreaming means maintenance and consolidation.
+Dreaming means maintenance and consolidation.
 
 Allowed jobs:
 
@@ -912,7 +912,7 @@ This prevents ghost graph state, half-projected artifacts, and recall skew after
 
 ### Visibility scope
 
-In v1, readiness is **episode-scoped**. Derived summaries, decisions, entities, and graph relations inherit the visibility state of their parent episode for automatic and normal explicit recall.
+Readiness is **episode-scoped**. Derived summaries, decisions, entities, and graph relations inherit the visibility state of their parent episode for automatic and normal explicit recall.
 
 ### State transitions
 
@@ -979,7 +979,7 @@ Determinism is promised per:
 - summarizer/extractor/embedding model revision
 - backend/runtime choice
 
-CPU-backed execution should be the canonical fixture/golden-test mode in v1. Faster GPU or platform-specific backends may exist, but they should be treated as performance modes rather than the canonical determinism baseline.
+CPU-backed execution should be the canonical fixture/golden-test mode. Faster GPU or platform-specific backends may exist, but they should be treated as performance modes rather than the canonical determinism baseline.
 
 ## Required test layers
 
@@ -1007,7 +1007,7 @@ Behavioral tests are necessary, but they should not be the only compatibility me
 
 ### Telemetry rule
 
-Retrieval and surfacing telemetry is observational only in v1 unless a telemetry-derived signal is explicitly promoted into the versioned ranking feature set. This keeps fixture-based determinism intact.
+Retrieval and surfacing telemetry is observational only unless a telemetry-derived signal is explicitly promoted into the versioned ranking feature set. This keeps fixture-based determinism intact.
 
 ---
 
@@ -1021,7 +1021,7 @@ If Lobster is degraded:
 - retrieval may omit non-ready items
 - retries run later when possible
 
-The memory system must never block normal coding flow in v1.
+The memory system must never block normal coding flow.
 
 ---
 
@@ -1087,7 +1087,7 @@ This keeps truth, serving, extraction, and retrieval concerns separate.
 
 ---
 
-## Future extensions after v1
+## Future extensions
 
 - optional dedicated late-interaction code index
 - cross-repo opt-in linking
@@ -1102,7 +1102,7 @@ These are intentionally deferred.
 
 ## Final architecture statement
 
-Lobster v1 is a **deterministic layered memory system** for Claude Code:
+Lobster is a **deterministic layered memory system** for Claude Code:
 
 - `redb` stores durable truth, coordinated through a single-writer task
 - `Grafeo` serves semantic memory, projected via its programmatic CRUD API
