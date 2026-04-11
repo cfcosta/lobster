@@ -213,6 +213,7 @@
                   cargo-deny
                   cargo-mutants
                   cargo-nextest
+                  uv
                 ]
                 ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux (
                   with pkgs.cudaPackages;
