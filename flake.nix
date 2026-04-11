@@ -1,24 +1,31 @@
 {
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+
     treefmt-nix = {
       url = "github:numtide/treefmt-nix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
-    bun2nix = {
-      url = "github:nix-community/bun2nix";
-      inputs.nixpkgs.follows = "nixpkgs";
+
+    llm-agents = {
+      url = "github:numtide/llm-agents.nix";
+
+      inputs = {
+        nixpkgs.follows = "nixpkgs";
+        treefmt-nix.follows = "treefmt-nix";
+      };
     };
   };
 
   outputs =
     {
-      bun2nix,
       nixpkgs,
+      llm-agents,
       rust-overlay,
       treefmt-nix,
       ...
@@ -39,10 +46,7 @@
             let
               pkgs = import nixpkgs {
                 inherit system;
-                overlays = [
-                  (import rust-overlay)
-                  bun2nix.overlays.default
-                ];
+                overlays = [ (import rust-overlay) ];
                 config.allowUnfree = true;
               };
 
@@ -80,20 +84,6 @@
                   };
                 }).config.build.wrapper;
 
-              uiPath = pkgs.bun2nix.mkDerivation {
-                pname = "lobster-ui";
-                src = ./crates/lobster/ui;
-                packageJson = ./crates/lobster/ui/package.json;
-                bunDeps = pkgs.bun2nix.fetchBunDeps { bunNix = ./crates/lobster/ui/bun.nix; };
-                buildPhase = ''
-                  bun run build
-                '';
-                installPhase = ''
-                  mkdir $out
-                  cp -rf dist/* $out/
-                '';
-              };
-
               mkPackage =
                 {
                   name,
@@ -103,7 +93,6 @@
                   buildInputs ? [ ],
                   nativeBuildInputs ? [ ],
                   extraEnv ? { },
-                  extraPreBuild ? "",
                 }:
                 rustPlatform.buildRustPackage (
                   {
@@ -124,24 +113,6 @@
                       outputHashes."pylate-rs-1.0.4" = "sha256-eCLCX7+MGMpUumGq3oLPv3cTepHBmSFdVDVhcpEXiZY=";
                     };
                     RUSTFLAGS = "-C target-cpu=native";
-                    preBuild =
-                      pkgs.lib.optionalString (uiPath != null) ''
-                        rm -rf crates/lobster/ui/dist
-                        mkdir -p crates/lobster/ui
-                        cp -r ${uiPath} crates/lobster/ui/dist
-                      ''
-                      + extraPreBuild;
-
-                    postInstall = ''
-                      # Generate shell completions
-                      mkdir -p $out/share/bash-completion/completions
-                      mkdir -p $out/share/zsh/site-functions
-                      mkdir -p $out/share/fish/vendor_completions.d
-
-                      $out/bin/lobster completions bash > $out/share/bash-completion/completions/lobster
-                      $out/bin/lobster completions zsh > $out/share/zsh/site-functions/_lobster
-                      $out/bin/lobster completions fish > $out/share/fish/vendor_completions.d/lobster.fish
-                    '';
 
                     meta.mainProgram = mainProgram;
                   }
@@ -233,7 +204,7 @@
               buildInputs =
                 with pkgs;
                 [
-                  bun2nix.packages.${pkgs.stdenv.hostPlatform.system}.default
+                  llm-agents.packages.${pkgs.stdenv.hostPlatform.system}.beads-rust
                   formatter
                   rust
 
