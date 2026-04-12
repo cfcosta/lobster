@@ -222,10 +222,8 @@ async fn cmd_mcp(storage_dir: &std::path::Path) -> Result<()> {
     });
 
     tracing::info!("MCP server starting on stdio");
-    eprintln!("lobster: MCP server ready (JSON-RPC on stdio)");
 
-    lobster::mcp::server::run_server(&db, &grafeo)
-        .map_err(|e| anyhow::anyhow!("MCP server error: {e}"))
+    lobster::mcp::server::run_server(db, grafeo).await
 }
 
 fn cmd_status(storage_dir: &std::path::Path) -> Result<()> {
