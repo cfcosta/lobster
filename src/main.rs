@@ -108,20 +108,38 @@ async fn cmd_hook(
         // Fail open — continue to recall even if capture fails
     }
 
-    // Step 2: Check if we should finalize an episode
-    // (For now, finalize after every UserPromptSubmit since
-    // that's the primary hook entry point. Real segmentation
-    // would check idle gaps and repo transitions.)
+    // Step 2: Check segmentation — should we finalize an episode?
     if event.hook_type == lobster::hooks::events::HookType::UserPromptSubmit {
         let repo_path = event.working_directory.as_deref().unwrap_or("unknown");
+        let repo_id = lobster::store::ids::RepoId::derive(repo_path.as_bytes());
+        let config =
+            lobster::episodes::segmenter::SegmentationConfig::default();
+
+        let action = lobster::hooks::segmentation::check_segmentation(
+            &db,
+            event.timestamp_ms,
+            &repo_id,
+            seq,
+            &config,
+        );
+
+        let (start_seq, end_seq) = match action {
+            lobster::hooks::segmentation::SegmentAction::StartNew {
+                seq: s,
+            } => (s, s),
+            lobster::hooks::segmentation::SegmentAction::ExtendCurrent {
+                start_seq,
+                end_seq,
+            } => (start_seq, end_seq),
+        };
+
         let result = lobster::episodes::finalize::finalize_episode(
             &db,
             &grafeo,
             repo_path,
-            // Use the captured event as the episode content
             &serde_json::to_vec(&[&event]).unwrap_or_default(),
-            seq,
-            seq,
+            start_seq,
+            end_seq,
             event.user_prompt.clone(),
         )
         .await;
