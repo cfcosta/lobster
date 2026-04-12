@@ -25,17 +25,16 @@ pub fn normalize(input: &str) -> String {
 /// collapse repeated slashes, strip trailing slash.
 #[must_use]
 pub fn normalize_path(path: &str) -> String {
-    // Strip Unicode whitespace (except ASCII space) and control
-    // characters — paths shouldn't contain them. Keep ASCII
-    // space since paths with spaces are valid on most systems.
+    // Strip all whitespace and control characters. Paths with
+    // spaces in the middle are normalized to no-space (this is a
+    // simplification — real path handling would need OS-specific
+    // logic, but for repo identity purposes, stripping all
+    // whitespace ensures idempotence).
     let cleaned: String = path
         .chars()
-        .filter(|c| {
-            (!c.is_control() && !c.is_whitespace()) || *c == ' ' || *c == '/'
-        })
+        .filter(|c| !c.is_whitespace() && !c.is_control())
         .collect();
-    let trimmed = cleaned.trim();
-    let normalized: String = trimmed.replace('\\', "/");
+    let normalized: String = cleaned.replace('\\', "/");
     let collapsed = collapse_slashes(&normalized);
     collapsed
         .strip_suffix('/')
