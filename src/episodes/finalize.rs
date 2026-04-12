@@ -178,6 +178,33 @@ pub async fn finalize_episode(
         }
     }
 
+    // ── Step 6-7: Embedding (runs first, doesn't depend on extraction)
+    let artifact_id = crate::store::ids::ArtifactId::derive(
+        format!("emb:{episode_id}").as_bytes(),
+    );
+    let policy = crate::embeddings::proxy::policy_for("summary");
+
+    let embedding_artifact = if let Ok(mut model) =
+        crate::embeddings::encoder::load_model()
+    {
+        match crate::embeddings::encoder::encode_text(
+            &mut model,
+            &summary.summary_text,
+            artifact_id,
+            policy,
+        ) {
+            Ok(art) => art,
+            Err(_) => fallback_embedding(&summary.summary_text, artifact_id),
+        }
+    } else {
+        fallback_embedding(&summary.summary_text, artifact_id)
+    };
+    let _ = crud::put_embedding_artifact(db, &embedding_artifact);
+
+    let proxy_vector = crate::embeddings::proxy::bytes_to_vector(
+        &embedding_artifact.pooled_vector_bytes,
+    );
+
     // ── Steps 6-8: Extract, validate, persist ────────────
     let extractor = HeuristicExtractor;
     let decisions_for_extraction =
@@ -235,38 +262,6 @@ pub async fn finalize_episode(
             "step 8 (persist extraction): {e}"
         ));
     }
-
-    // ── Step 8b: Create and persist EmbeddingArtifact ────
-    // Try real ColBERT encoding if the model is available.
-    // Falls back to byte-level proxy if model not installed.
-    let artifact_id = crate::store::ids::ArtifactId::derive(
-        format!("emb:{episode_id}").as_bytes(),
-    );
-    let policy = crate::embeddings::proxy::policy_for("summary");
-
-    let embedding_artifact = if let Ok(mut model) =
-        crate::embeddings::encoder::load_model()
-    {
-        // Real ColBERT encoding with hierarchical_pooling
-        match crate::embeddings::encoder::encode_text(
-            &mut model,
-            &summary.summary_text,
-            artifact_id,
-            policy,
-        ) {
-            Ok(art) => art,
-            Err(_) => fallback_embedding(&summary.summary_text, artifact_id),
-        }
-    } else {
-        // Model not installed — use byte-level fallback
-        fallback_embedding(&summary.summary_text, artifact_id)
-    };
-    let _ = crud::put_embedding_artifact(db, &embedding_artifact);
-
-    // Parse the proxy vector for Grafeo projection
-    let proxy_vector = crate::embeddings::proxy::bytes_to_vector(
-        &embedding_artifact.pooled_vector_bytes,
-    );
 
     // ── Step 9: Project to Grafeo ────────────────────────
     let ep_node = projection::project_episode(grafeo, &episode);

@@ -156,16 +156,43 @@ pub fn memory_search(
     let results = execute_query(query, db, grafeo, true);
     let hits: Vec<ContextItem> = results
         .into_iter()
-        .map(|r| ContextItem {
-            artifact_type: r.artifact_type,
-            snippet: None,
-            repo_id: None,
-            task_id: None,
-            confidence: None,
-            provenance: Some(r.episode_id.to_string()),
-            graph_context: None,
-            score: r.score,
-            content: format!("Score: {:.2}", r.score),
+        .map(|r| {
+            // Load actual content from redb for the snippet
+            let (snippet, confidence) = match r.artifact_type.as_str() {
+                "decision" => {
+                    let dec = crud::get_decision(db, &r.episode_id);
+                    match dec {
+                        Ok(d) => (
+                            Some(d.statement.clone()),
+                            Some(format!("{:?}", d.confidence)),
+                        ),
+                        Err(_) => (None, None),
+                    }
+                }
+                "summary" => {
+                    let sum = crud::get_summary_artifact(db, &r.episode_id);
+                    match sum {
+                        Ok(s) => {
+                            let preview: String =
+                                s.summary_text.chars().take(200).collect();
+                            (Some(preview), None)
+                        }
+                        Err(_) => (None, None),
+                    }
+                }
+                _ => (None, None),
+            };
+            ContextItem {
+                artifact_type: r.artifact_type,
+                snippet,
+                repo_id: None,
+                task_id: None,
+                confidence,
+                provenance: Some(r.episode_id.to_string()),
+                graph_context: None,
+                score: r.score,
+                content: format!("Score: {:.2}", r.score),
+            }
         })
         .collect();
     SearchResult {

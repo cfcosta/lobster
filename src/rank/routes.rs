@@ -165,7 +165,37 @@ fn search_grafeo(
     let mut candidates = Vec::new();
     let query_lower = query.to_lowercase();
 
-    // Try BM25 text search on decision statements (uses index)
+    // Per spec: "use Grafeo hybrid search to fetch top-K candidates"
+    // Try hybrid search (BM25 + vector) on episode summaries when
+    // proxy vectors exist on nodes. Falls through to BM25-only if
+    // no vector index or no query vector available.
+    if let Ok(hits) = grafeo.hybrid_search(
+        crate::graph::db::labels::EPISODE,
+        "summary_text",
+        "embedding",
+        query,
+        None, // no query vector yet (would need model to encode)
+        20,
+        None, // default RRF fusion
+    ) {
+        for (node_id, _score) in &hits {
+            if let Some(node) = grafeo.get_node(*node_id) {
+                if let Some(id_val) = node.get_property("episode_id") {
+                    if let Some(id_str) = id_val.as_str() {
+                        if let Ok(raw_id) = id_str.parse() {
+                            candidates.push(ScoredCandidate {
+                                id: raw_id,
+                                score: 0.85,
+                                artifact_type: "summary".into(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // BM25 text search on decision statements (uses index)
     if let Ok(hits) = grafeo.text_search(
         crate::graph::db::labels::DECISION,
         "statement",

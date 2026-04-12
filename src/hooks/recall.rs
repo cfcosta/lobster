@@ -120,8 +120,20 @@ pub fn construct_query(event: &HookEvent) -> Option<String> {
     match event.hook_type {
         HookType::UserPromptSubmit => event.user_prompt.clone(),
         HookType::PostToolUse | HookType::PostToolUseFailure => {
-            // Use tool name as query context
-            event.tool_name.clone()
+            // Build query from tool name + relevant input context.
+            // Per spec: "lightweight reminders after heavy edits,
+            // failures, test results, major task transitions"
+            let tool = event.tool_name.as_deref().unwrap_or("");
+            let input_context = event
+                .tool_input
+                .as_ref()
+                .and_then(|v| v.get("path"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            if tool.is_empty() && input_context.is_empty() {
+                return None;
+            }
+            Some(format!("{tool} {input_context}").trim().to_string())
         }
         HookType::NotificationPost => None,
     }

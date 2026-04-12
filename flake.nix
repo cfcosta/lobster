@@ -93,10 +93,16 @@
                   buildInputs ? [ ],
                   nativeBuildInputs ? [ ],
                   extraEnv ? { },
+                  preBuild ? "",
                 }:
                 rustPlatform.buildRustPackage (
                   {
-                    inherit name buildInputs buildFeatures;
+                    inherit
+                      name
+                      buildInputs
+                      buildFeatures
+                      preBuild
+                      ;
                     nativeBuildInputs = nativeBuildInputs;
                     src = ./.;
                     cargoBuildFlags = [
@@ -110,7 +116,7 @@
                     doCheck = false;
                     cargoLock = {
                       lockFile = ./Cargo.lock;
-                      outputHashes."pylate-rs-1.0.4" = "sha256-eCLCX7+MGMpUumGq3oLPv3cTepHBmSFdVDVhcpEXiZY=";
+                      outputHashes."pylate-rs-1.0.4" = "sha256-rgpPyruOlufO97XPc5NcVoN4TZBLAWxakzIxgeG/W5c=";
                     };
                     RUSTFLAGS = "-C target-cpu=native";
 
@@ -155,7 +161,7 @@
           cutlassSrc = pkgs.fetchgit {
             url = "https://github.com/NVIDIA/cutlass.git";
             rev = "7d49e6c7e2f8896c47f586706e67e1fb215529dc";
-            hash = "sha256-cSWVzyuDC8EidTAZzHbVz0jUNK4zx5AAwfUV6lUXTXs=";
+            hash = "sha256-GR9GeR8xjyr6GPX/O2qXaAlIek4QzKxn/hjAUe6fIQU=";
             leaveDotGit = true;
             fetchSubmodules = false;
           };
@@ -173,7 +179,7 @@
             extraEnv = cudaEnv // {
               CUDAFORGE_HOME = "/tmp/cudaforge-cache";
             };
-            extraPreBuild = ''
+            preBuild = ''
               mkdir -p $CUDAFORGE_HOME/git/checkouts
               cp -r ${cutlassSrc} $CUDAFORGE_HOME/git/checkouts/cutlass-7d49e6c7e2f8896c
               chmod -R u+w $CUDAFORGE_HOME/git/checkouts/cutlass-7d49e6c7e2f8896c
