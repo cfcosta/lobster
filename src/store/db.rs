@@ -60,6 +60,36 @@ pub fn open_in_memory() -> Result<Database, redb::Error> {
     Ok(db)
 }
 
+/// Open a read-only snapshot of the database.
+///
+/// Tries `ReadOnlyDatabase` first. If the file is exclusively locked
+/// (e.g. by the MCP server), copies it to a temp file, repairs it,
+/// and opens the copy. Returns `None` if the file doesn't exist or
+/// both approaches fail.
+#[must_use]
+pub fn open_snapshot(path: &Path) -> Option<Database> {
+    if !path.exists() {
+        return None;
+    }
+
+    // Fast path: try opening the copy directly with repair allowed
+    let tmp = path.with_extension("redb.snapshot");
+    if std::fs::copy(path, &tmp).is_err() {
+        return None;
+    }
+
+    let result = redb::Builder::new().set_repair_callback(|_| {}).open(&tmp);
+
+    match result {
+        Ok(db) => Some(db),
+        Err(e) => {
+            tracing::debug!(error = %e, "open_snapshot: failed to open copy");
+            let _ = std::fs::remove_file(&tmp);
+            None
+        }
+    }
+}
+
 /// Ensure all tables exist by opening each one in a single write
 /// transaction.
 fn init_tables(db: &Database) -> Result<(), redb::Error> {

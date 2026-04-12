@@ -93,19 +93,71 @@ async fn cmd_hook(
     // owner of the redb database and will watch the staging directory
     // via inotify to ingest events as they arrive.
     //
-    // Hooks NEVER open redb — even briefly holding the lock prevents
-    // the MCP server from starting (hooks fire on every tool call,
-    // creating perpetual contention).
+    // Hooks NEVER open redb directly — they use a snapshot copy to
+    // avoid lock contention with the MCP server.
     if let Err(e) = lobster::store::staging::stage_event(storage_dir, &input) {
         tracing::warn!(error = %e, "failed to stage event");
     }
 
-    let output = lobster::hooks::events::HookOutput::empty();
+    // Run automatic recall for prompt events. Opens a snapshot copy
+    // of the database (never the live file) so we don't block the
+    // MCP server. Fails open: if the DB is unavailable, return empty.
+    let output = try_hook_recall(storage_dir, &event);
+
     let json =
         serde_json::to_string(&output).context("serialize hook output")?;
     println!("{json}");
 
     Ok(())
+}
+
+/// Attempt automatic recall for a hook event.
+///
+/// Opens a read-only snapshot of the database, rebuilds Grafeo, runs
+/// the recall pipeline, and formats the result. Returns empty output
+/// if the database is unavailable or no relevant memories are found.
+fn try_hook_recall(
+    storage_dir: &std::path::Path,
+    event: &lobster::hooks::events::HookEvent,
+) -> lobster::hooks::events::HookOutput {
+    use lobster::hooks::{
+        events::HookOutput,
+        recall::run_recall,
+        tiered::{OutputTier, classify_tier, format_hint},
+    };
+
+    // Only run recall for events that produce queries
+    if lobster::hooks::recall::construct_query(event).is_none() {
+        return HookOutput::empty();
+    }
+
+    let db_path = lobster::app::config::db_path(storage_dir);
+    let Some(db) = lobster::store::db::open_snapshot(&db_path) else {
+        return HookOutput::empty();
+    };
+
+    // Rebuild Grafeo from the snapshot for retrieval
+    let grafeo = lobster::graph::db::new_in_memory();
+    if let Err(e) = lobster::graph::rebuild::rebuild_from_redb(&db, &grafeo) {
+        tracing::debug!(error = %e, "hook recall: failed to rebuild grafeo");
+        return HookOutput::empty();
+    }
+    lobster::graph::indexes::ensure_indexes(&grafeo);
+
+    let payload = run_recall(event, &db, &grafeo);
+    let tier = classify_tier(&payload);
+
+    match tier {
+        OutputTier::Silent => HookOutput::empty(),
+        OutputTier::Hint | OutputTier::Structured => {
+            let message = format_hint(&payload);
+            if message.is_empty() {
+                HookOutput::empty()
+            } else {
+                HookOutput::with_message(message)
+            }
+        }
+    }
 }
 
 #[allow(clippy::unused_async)]
