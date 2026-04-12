@@ -3,4 +3,5 @@
 pub mod config;
 pub mod failopen;
 pub mod hooks_config;
+pub mod llm;
 pub mod status;

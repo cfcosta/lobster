@@ -1,12 +1,8 @@
 //! rig-core backed LLM extractor.
 //!
-//! Uses rig-core's provider-agnostic API for structured extraction
-//! of entities and relations from episode content.
-
-use rig::{
-    client::{CompletionClient, ProviderClient},
-    completion::Prompt,
-};
+//! Uses `app::llm::call` which reads provider and model from env:
+//! - `ANTHROPIC_API_KEY` + `ANTHROPIC_MODEL` (default: claude-sonnet-4-6)
+//! - `OPENAI_API_KEY` + `OPENAI_MODEL` (default: gpt-4o-mini)
 
 use crate::extract::traits::{
     ExtractedEntity,
@@ -41,41 +37,15 @@ impl Extractor for RigExtractor {
             input.summary_text, input.repo_path,
         );
 
-        let response = call_llm(&prompt)
-            .await
-            .map_err(ExtractionError::ModelUnavailable)?;
+        let response = crate::app::llm::call(
+            "You are a precise entity and relation extractor. \
+             Output only valid JSON, no markdown fences.",
+            &prompt,
+        )
+        .await
+        .map_err(ExtractionError::ModelUnavailable)?;
 
-        // Parse the LLM response as JSON
         parse_extraction_response(&response)
-    }
-}
-
-async fn call_llm(prompt: &str) -> Result<String, String> {
-    if let Ok(_key) = std::env::var("ANTHROPIC_API_KEY") {
-        let client = rig::providers::anthropic::Client::from_env();
-        let agent = client
-            .agent("claude-sonnet-4-6")
-            .preamble(
-                "You are a precise entity and relation extractor. \
-                 Output only valid JSON, no markdown fences.",
-            )
-            .build();
-        agent.prompt(prompt).await.map_err(|e| e.to_string())
-    } else if let Ok(_key) = std::env::var("OPENAI_API_KEY") {
-        let client = rig::providers::openai::Client::from_env();
-        let agent = client
-            .agent("gpt-4o-mini")
-            .preamble(
-                "You are a precise entity and relation extractor. \
-                 Output only valid JSON, no markdown fences.",
-            )
-            .build();
-        agent.prompt(prompt).await.map_err(|e| e.to_string())
-    } else {
-        Err("No ANTHROPIC_API_KEY or OPENAI_API_KEY set. \
-             Lobster requires an LLM API key for summarization \
-             and extraction."
-            .into())
     }
 }
 

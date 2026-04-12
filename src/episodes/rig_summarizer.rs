@@ -1,10 +1,9 @@
 //! rig-core backed LLM summarizer.
 //!
-//! Per spec: "The primary summarizer implementation wraps rig-core,
-//! which is Tokio-based." Uses the provider-agnostic rig API for
-//! Anthropic/OpenAI/Ollama backends.
+//! Uses `app::llm::call` which reads provider and model from env:
+//! - `ANTHROPIC_API_KEY` + `ANTHROPIC_MODEL` (default: claude-sonnet-4-6)
+//! - `OPENAI_API_KEY` + `OPENAI_MODEL` (default: gpt-4o-mini)
 
-use rig::client::{CompletionClient, ProviderClient};
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -12,12 +11,6 @@ use crate::{
     store::{ids::EpisodeId, schema::SummaryArtifact},
 };
 
-/// rig-core backed LLM summarizer.
-///
-/// Reads the LLM provider from environment variables:
-/// - `ANTHROPIC_API_KEY` for Anthropic
-/// - `OPENAI_API_KEY` for `OpenAI`
-/// - Falls back to heuristic if no key is set.
 pub struct RigSummarizer {
     pub revision: String,
 }
@@ -35,52 +28,20 @@ impl Summarizer for RigSummarizer {
         &self,
         input: SummaryInput,
     ) -> Result<SummaryArtifact, SummaryError> {
-        use rig::completion::Prompt;
+        let prompt = format!(
+            "Task: {}\nRepo: {}\nEvents:\n{}",
+            input.task_title.as_deref().unwrap_or("unknown"),
+            input.repo_path,
+            String::from_utf8_lossy(&input.episode_events_json),
+        );
 
-        // Try Anthropic first, then OpenAI, then fall back
-        let response = if std::env::var("ANTHROPIC_API_KEY").is_ok() {
-            let client = rig::providers::anthropic::Client::from_env();
-            let agent = client
-                .agent("claude-sonnet-4-6")
-                .preamble(
-                    "Summarize the following episode events \
-                     concisely. Focus on decisions made, tools \
-                     used, and outcomes.",
-                )
-                .build();
-            agent
-                .prompt(&format!(
-                    "Task: {}\nRepo: {}\nEvents: {}",
-                    input.task_title.as_deref().unwrap_or("unknown"),
-                    input.repo_path,
-                    String::from_utf8_lossy(&input.episode_events_json,)
-                ))
-                .await
-                .map_err(|e| SummaryError::ModelUnavailable(e.to_string()))?
-        } else if std::env::var("OPENAI_API_KEY").is_ok() {
-            let client = rig::providers::openai::Client::from_env();
-            let agent = client
-                .agent("gpt-4o-mini")
-                .preamble(
-                    "Summarize the following episode events \
-                     concisely. Focus on decisions made, tools \
-                     used, and outcomes.",
-                )
-                .build();
-            agent
-                .prompt(&format!(
-                    "Task: {}\nRepo: {}\nEvents: {}",
-                    input.task_title.as_deref().unwrap_or("unknown"),
-                    input.repo_path,
-                    String::from_utf8_lossy(&input.episode_events_json,)
-                ))
-                .await
-                .map_err(|e| SummaryError::ModelUnavailable(e.to_string()))?
-        } else {
-            return Err(SummaryError::ModelUnavailable(
-                "No ANTHROPIC_API_KEY or OPENAI_API_KEY set".into(),
-            ));
-        };
+        let response = crate::app::llm::call(
+            "Summarize the following episode events concisely. \
+             Focus on decisions made, tools used, and outcomes.",
+            &prompt,
+        )
+        .await
+        .map_err(SummaryError::ModelUnavailable)?;
 
         let mut hasher = Sha256::new();
         hasher.update(response.as_bytes());
