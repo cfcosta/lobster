@@ -54,8 +54,7 @@ pub fn mean_pool(token_embeddings: &[f32], dimensions: usize) -> Vec<f32> {
     #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
     let count = non_padding_count as f64;
     #[allow(clippy::cast_possible_truncation)]
-    let result: Vec<f32> =
-        sum.iter().map(|&s| (s / count) as f32).collect();
+    let result: Vec<f32> = sum.iter().map(|&s| (s / count) as f32).collect();
     result
 }
 
