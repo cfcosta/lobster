@@ -164,7 +164,7 @@ pub async fn finalize_episode_at(
         if conf == Confidence::High || conf == Confidence::Medium {
             // Group signals into a single decision statement.
             // In a real system each distinct decision would be
-            // separate, but the heuristic detector produces
+            // separate, but the decision detector produces
             // signals from a single summary so we merge them.
             let statement: String = signals
                 .iter()
@@ -311,7 +311,7 @@ pub async fn finalize_episode_at(
 
     let extraction_artifact = ExtractionArtifact {
         episode_id,
-        revision: "heuristic-v1".to_string(),
+        revision: "rig-v1".to_string(),
         output_json,
         payload_checksum,
     };
@@ -414,8 +414,17 @@ mod tests {
     use super::*;
     use crate::{graph::db as grafeo_db, store::db};
 
+    fn has_api_key() -> bool {
+        std::env::var("ANTHROPIC_API_KEY").is_ok()
+            || std::env::var("OPENAI_API_KEY").is_ok()
+    }
+
     #[tokio::test]
     async fn test_finalize_empty_episode() {
+        if !has_api_key() {
+            eprintln!("skipping: no API key");
+            return;
+        }
         let database = db::open_in_memory().unwrap();
         let grafeo = grafeo_db::new_in_memory();
 
@@ -444,6 +453,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_finalize_creates_summary_with_correct_episode_id() {
+        if !has_api_key() {
+            eprintln!("skipping: no API key");
+            return;
+        }
         let database = db::open_in_memory().unwrap();
         let grafeo = grafeo_db::new_in_memory();
 
@@ -477,17 +490,21 @@ mod tests {
     /// created in redb with evidence.
     #[tokio::test]
     async fn test_finalize_promotes_and_persists_decisions() {
+        if !has_api_key() {
+            eprintln!("skipping: no API key");
+            return;
+        }
         let database = db::open_in_memory().unwrap();
         let grafeo = grafeo_db::new_in_memory();
 
         // Craft events whose summary will trigger decision
-        // detection. The heuristic summarizer produces text like
+        // detection. The LLM summarizer produces text like
         // "Task: ...", and the decision detector looks for
         // patterns in the summary text. We can't control the
         // summary content directly, so instead we need the
         // summary to contain decision language.
         //
-        // But the heuristic summarizer produces generic text
+        // But the summarizer produces generic text
         // from event metadata — it won't contain "I chose" etc.
         // So for this test, let's verify the pipeline flow
         // differently: we know that when no decision signals
@@ -504,7 +521,7 @@ mod tests {
         )
         .await;
 
-        // With empty events, the heuristic summarizer produces
+        // With empty events, the summarizer produces
         // generic text that won't trigger decision signals
         match result {
             FinalizeResult::Ready {
@@ -525,6 +542,10 @@ mod tests {
     /// auto-promotion must create and persist a Decision record.
     #[tokio::test]
     async fn test_decision_detection_actually_persists() {
+        if !has_api_key() {
+            eprintln!("skipping: no API key");
+            return;
+        }
         let database = db::open_in_memory().unwrap();
 
         // We'll test the decision persistence directly by calling
@@ -581,6 +602,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_finalize_creates_extraction_with_real_checksum() {
+        if !has_api_key() {
+            eprintln!("skipping: no API key");
+            return;
+        }
         let database = db::open_in_memory().unwrap();
         let grafeo = grafeo_db::new_in_memory();
 
@@ -611,6 +636,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_finalize_projects_to_grafeo() {
+        if !has_api_key() {
+            eprintln!("skipping: no API key");
+            return;
+        }
         let database = db::open_in_memory().unwrap();
         let grafeo = grafeo_db::new_in_memory();
 
@@ -634,19 +663,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_finalize_is_deterministic() {
-        let db1 = db::open_in_memory().unwrap();
-        let g1 = grafeo_db::new_in_memory();
-        let db2 = db::open_in_memory().unwrap();
-        let g2 = grafeo_db::new_in_memory();
+    async fn test_finalize_completes_successfully() {
+        if !has_api_key() {
+            eprintln!("skipping: no API key");
+            return;
+        }
+        let database = db::open_in_memory().unwrap();
+        let grafeo = grafeo_db::new_in_memory();
 
-        let events = b"[]";
+        let result = finalize_episode(
+            &database,
+            &grafeo,
+            "/repo",
+            b"[]",
+            0,
+            5,
+            Some("Test task".into()),
+        )
+        .await;
 
-        let r1 = finalize_episode(&db1, &g1, "/repo", events, 0, 5, None).await;
-        let r2 = finalize_episode(&db2, &g2, "/repo", events, 0, 5, None).await;
-
-        assert!(matches!(r1, FinalizeResult::Ready { .. }));
-        assert!(matches!(r2, FinalizeResult::Ready { .. }));
-        assert_eq!(g1.node_count(), g2.node_count());
+        // With LLM backends, both runs should succeed
+        // (exact node count may vary since LLM output is
+        // non-deterministic — determinism is per model revision
+        // and fixed seed, not across arbitrary calls)
+        assert!(
+            matches!(result, FinalizeResult::Ready { .. }),
+            "finalization should succeed: {result:?}"
+        );
+        assert!(
+            grafeo.node_count() >= 1,
+            "should have at least the episode node"
+        );
     }
 }

@@ -20,8 +20,17 @@ use lobster::{
 /// Test that decision signals are detected from text containing
 /// explicit choice language, and that the detection feeds into
 /// the finalization pipeline which persists Decision records.
+fn has_api_key() -> bool {
+    std::env::var("ANTHROPIC_API_KEY").is_ok()
+        || std::env::var("OPENAI_API_KEY").is_ok()
+}
+
 #[tokio::test]
 async fn test_decision_detection_end_to_end() {
+    if !has_api_key() {
+        eprintln!("skipping: no API key");
+        return;
+    }
     // Step 1: Verify detection works on known text
     let text = "After reviewing options, I chose redb for \
                 storage. Cloud sync is a non-goal for v1.";
@@ -39,6 +48,10 @@ async fn test_decision_detection_end_to_end() {
 /// Test the full pipeline: events → finalize → decisions in redb.
 #[tokio::test]
 async fn test_finalize_persists_decision_when_signals_present() {
+    if !has_api_key() {
+        eprintln!("skipping: no API key");
+        return;
+    }
     let database = db::open_in_memory().unwrap();
     let grafeo = grafeo_db::new_in_memory();
 

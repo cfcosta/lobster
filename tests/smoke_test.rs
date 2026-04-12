@@ -16,8 +16,17 @@ use lobster::{
 };
 
 /// Complete smoke test exercising every layer of the system.
+fn has_api_key() -> bool {
+    std::env::var("ANTHROPIC_API_KEY").is_ok()
+        || std::env::var("OPENAI_API_KEY").is_ok()
+}
+
 #[tokio::test]
 async fn test_full_pipeline_smoke() {
+    if !has_api_key() {
+        eprintln!("skipping: no API key");
+        return;
+    }
     // 1. Create storage
     let database = db::open_in_memory().unwrap();
     let grafeo = grafeo_db::new_in_memory();
@@ -93,6 +102,10 @@ async fn test_full_pipeline_smoke() {
 /// Smoke test: multiple episodes accumulate correctly.
 #[tokio::test]
 async fn test_multiple_episodes_accumulate() {
+    if !has_api_key() {
+        eprintln!("skipping: no API key");
+        return;
+    }
     let database = db::open_in_memory().unwrap();
     let grafeo = grafeo_db::new_in_memory();
 

@@ -72,7 +72,7 @@ pub fn run_cycle(db: &Database, config: &DreamConfig) -> DreamCycleResult {
                 let _ = crud::put_episode(db, &ep);
                 result.episodes_failed_final += 1;
             } else {
-                // Re-attempt extraction with the heuristic
+                // Re-attempt extraction with the LLM
                 // extractor (tighter constraints on retry)
                 let summary_text =
                     crud::get_summary_artifact(db, &ep.episode_id.raw())

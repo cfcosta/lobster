@@ -10,8 +10,17 @@ use lobster::{
     store::db,
 };
 
+fn has_api_key() -> bool {
+    std::env::var("ANTHROPIC_API_KEY").is_ok()
+        || std::env::var("OPENAI_API_KEY").is_ok()
+}
+
 #[tokio::test]
 async fn test_rebuild_from_scratch_matches_original() {
+    if !has_api_key() {
+        eprintln!("skipping: no API key");
+        return;
+    }
     let database = db::open_in_memory().unwrap();
 
     // Phase 1: Finalize several episodes into original Grafeo
@@ -58,6 +67,10 @@ async fn test_rebuild_from_scratch_matches_original() {
 
 #[tokio::test]
 async fn test_rebuild_excludes_non_ready_episodes() {
+    if !has_api_key() {
+        eprintln!("skipping: no API key");
+        return;
+    }
     let database = db::open_in_memory().unwrap();
     let grafeo = grafeo_db::new_in_memory();
 
