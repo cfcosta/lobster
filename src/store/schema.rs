@@ -76,6 +76,10 @@ pub struct Episode {
     pub task_id: Option<TaskId>,
     pub processing_state: ProcessingState,
     pub finalized_ts_utc_ms: i64,
+    /// Number of extraction retry attempts. Spec says mark
+    /// `RetryQueued` after first failure, `FailedFinal` after second.
+    #[serde(default)]
+    pub retry_count: u32,
 }
 
 // ── Confidence + Decision (d49.4) ────────────────────────────
@@ -267,6 +271,7 @@ mod tests {
             finalized_ts_utc_ms: tc.draw(
                 gs::integers::<i64>().min_value(0).max_value(i64::MAX / 2),
             ),
+            retry_count: 0,
         }
     }
 

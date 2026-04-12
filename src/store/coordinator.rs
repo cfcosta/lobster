@@ -215,6 +215,7 @@ mod tests {
             task_id: None,
             processing_state: ProcessingState::Pending,
             finalized_ts_utc_ms: 1_700_000_000_000,
+            retry_count: 0,
         };
 
         write_handle.put_episode(ep.clone()).await.expect("put");

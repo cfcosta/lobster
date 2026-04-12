@@ -163,7 +163,15 @@ async fn cmd_mcp(storage_dir: &std::path::Path) -> Result<()> {
     std::fs::create_dir_all(storage_dir).context("create storage dir")?;
 
     let db_path = lobster::app::config::db_path(storage_dir);
-    let db = lobster::store::db::open(&db_path).context("open database")?;
+    let db = std::sync::Arc::new(
+        lobster::store::db::open(&db_path).context("open database")?,
+    );
+
+    // Spawn the write coordinator for serialized writes
+    let (write_handle, _coordinator) =
+        lobster::store::coordinator::spawn(db.clone(), 64);
+    // write_handle is available for tools that need to write
+    let _ = write_handle;
 
     // Rebuild Grafeo from redb for the MCP session
     let grafeo = lobster::graph::db::new_in_memory();

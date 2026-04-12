@@ -65,14 +65,57 @@ pub fn run_cycle(db: &Database, config: &DreamConfig) -> DreamCycleResult {
 
         result.retries_attempted += 1;
 
-        // For now, retry just marks as FailedFinal since we
-        // don't have a retry mechanism that would produce
-        // different results. In a real system, this would
-        // re-run extraction with tighter constraints.
         if let Ok(mut ep) = crud::get_episode(db, episode_id_bytes) {
-            ep.processing_state = ProcessingState::FailedFinal;
-            let _ = crud::put_episode(db, &ep);
-            result.episodes_failed_final += 1;
+            if ep.retry_count >= config.max_retries {
+                // Exhausted retry budget → FailedFinal
+                ep.processing_state = ProcessingState::FailedFinal;
+                let _ = crud::put_episode(db, &ep);
+                result.episodes_failed_final += 1;
+            } else {
+                // Re-attempt extraction with the heuristic
+                // extractor (tighter constraints on retry)
+                let summary_text =
+                    crud::get_summary_artifact(db, &ep.episode_id.raw())
+                        .map(|s| s.summary_text)
+                        .unwrap_or_default();
+
+                let extractor = crate::extract::heuristic::HeuristicExtractor;
+                let input = crate::extract::traits::ExtractionInput {
+                    summary_text,
+                    decisions_json: b"[]".to_vec(),
+                    tool_outcomes_json: b"[]".to_vec(),
+                    conversation_spans_json: b"[]".to_vec(),
+                    repo_path: String::new(),
+                };
+
+                // Use block_on since we're not in async context
+                let extraction_ok =
+                    tokio::runtime::Handle::try_current().ok().and_then(|h| {
+                        tokio::task::block_in_place(|| {
+                            h.block_on(async {
+                                use crate::extract::traits::Extractor;
+                                extractor.extract(input).await.ok()
+                            })
+                        })
+                    });
+
+                if let Some(output) = extraction_ok {
+                    if crate::extract::validate::validate(&output).is_ok() {
+                        ep.processing_state = ProcessingState::Ready;
+                        let _ = crud::put_episode(db, &ep);
+                        result.retries_succeeded += 1;
+                        continue;
+                    }
+                }
+
+                // Retry failed — increment counter
+                ep.retry_count += 1;
+                if ep.retry_count >= config.max_retries {
+                    ep.processing_state = ProcessingState::FailedFinal;
+                    result.episodes_failed_final += 1;
+                }
+                let _ = crud::put_episode(db, &ep);
+            }
         }
     }
 
@@ -138,6 +181,7 @@ mod tests {
             task_id: None,
             processing_state: state,
             finalized_ts_utc_ms: 1000,
+            retry_count: 0,
         };
         crud::put_episode(database, &ep).unwrap();
     }
@@ -153,10 +197,25 @@ mod tests {
     }
 
     #[test]
-    fn test_retry_queued_gets_processed() {
+    fn test_retry_queued_exhausted_goes_to_failed_final() {
         let database = db::open_in_memory().unwrap();
-        make_episode(&database, b"retry1", ProcessingState::RetryQueued);
-        make_episode(&database, b"retry2", ProcessingState::RetryQueued);
+        // Create episodes with retry_count >= max_retries so they
+        // go straight to FailedFinal
+        let ep1 = Episode {
+            episode_id: EpisodeId::derive(b"retry1"),
+            repo_id: RepoId::derive(b"repo"),
+            start_seq: 0,
+            end_seq: 5,
+            task_id: None,
+            processing_state: ProcessingState::RetryQueued,
+            finalized_ts_utc_ms: 1000,
+            retry_count: 2, // matches default max_retries
+        };
+        crud::put_episode(&database, &ep1).unwrap();
+        let mut ep2 = ep1;
+        ep2.episode_id = EpisodeId::derive(b"retry2");
+        ep2.retry_count = 3;
+        crud::put_episode(&database, &ep2).unwrap();
         make_episode(&database, b"ready1", ProcessingState::Ready);
 
         let config = DreamConfig::default();

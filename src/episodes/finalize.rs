@@ -88,6 +88,7 @@ pub async fn finalize_episode(
         task_id: None,
         processing_state: ProcessingState::Pending,
         finalized_ts_utc_ms: now_ms,
+        retry_count: 0,
     };
 
     if let Err(e) = crud::put_episode(db, &episode) {
@@ -192,8 +193,12 @@ pub async fn finalize_episode(
     let extraction_output = match extractor.extract(extraction_input).await {
         Ok(output) => output,
         Err(e) => {
+            // Spec: mark RetryQueued on first failure, increment
+            // retry count. The dreaming scheduler will attempt
+            // re-extraction and mark FailedFinal if it fails again.
             let mut retry_ep = episode.clone();
             retry_ep.processing_state = ProcessingState::RetryQueued;
+            retry_ep.retry_count += 1;
             let _ = crud::put_episode(db, &retry_ep);
             return FinalizeResult::RetryQueued {
                 episode_id,
@@ -205,6 +210,7 @@ pub async fn finalize_episode(
     if let Err(errors) = validate::validate(&extraction_output) {
         let mut retry_ep = episode.clone();
         retry_ep.processing_state = ProcessingState::RetryQueued;
+        retry_ep.retry_count += 1;
         let _ = crud::put_episode(db, &retry_ep);
         return FinalizeResult::RetryQueued {
             episode_id,
@@ -229,6 +235,39 @@ pub async fn finalize_episode(
             "step 8 (persist extraction): {e}"
         ));
     }
+
+    // ── Step 8b: Create and persist EmbeddingArtifact ────
+    // Convert summary text to a simple byte-level "embedding"
+    // (real ColBERT encoding deferred to model runtime), then
+    // mean-pool to a proxy vector.
+    let text_bytes: Vec<f32> = summary
+        .summary_text
+        .bytes()
+        .map(|b| f32::from(b) / 255.0)
+        .collect();
+    let dims = 16; // proxy vector dimensions
+    let padded_len = text_bytes.len().div_ceil(dims) * dims;
+    let mut padded = text_bytes;
+    padded.resize(padded_len, 0.0);
+    let proxy = crate::embeddings::proxy::mean_pool(&padded, dims);
+    let pooled_bytes = crate::embeddings::proxy::vector_to_bytes(&proxy);
+
+    let mut emb_hasher = Sha256::new();
+    emb_hasher.update(&pooled_bytes);
+    let emb_checksum: [u8; 32] = emb_hasher.finalize().into();
+
+    let embedding_artifact = crate::store::schema::EmbeddingArtifact {
+        artifact_id: crate::store::ids::ArtifactId::derive(
+            format!("emb:{episode_id}").as_bytes(),
+        ),
+        revision: crate::embeddings::proxy::PROXY_REDUCTION_VERSION.to_string(),
+        backend: crate::store::schema::EmbeddingBackend::Cpu,
+        quantization: None,
+        pooled_vector_bytes: pooled_bytes,
+        late_interaction_bytes: None,
+        payload_checksum: emb_checksum,
+    };
+    let _ = crud::put_embedding_artifact(db, &embedding_artifact);
 
     // ── Step 9: Project to Grafeo ────────────────────────
     let ep_node = projection::project_episode(grafeo, &episode);

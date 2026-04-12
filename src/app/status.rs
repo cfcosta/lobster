@@ -126,6 +126,7 @@ mod tests {
                 task_id: None,
                 processing_state: *state,
                 finalized_ts_utc_ms: 1000,
+                retry_count: 0,
             };
             crud::put_episode(&database, &ep).unwrap();
         }

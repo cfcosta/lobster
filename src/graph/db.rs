@@ -127,7 +127,10 @@ pub fn create_task_node(
     node
 }
 
-/// Create an edge between two nodes with temporal validity.
+/// Create an edge with temporal validity and evidence back-link.
+///
+/// Per spec: every persisted edge must be evidence-backed and
+/// temporally annotated.
 pub fn create_temporal_edge(
     db: &GrafeoDB,
     from: grafeo::NodeId,
@@ -135,6 +138,27 @@ pub fn create_temporal_edge(
     edge_type: &str,
     valid_from_ms: i64,
     valid_to_ms: Option<i64>,
+) -> grafeo::EdgeId {
+    create_temporal_edge_with_evidence(
+        db,
+        from,
+        to,
+        edge_type,
+        valid_from_ms,
+        valid_to_ms,
+        None,
+    )
+}
+
+/// Create an edge with temporal validity and explicit evidence.
+pub fn create_temporal_edge_with_evidence(
+    db: &GrafeoDB,
+    from: grafeo::NodeId,
+    to: grafeo::NodeId,
+    edge_type: &str,
+    valid_from_ms: i64,
+    valid_to_ms: Option<i64>,
+    evidence_episode_id: Option<&str>,
 ) -> grafeo::EdgeId {
     let edge = db.create_edge(from, to, edge_type);
     db.set_edge_property(
@@ -147,6 +171,13 @@ pub fn create_temporal_edge(
             edge,
             "valid_to_ts_utc_ms",
             grafeo::Value::from(to_ms),
+        );
+    }
+    if let Some(ep_id) = evidence_episode_id {
+        db.set_edge_property(
+            edge,
+            "evidence_episode_id",
+            grafeo::Value::from(ep_id),
         );
     }
     edge

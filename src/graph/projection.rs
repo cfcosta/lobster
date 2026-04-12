@@ -155,6 +155,7 @@ mod tests {
             task_id: None,
             processing_state: ProcessingState::Ready,
             finalized_ts_utc_ms: 1_700_000_000_000,
+            retry_count: 0,
         }
     }
 
