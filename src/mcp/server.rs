@@ -52,15 +52,27 @@ pub fn run_server(
     grafeo: &GrafeoDB,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let stdin = std::io::stdin();
+    let stdin_lock = stdin.lock();
     let mut stdout = std::io::stdout();
+    let mut reader = std::io::BufReader::new(stdin_lock);
 
-    for line in stdin.lock().lines() {
-        let line = line?;
-        if line.trim().is_empty() {
+    loop {
+        // Read using Content-Length framing (MCP/LSP protocol),
+        // falling back to line-delimited for compatibility.
+        let body = match read_message(&mut reader) {
+            Ok(Some(b)) => b,
+            Ok(None) => break, // EOF
+            Err(e) => {
+                eprintln!("lobster: read error: {e}");
+                break;
+            }
+        };
+
+        if body.trim().is_empty() {
             continue;
         }
 
-        let response = match serde_json::from_str::<JsonRpcRequest>(&line) {
+        let response = match serde_json::from_str::<JsonRpcRequest>(&body) {
             Ok(req) => handle_request(&req, db, grafeo),
             Err(e) => JsonRpcResponse {
                 jsonrpc: "2.0".into(),
@@ -74,10 +86,58 @@ pub fn run_server(
         };
 
         let json = serde_json::to_string(&response)?;
-        writeln!(stdout, "{json}")?;
-        stdout.flush()?;
+        write_message(&mut stdout, &json)?;
     }
 
+    Ok(())
+}
+
+/// Read a message using Content-Length framing or line-delimited fallback.
+fn read_message(
+    reader: &mut impl BufRead,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let mut header_line = String::new();
+    let n = reader.read_line(&mut header_line)?;
+    if n == 0 {
+        return Ok(None); // EOF
+    }
+
+    let trimmed = header_line.trim();
+    if trimmed.is_empty() {
+        // Empty line — skip
+        return Ok(Some(String::new()));
+    }
+
+    // Check for Content-Length header (MCP/LSP framing)
+    if let Some(len_str) = trimmed.strip_prefix("Content-Length:") {
+        let len: usize = len_str
+            .trim()
+            .parse()
+            .map_err(|e| format!("invalid Content-Length: {e}"))?;
+
+        // Read the blank separator line
+        let mut blank = String::new();
+        reader.read_line(&mut blank)?;
+
+        // Read exactly `len` bytes of body
+        let mut body = vec![0u8; len];
+        reader.read_exact(&mut body)?;
+        return Ok(Some(String::from_utf8(body)?));
+    }
+
+    // Fallback: treat the line itself as the message
+    Ok(Some(trimmed.to_string()))
+}
+
+/// Write a message with Content-Length framing.
+fn write_message(
+    writer: &mut impl Write,
+    json: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let body = json.as_bytes();
+    write!(writer, "Content-Length: {}\r\n\r\n", body.len())?;
+    writer.write_all(body)?;
+    writer.flush()?;
     Ok(())
 }
 

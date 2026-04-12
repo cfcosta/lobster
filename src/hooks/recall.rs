@@ -13,7 +13,7 @@ use redb::Database;
 use serde::Serialize;
 
 use crate::{
-    hooks::events::{HookEvent, HookType},
+    hooks::events::HookEvent,
     rank::{
         evidence::{
             DecisionEvidence,
@@ -74,8 +74,7 @@ pub fn run_recall(
     // Execute retrieval
     // Find current task for task_overlap scoring
     let repo_id = event
-        .working_directory
-        .as_deref()
+        .working_directory()
         .map(|d| crate::store::ids::RepoId::derive(d.as_bytes()));
     let current_task = repo_id
         .as_ref()
@@ -132,25 +131,26 @@ pub fn run_recall(
 /// Returns `None` for hook types that don't need recall.
 #[must_use]
 pub fn construct_query(event: &HookEvent) -> Option<String> {
-    match event.hook_type {
-        HookType::UserPromptSubmit => event.user_prompt.clone(),
-        HookType::PostToolUse | HookType::PostToolUseFailure => {
-            // Build query from tool name + relevant input context.
-            // Per spec: "lightweight reminders after heavy edits,
-            // failures, test results, major task transitions"
-            let tool = event.tool_name.as_deref().unwrap_or("");
-            let input_context = event
-                .tool_input
-                .as_ref()
-                .and_then(|v| v.get("path"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            if tool.is_empty() && input_context.is_empty() {
-                return None;
-            }
-            Some(format!("{tool} {input_context}").trim().to_string())
+    if event.is_prompt_submit() {
+        event.user_prompt()
+    } else if event.is_tool_use() || event.is_tool_failure() {
+        let tool = event.tool_name.as_deref().unwrap_or("");
+        let input_context = event
+            .tool_input
+            .as_ref()
+            .and_then(|v| {
+                v.get("file_path")
+                    .or_else(|| v.get("path"))
+                    .or_else(|| v.get("command"))
+            })
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if tool.is_empty() && input_context.is_empty() {
+            return None;
         }
-        HookType::NotificationPost => None,
+        Some(format!("{tool} {input_context}").trim().to_string())
+    } else {
+        None
     }
 }
 
@@ -210,31 +210,21 @@ mod tests {
     use crate::{graph::db as grafeo_db, store::db};
 
     fn make_prompt_event(prompt: &str) -> HookEvent {
-        HookEvent {
-            hook_type: HookType::UserPromptSubmit,
-            session_id: "test-session".into(),
-            tool_name: None,
-            tool_input: None,
-            tool_output: None,
-            user_prompt: Some(prompt.into()),
-            assistant_response: None,
-            working_directory: Some("/test".into()),
-            timestamp_ms: 1_700_000_000_000,
-        }
+        serde_json::from_value(serde_json::json!({
+            "hook_event_name": "UserPromptSubmit",
+            "tool_input": {"prompt": prompt},
+            "cwd": "/test",
+        }))
+        .unwrap()
     }
 
     fn make_tool_event(tool: &str) -> HookEvent {
-        HookEvent {
-            hook_type: HookType::PostToolUse,
-            session_id: "test-session".into(),
-            tool_name: Some(tool.into()),
-            tool_input: None,
-            tool_output: None,
-            user_prompt: None,
-            assistant_response: None,
-            working_directory: Some("/test".into()),
-            timestamp_ms: 1_700_000_000_000,
-        }
+        serde_json::from_value(serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": tool,
+            "cwd": "/test",
+        }))
+        .unwrap()
     }
 
     #[test]
@@ -252,18 +242,12 @@ mod tests {
     }
 
     #[test]
-    fn test_construct_query_notification_returns_none() {
-        let event = HookEvent {
-            hook_type: HookType::NotificationPost,
-            session_id: "test".into(),
-            tool_name: None,
-            tool_input: None,
-            tool_output: None,
-            user_prompt: None,
-            assistant_response: None,
-            working_directory: None,
-            timestamp_ms: 0,
-        };
+    fn test_construct_query_stop_returns_none() {
+        let event: HookEvent = serde_json::from_value(serde_json::json!({
+            "hook_event_name": "Stop",
+            "reason": "done",
+        }))
+        .unwrap();
         assert!(construct_query(&event).is_none());
     }
 
@@ -279,20 +263,13 @@ mod tests {
     }
 
     #[test]
-    fn test_run_recall_notification_noop() {
+    fn test_run_recall_stop_noop() {
         let database = db::open_in_memory().unwrap();
         let grafeo = grafeo_db::new_in_memory();
-        let event = HookEvent {
-            hook_type: HookType::NotificationPost,
-            session_id: "test".into(),
-            tool_name: None,
-            tool_input: None,
-            tool_output: None,
-            user_prompt: None,
-            assistant_response: None,
-            working_directory: None,
-            timestamp_ms: 0,
-        };
+        let event: HookEvent = serde_json::from_value(serde_json::json!({
+            "hook_event_name": "Stop",
+        }))
+        .unwrap();
 
         let payload = run_recall(&event, &database, &grafeo);
         assert!(payload.items.is_empty());

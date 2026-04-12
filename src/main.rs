@@ -71,7 +71,7 @@ async fn main() -> Result<()> {
     }
 }
 
-#[allow(clippy::unused_async)]
+#[allow(clippy::unused_async, clippy::too_many_lines)]
 async fn cmd_hook(
     storage_dir: &std::path::Path,
     _hook_type: &str,
@@ -99,7 +99,7 @@ async fn cmd_hook(
     let event: lobster::hooks::events::HookEvent =
         serde_json::from_str(&input).context("parse hook event")?;
 
-    tracing::debug!(hook_type = ?event.hook_type, "hook invoked");
+    tracing::debug!(hook_type = event.hook_type(), "hook invoked");
 
     // Step 1: Capture the raw event into redb
     let seq = lobster::hooks::capture::next_seq(&db);
@@ -112,17 +112,30 @@ async fn cmd_hook(
     // Per spec: "Short-lived hook invocations should only append raw events"
     // but finalization "may run opportunistically under a repo-local lease
     // with a strict time budget" (line 151). We allow 200ms for finalization.
+    // Check if LLM API key is available before attempting finalization
+    let has_llm_key = std::env::var("ANTHROPIC_API_KEY").is_ok()
+        || std::env::var("OPENAI_API_KEY").is_ok();
+    if !has_llm_key {
+        tracing::warn!(
+            "No ANTHROPIC_API_KEY or OPENAI_API_KEY set. \
+             Events are captured but episodes cannot be finalized. \
+             Set an API key to enable summarization and extraction."
+        );
+    }
+
     let finalization_deadline =
         std::time::Instant::now() + std::time::Duration::from_millis(200);
-    if event.hook_type == lobster::hooks::events::HookType::UserPromptSubmit {
-        let repo_path = event.working_directory.as_deref().unwrap_or("unknown");
+    if has_llm_key && event.is_prompt_submit() {
+        let repo_path = event
+            .working_directory()
+            .unwrap_or_else(|| "unknown".to_string());
         let repo_id = lobster::store::ids::RepoId::derive(repo_path.as_bytes());
         let config =
             lobster::episodes::segmenter::SegmentationConfig::default();
 
         let action = lobster::hooks::segmentation::check_segmentation(
             &db,
-            event.timestamp_ms,
+            chrono::Utc::now().timestamp_millis(),
             &repo_id,
             seq,
             &config,
@@ -143,11 +156,11 @@ async fn cmd_hook(
             lobster::episodes::finalize::finalize_episode(
                 &db,
                 &grafeo,
-                repo_path,
+                &repo_path,
                 &serde_json::to_vec(&[&event]).unwrap_or_default(),
                 start_seq,
                 end_seq,
-                event.user_prompt.clone(),
+                event.user_prompt(),
             )
             .await
         } else {
@@ -182,9 +195,20 @@ async fn cmd_hook(
     // Step 3: Run the recall pipeline
     let payload = lobster::hooks::recall::run_recall(&event, &db, &grafeo);
 
-    // Output recall payload as JSON to stdout
+    // Format recall as a Claude Code hook output (systemMessage)
+    let output = if payload.items.is_empty() {
+        lobster::hooks::events::HookOutput::empty()
+    } else {
+        let hint = lobster::hooks::tiered::format_hint(&payload);
+        if hint.is_empty() {
+            lobster::hooks::events::HookOutput::empty()
+        } else {
+            lobster::hooks::events::HookOutput::with_message(hint)
+        }
+    };
+
     let json =
-        serde_json::to_string(&payload).context("serialize recall payload")?;
+        serde_json::to_string(&output).context("serialize hook output")?;
     println!("{json}");
 
     Ok(())
@@ -297,6 +321,13 @@ fn cmd_init(storage_dir: &std::path::Path) -> Result<()> {
 
     println!("Lobster initialized at {}", storage_dir.display());
     println!("Database: {}", db_path.display());
+    println!();
+
+    // Generate Claude Code hook configuration
+    let hook_json = lobster::app::hooks_config::to_json("lobster")
+        .context("generate hook config")?;
+    println!("Add this to .claude/settings.json hooks:");
+    println!("{hook_json}");
 
     Ok(())
 }

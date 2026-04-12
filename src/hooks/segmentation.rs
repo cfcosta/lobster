@@ -116,26 +116,23 @@ fn find_episode_start(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        hooks::{
-            capture,
-            events::{HookEvent, HookType},
-        },
-        store::db,
+    use crate::store::{
+        crud,
+        db,
+        ids::RepoId,
+        schema::{EventKind, RawEvent},
     };
 
-    fn make_event(prompt: &str, ts: i64, dir: &str) -> HookEvent {
-        HookEvent {
-            hook_type: HookType::UserPromptSubmit,
-            session_id: "test".into(),
-            tool_name: None,
-            tool_input: None,
-            tool_output: None,
-            user_prompt: Some(prompt.into()),
-            assistant_response: None,
-            working_directory: Some(dir.into()),
-            timestamp_ms: ts,
-        }
+    fn insert_event(database: &redb::Database, seq: u64, ts: i64, repo: &[u8]) {
+        let event = RawEvent {
+            seq,
+            repo_id: RepoId::derive(repo),
+            ts_utc_ms: ts,
+            event_kind: EventKind::UserPromptSubmit,
+            payload_hash: [0; 32],
+            payload_bytes: vec![],
+        };
+        crud::append_raw_event(database, &event).unwrap();
     }
 
     #[test]
@@ -156,9 +153,8 @@ mod tests {
             idle_gap_ms: 5 * 60 * 1000, // 5 min
         };
 
-        // Capture first event
-        let ev1 = make_event("first", 1_700_000_000_000, "/project");
-        capture::capture_event(&database, &ev1, 0).unwrap();
+        // Insert event with explicit timestamp
+        insert_event(&database, 0, 1_700_000_000_000, b"/project");
 
         // Second event 10 seconds later — should extend
         let repo = RepoId::derive(b"/project");
@@ -177,8 +173,7 @@ mod tests {
             idle_gap_ms: 5 * 60 * 1000,
         };
 
-        let ev1 = make_event("first", 1_700_000_000_000, "/project");
-        capture::capture_event(&database, &ev1, 0).unwrap();
+        insert_event(&database, 0, 1_700_000_000_000, b"/project");
 
         // Second event 10 minutes later — should start new
         let repo = RepoId::derive(b"/project");
@@ -197,8 +192,7 @@ mod tests {
         let database = db::open_in_memory().unwrap();
         let config = SegmentationConfig::default();
 
-        let ev1 = make_event("first", 1_700_000_000_000, "/project-a");
-        capture::capture_event(&database, &ev1, 0).unwrap();
+        insert_event(&database, 0, 1_700_000_000_000, b"/project-a");
 
         // Same time but different repo
         let repo_b = RepoId::derive(b"/project-b");

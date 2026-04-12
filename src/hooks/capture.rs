@@ -7,10 +7,7 @@ use redb::Database;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    hooks::{
-        events::{HookEvent, HookType},
-        redact,
-    },
+    hooks::{events::HookEvent, redact},
     store::{
         crud,
         ids::RepoId,
@@ -30,16 +27,19 @@ pub fn capture_event(
     event: &HookEvent,
     seq: u64,
 ) -> Result<u64, crud::StoreError> {
-    let repo_id = event.working_directory.as_deref().map_or_else(
+    let repo_id = event.working_directory().map_or_else(
         || RepoId::derive(b"unknown"),
         |d| RepoId::derive(d.as_bytes()),
     );
 
-    let event_kind = match event.hook_type {
-        HookType::UserPromptSubmit => EventKind::UserPromptSubmit,
-        HookType::PostToolUse => EventKind::ToolUse,
-        HookType::PostToolUseFailure => EventKind::ToolUseFailure,
-        HookType::NotificationPost => EventKind::AssistantResponse,
+    let event_kind = if event.is_prompt_submit() {
+        EventKind::UserPromptSubmit
+    } else if event.is_tool_use() {
+        EventKind::ToolUse
+    } else if event.is_tool_failure() {
+        EventKind::ToolUseFailure
+    } else {
+        EventKind::AssistantResponse
     };
 
     // Serialize the event payload
@@ -63,7 +63,7 @@ pub fn capture_event(
     let raw_event = RawEvent {
         seq,
         repo_id,
-        ts_utc_ms: event.timestamp_ms,
+        ts_utc_ms: chrono::Utc::now().timestamp_millis(),
         event_kind,
         payload_hash: hash,
         payload_bytes,
@@ -101,17 +101,12 @@ mod tests {
     use crate::store::db;
 
     fn make_event(prompt: &str) -> HookEvent {
-        HookEvent {
-            hook_type: HookType::UserPromptSubmit,
-            session_id: "test".into(),
-            tool_name: None,
-            tool_input: None,
-            tool_output: None,
-            user_prompt: Some(prompt.into()),
-            assistant_response: None,
-            working_directory: Some("/test/repo".into()),
-            timestamp_ms: 1_700_000_000_000,
-        }
+        serde_json::from_value(serde_json::json!({
+            "hook_event_name": "UserPromptSubmit",
+            "tool_input": {"prompt": prompt},
+            "cwd": "/test/repo",
+        }))
+        .unwrap()
     }
 
     #[test]
@@ -164,7 +159,10 @@ mod tests {
         let database = db::open_in_memory().unwrap();
         let mut event = make_event("fix the bug");
         // Inject a secret-like pattern in the prompt
-        event.user_prompt = Some("key=sk-secret123abc".into());
+        event.extra.insert(
+            "prompt".into(),
+            serde_json::Value::String("key=sk-secret123abc".into()),
+        );
 
         capture_event(&database, &event, 0).unwrap();
 

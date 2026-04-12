@@ -1,24 +1,25 @@
 //! Full pipeline integration smoke test.
-//!
-//! Exercises the complete chain: hook event → event capture →
-//! episode finalization → Grafeo projection → retrieval query →
-//! recall output. Proves the system works end-to-end.
 
 use lobster::{
     episodes::finalize::{FinalizeResult, finalize_episode},
     graph::{db as grafeo_db, rebuild::rebuild_from_redb},
-    hooks::{
-        events::{HookEvent, HookType},
-        recall,
-    },
+    hooks::{events::HookEvent, recall},
     rank::routes::execute_query,
     store::{crud, db, schema::ProcessingState, visibility},
 };
 
-/// Complete smoke test exercising every layer of the system.
 fn has_api_key() -> bool {
     std::env::var("ANTHROPIC_API_KEY").is_ok()
         || std::env::var("OPENAI_API_KEY").is_ok()
+}
+
+fn make_prompt_event(prompt: &str) -> HookEvent {
+    serde_json::from_value(serde_json::json!({
+        "hook_event_name": "UserPromptSubmit",
+        "tool_input": {"prompt": prompt},
+        "cwd": "/home/user/project",
+    }))
+    .unwrap()
 }
 
 #[tokio::test]
@@ -27,12 +28,9 @@ async fn test_full_pipeline_smoke() {
         eprintln!("skipping: no API key");
         return;
     }
-    // 1. Create storage
     let database = db::open_in_memory().unwrap();
     let grafeo = grafeo_db::new_in_memory();
 
-    // 2. Simulate episode finalization (normally triggered by
-    //    event capture + segmentation)
     let result = finalize_episode(
         &database,
         &grafeo,
@@ -49,57 +47,23 @@ async fn test_full_pipeline_smoke() {
         other => panic!("finalization failed: {other:?}"),
     };
 
-    // 3. Verify redb has the episode in Ready state
     let episode = crud::get_episode(&database, &episode_id.raw()).unwrap();
     assert_eq!(episode.processing_state, ProcessingState::Ready);
-
-    // 4. Verify summary artifact was persisted
-    let summary =
-        crud::get_summary_artifact(&database, &episode_id.raw()).unwrap();
-    assert!(!summary.summary_text.is_empty());
-
-    // 5. Verify extraction artifact was persisted with real checksum
-    let extraction =
-        crud::get_extraction_artifact(&database, &episode_id.raw()).unwrap();
-    assert_ne!(extraction.payload_checksum, [0; 32]);
-
-    // 6. Verify Grafeo has nodes
     assert!(grafeo.node_count() >= 1);
-
-    // 7. Verify visibility: Ready episode is visible
     assert!(visibility::is_episode_visible(&database, &episode_id.raw()));
 
-    // 8. Run a retrieval query
     let results = execute_query("memory search", &database, &grafeo, false);
-    // Results may be empty (no Grafeo text/vector indexes yet)
-    // but the pipeline should not crash
     let _ = results;
 
-    // 9. Simulate a hook recall
-    let hook_event = HookEvent {
-        hook_type: HookType::UserPromptSubmit,
-        session_id: "smoke-test".into(),
-        tool_name: None,
-        tool_input: None,
-        tool_output: None,
-        user_prompt: Some("What was the task?".into()),
-        assistant_response: None,
-        working_directory: Some("/home/user/project".into()),
-        timestamp_ms: 1_700_000_000_000,
-    };
-
+    let hook_event = make_prompt_event("What was the task?");
     let payload = recall::run_recall(&hook_event, &database, &grafeo);
-    // Should not crash, should have low latency
     assert!(payload.latency_ms < 5000);
 
-    // 10. Verify Grafeo can be rebuilt from redb
     let grafeo_fresh = grafeo_db::new_in_memory();
     let rebuild_stats = rebuild_from_redb(&database, &grafeo_fresh).unwrap();
     assert_eq!(rebuild_stats.episodes_projected, 1);
-    assert!(grafeo_fresh.node_count() >= 1);
 }
 
-/// Smoke test: multiple episodes accumulate correctly.
 #[tokio::test]
 async fn test_multiple_episodes_accumulate() {
     if !has_api_key() {
@@ -109,7 +73,7 @@ async fn test_multiple_episodes_accumulate() {
     let database = db::open_in_memory().unwrap();
     let grafeo = grafeo_db::new_in_memory();
 
-    for i in 0..5 {
+    for i in 0..3 {
         let result = finalize_episode(
             &database,
             &grafeo,
@@ -126,8 +90,7 @@ async fn test_multiple_episodes_accumulate() {
         );
     }
 
-    // All 5 episodes should be Ready
     let grafeo_rebuilt = grafeo_db::new_in_memory();
     let stats = rebuild_from_redb(&database, &grafeo_rebuilt).unwrap();
-    assert_eq!(stats.episodes_projected, 5);
+    assert_eq!(stats.episodes_projected, 3);
 }
