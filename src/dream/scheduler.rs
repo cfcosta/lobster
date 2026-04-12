@@ -182,6 +182,7 @@ mod tests {
             processing_state: state,
             finalized_ts_utc_ms: 1000,
             retry_count: 0,
+            is_noisy: false,
         };
         crud::put_episode(database, &ep).unwrap();
     }
@@ -209,7 +210,8 @@ mod tests {
             task_id: None,
             processing_state: ProcessingState::RetryQueued,
             finalized_ts_utc_ms: 1000,
-            retry_count: 2, // matches default max_retries
+            retry_count: 2,
+            is_noisy: false,
         };
         crud::put_episode(&database, &ep1).unwrap();
         let mut ep2 = ep1;

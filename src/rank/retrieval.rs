@@ -166,6 +166,7 @@ mod tests {
             processing_state: ProcessingState::Ready,
             finalized_ts_utc_ms: 1_000,
             retry_count: 0,
+            is_noisy: false,
         };
         let pending_ep = Episode {
             episode_id: EpisodeId::derive(b"pending"),
@@ -176,6 +177,7 @@ mod tests {
             processing_state: ProcessingState::Pending,
             finalized_ts_utc_ms: 2_000,
             retry_count: 0,
+            is_noisy: false,
         };
 
         crud::put_episode(&database, &ready_ep).unwrap();

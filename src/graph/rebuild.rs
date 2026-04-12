@@ -153,6 +153,7 @@ mod tests {
             processing_state: ProcessingState::Pending,
             finalized_ts_utc_ms: 1000,
             retry_count: 0,
+            is_noisy: false,
         };
         crud::put_episode(&database, &ep).unwrap();
 

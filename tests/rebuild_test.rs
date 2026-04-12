@@ -76,6 +76,7 @@ async fn test_rebuild_excludes_non_ready_episodes() {
         processing_state: lobster::store::schema::ProcessingState::Pending,
         finalized_ts_utc_ms: 999,
         retry_count: 0,
+        is_noisy: false,
     };
     lobster::store::crud::put_episode(&database, &pending).unwrap();
 

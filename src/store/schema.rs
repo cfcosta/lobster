@@ -80,6 +80,9 @@ pub struct Episode {
     /// `RetryQueued` after first failure, `FailedFinal` after second.
     #[serde(default)]
     pub retry_count: u32,
+    /// Flagged as low-signal during dreaming. Reduces ranking score.
+    #[serde(default)]
+    pub is_noisy: bool,
 }
 
 // ── Confidence + Decision (d49.4) ────────────────────────────
@@ -272,6 +275,7 @@ mod tests {
                 gs::integers::<i64>().min_value(0).max_value(i64::MAX / 2),
             ),
             retry_count: 0,
+            is_noisy: false,
         }
     }
 

@@ -21,7 +21,7 @@ use crate::{
             expand_decision,
             expand_summary,
         },
-        routes::{RetrievalResult, execute_query},
+        routes::RetrievalResult,
     },
 };
 
@@ -72,7 +72,22 @@ pub fn run_recall(
     };
 
     // Execute retrieval
-    let results = execute_query(&query, db, grafeo, false);
+    // Find current task for task_overlap scoring
+    let repo_id = event
+        .working_directory
+        .as_deref()
+        .map(|d| crate::store::ids::RepoId::derive(d.as_bytes()));
+    let current_task = repo_id
+        .as_ref()
+        .and_then(|r| crate::rank::context::find_current_task(db, r));
+
+    let results = crate::rank::routes::execute_query_with_context(
+        &query,
+        db,
+        grafeo,
+        false,
+        current_task.as_ref(),
+    );
 
     // Check latency budget
     let elapsed = start.elapsed().as_millis();

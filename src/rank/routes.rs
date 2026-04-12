@@ -56,7 +56,7 @@ pub fn execute_query_with_context(
     db: &Database,
     grafeo: &GrafeoDB,
     is_mcp: bool,
-    _current_task_id: Option<&crate::store::ids::TaskId>,
+    current_task_id: Option<&crate::store::ids::TaskId>,
 ) -> Vec<RetrievalResult> {
     let route = classify_query(query);
 
@@ -110,6 +110,7 @@ pub fn execute_query_with_context(
     // Decisions and entities inherit visibility from their parent
     // episode (which was Ready when projected). Only filter
     // episode-typed candidates against the ready set directly.
+    let candidate_ids: Vec<_> = diverse.iter().map(|c| c.id).collect();
     diverse
         .into_iter()
         .filter(|c| {
@@ -131,13 +132,29 @@ pub fn execute_query_with_context(
                 now_ms,
             );
 
+            // Compute task_overlap from current task context
+            let task_ol =
+                crate::rank::context::task_overlap(db, &c.id, current_task_id);
+
+            // Compute graph_support for HybridGraph route
+            let graph_sup = if route == RetrievalRoute::HybridGraph {
+                crate::rank::context::graph_support(
+                    grafeo,
+                    &c.id.to_string(),
+                    &candidate_ids,
+                )
+            } else {
+                0.0
+            };
+
             let input = ScoringInput {
                 semantic: c.score,
                 recency,
-                task_overlap: 0.0,
-                graph_support: 0.0,
+                task_overlap: task_ol,
+                graph_support: graph_sup,
                 is_decision: c.artifact_type == "decision",
-                is_noisy: false,
+                is_noisy: crate::store::crud::get_episode(db, &c.id)
+                    .is_ok_and(|ep| ep.is_noisy),
             };
             let raw = composite_score(&input, &DEFAULT_WEIGHTS, route);
             let normalized = normalize_score(raw, &DEFAULT_WEIGHTS, route);
@@ -405,6 +422,7 @@ mod tests {
             processing_state: ProcessingState::Pending,
             finalized_ts_utc_ms: 1000,
             retry_count: 0,
+            is_noisy: false,
         };
         crud::put_episode(&database, &ep).unwrap();
 

@@ -367,6 +367,7 @@ mod tests {
             processing_state: ProcessingState::Pending,
             finalized_ts_utc_ms: 1_700_000_000_000,
             retry_count: 0,
+            is_noisy: false,
         };
         let db = test_db();
         put_episode(&db, &ep).expect("put");

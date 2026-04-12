@@ -118,6 +118,7 @@ pub async fn finalize_episode_at(
         processing_state: ProcessingState::Pending,
         finalized_ts_utc_ms: now_ms,
         retry_count: 0,
+        is_noisy: false,
     };
 
     if let Err(e) = crud::put_episode(db, &episode) {

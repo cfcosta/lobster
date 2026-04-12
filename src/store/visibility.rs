@@ -75,6 +75,7 @@ mod tests {
             processing_state: state,
             finalized_ts_utc_ms: 1_000,
             retry_count: 0,
+            is_noisy: false,
         };
         crud::put_episode(database, &ep).unwrap();
         id
