@@ -79,6 +79,21 @@ pub fn set_episode_summary(
     );
 }
 
+/// Set a proxy embedding vector on a node for vector search.
+///
+/// Per spec: "project the pooled proxy vector into Grafeo"
+pub fn set_node_embedding(
+    db: &GrafeoDB,
+    node: grafeo::NodeId,
+    proxy_f32: &[f32],
+) {
+    db.set_node_property(
+        node,
+        "embedding",
+        grafeo::Value::Vector(proxy_f32.into()),
+    );
+}
+
 /// Create a graph node for a decision.
 pub fn create_decision_node(
     db: &GrafeoDB,

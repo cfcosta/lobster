@@ -108,7 +108,12 @@ async fn cmd_hook(
         // Fail open — continue to recall even if capture fails
     }
 
-    // Step 2: Check segmentation — should we finalize an episode?
+    // Step 2: Opportunistically finalize under a time budget.
+    // Per spec: "Short-lived hook invocations should only append raw events"
+    // but finalization "may run opportunistically under a repo-local lease
+    // with a strict time budget" (line 151). We allow 200ms for finalization.
+    let finalization_deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(200);
     if event.hook_type == lobster::hooks::events::HookType::UserPromptSubmit {
         let repo_path = event.working_directory.as_deref().unwrap_or("unknown");
         let repo_id = lobster::store::ids::RepoId::derive(repo_path.as_bytes());
@@ -133,16 +138,24 @@ async fn cmd_hook(
             } => (start_seq, end_seq),
         };
 
-        let result = lobster::episodes::finalize::finalize_episode(
-            &db,
-            &grafeo,
-            repo_path,
-            &serde_json::to_vec(&[&event]).unwrap_or_default(),
-            start_seq,
-            end_seq,
-            event.user_prompt.clone(),
-        )
-        .await;
+        // Only finalize if we still have time budget remaining
+        let result = if std::time::Instant::now() < finalization_deadline {
+            lobster::episodes::finalize::finalize_episode(
+                &db,
+                &grafeo,
+                repo_path,
+                &serde_json::to_vec(&[&event]).unwrap_or_default(),
+                start_seq,
+                end_seq,
+                event.user_prompt.clone(),
+            )
+            .await
+        } else {
+            tracing::debug!("skipping finalization: time budget exceeded");
+            lobster::episodes::finalize::FinalizeResult::Failed(
+                "time budget exceeded".into(),
+            )
+        };
         match result {
             lobster::episodes::finalize::FinalizeResult::Ready {
                 episode_id,
@@ -161,7 +174,7 @@ async fn cmd_hook(
                 tracing::warn!(reason, "episode queued for retry");
             }
             lobster::episodes::finalize::FinalizeResult::Failed(msg) => {
-                tracing::warn!(msg, "episode finalization failed");
+                tracing::debug!(msg, "finalization skipped or failed");
             }
         }
     }

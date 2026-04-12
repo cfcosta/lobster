@@ -263,6 +263,11 @@ pub async fn finalize_episode(
     };
     let _ = crud::put_embedding_artifact(db, &embedding_artifact);
 
+    // Parse the proxy vector for Grafeo projection
+    let proxy_vector = crate::embeddings::proxy::bytes_to_vector(
+        &embedding_artifact.pooled_vector_bytes,
+    );
+
     // ── Step 9: Project to Grafeo ────────────────────────
     let ep_node = projection::project_episode(grafeo, &episode);
     // Set summary text on episode node for text search
@@ -271,6 +276,10 @@ pub async fn finalize_episode(
         ep_node,
         &summary.summary_text,
     );
+    // Project proxy vector into Grafeo for vector search
+    if !proxy_vector.is_empty() {
+        crate::graph::db::set_node_embedding(grafeo, ep_node, &proxy_vector);
+    }
 
     // Project decisions and persist entities to redb (Fix #4)
     for dec in &created_decisions {

@@ -23,6 +23,8 @@ pub struct ContextBundle {
 pub struct ContextItem {
     pub artifact_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub repo_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
@@ -30,6 +32,8 @@ pub struct ContextItem {
     pub confidence: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provenance: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graph_context: Option<String>,
     pub score: f64,
     pub content: String,
 }
@@ -52,10 +56,12 @@ pub fn memory_context(
         .into_iter()
         .map(|r| ContextItem {
             artifact_type: r.artifact_type,
+            snippet: None,
             repo_id: None,
             task_id: None,
             confidence: None,
             provenance: None,
+            graph_context: None,
             score: r.score,
             content: format!("Retrieved via {:?} route", r.route),
         })
@@ -152,10 +158,12 @@ pub fn memory_search(
         .into_iter()
         .map(|r| ContextItem {
             artifact_type: r.artifact_type,
+            snippet: None,
             repo_id: None,
             task_id: None,
             confidence: None,
             provenance: Some(r.episode_id.to_string()),
+            graph_context: None,
             score: r.score,
             content: format!("Score: {:.2}", r.score),
         })
@@ -248,12 +256,18 @@ pub fn memory_neighbors(
 ) -> NeighborsResult {
     let mut neighbors = Vec::new();
 
-    // Query outgoing edges from the node
+    // Query outgoing edges, filtering on temporal validity.
+    // Per spec: "memory_neighbors must filter on temporal validity by default"
+    // Edges with valid_to_ts_utc_ms in the past are excluded.
+    let now_ms = chrono::Utc::now().timestamp_millis();
     let session = grafeo.session();
     let query = format!(
-        "MATCH (n)-[r]->(m) WHERE n.episode_id = '{node_id_str}' \
-         OR n.decision_id = '{node_id_str}' \
-         OR n.entity_id = '{node_id_str}' \
+        "MATCH (n)-[r]->(m) WHERE \
+         (n.episode_id = '{node_id_str}' \
+          OR n.decision_id = '{node_id_str}' \
+          OR n.entity_id = '{node_id_str}') \
+         AND (r.valid_to_ts_utc_ms IS NULL \
+              OR r.valid_to_ts_utc_ms > {now_ms}) \
          RETURN m.episode_id, m.decision_id, m.entity_id, \
                 m.canonical_name, TYPE(r)"
     );
@@ -312,10 +326,12 @@ mod tests {
         let bundle = ContextBundle {
             items: vec![ContextItem {
                 artifact_type: "decision".into(),
+                snippet: Some("Use redb for storage".into()),
                 repo_id: None,
                 task_id: None,
                 confidence: Some("High".into()),
                 provenance: None,
+                graph_context: None,
                 score: 0.85,
                 content: "Use redb".into(),
             }],
