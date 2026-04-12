@@ -44,7 +44,7 @@ pub struct RetrievalResult {
 pub fn execute_query(
     query: &str,
     db: &Database,
-    _grafeo: &GrafeoDB,
+    grafeo: &GrafeoDB,
     is_mcp: bool,
 ) -> Vec<RetrievalResult> {
     let route = classify_query(query);
@@ -71,9 +71,10 @@ pub fn execute_query(
         scoring::auto_surface_budget(route)
     };
 
-    // TODO: Replace with actual Grafeo search when indexes exist.
-    // For now return empty — this is honest about what works.
-    let candidates: Vec<ScoredCandidate> = vec![];
+    // Search Grafeo using GQL text matching on decision statements
+    // and entity names. This is a basic implementation that will be
+    // replaced with HNSW vector search when embeddings are active.
+    let candidates = search_grafeo(grafeo, query, route);
 
     // Apply MMR diversity
     let diverse = apply_mmr(&candidates, budget, lambda, |a, b| {
@@ -106,6 +107,74 @@ pub fn execute_query(
             route,
         })
         .collect()
+}
+
+/// Search Grafeo for candidates matching the query.
+///
+/// Uses GQL property matching on decision statements and entity
+/// names. Returns scored candidates for the downstream pipeline.
+fn search_grafeo(
+    grafeo: &GrafeoDB,
+    query: &str,
+    _route: RetrievalRoute,
+) -> Vec<ScoredCandidate> {
+    let mut candidates = Vec::new();
+
+    // Search decision nodes by matching statement text
+    let query_lower = query.to_lowercase();
+    let session = grafeo.session();
+
+    // Search decisions
+    if let Ok(result) =
+        session.execute("MATCH (d:Decision) RETURN d.decision_id, d.statement")
+    {
+        for row in result.iter() {
+            if let (Some(id), Some(stmt)) = (row[0].as_str(), row[1].as_str()) {
+                let stmt_lower = stmt.to_lowercase();
+                // Simple text overlap scoring
+                let overlap = query_lower
+                    .split_whitespace()
+                    .filter(|w| stmt_lower.contains(w))
+                    .count();
+                if overlap > 0 {
+                    #[allow(clippy::cast_precision_loss)]
+                    let score = overlap as f64
+                        / query_lower.split_whitespace().count().max(1) as f64;
+                    if let Ok(raw_id) = id.parse() {
+                        candidates.push(ScoredCandidate {
+                            id: raw_id,
+                            score,
+                            artifact_type: "decision".into(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Search entity nodes
+    if let Ok(result) =
+        session.execute("MATCH (e:Entity) RETURN e.entity_id, e.canonical_name")
+    {
+        for row in result.iter() {
+            if let (Some(id), Some(name)) = (row[0].as_str(), row[1].as_str()) {
+                let name_lower = name.to_lowercase();
+                if query_lower.contains(&name_lower)
+                    || name_lower.contains(&query_lower)
+                {
+                    if let Ok(raw_id) = id.parse() {
+                        candidates.push(ScoredCandidate {
+                            id: raw_id,
+                            score: 0.7,
+                            artifact_type: "entity".into(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    candidates
 }
 
 #[cfg(test)]

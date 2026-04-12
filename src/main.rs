@@ -109,14 +109,14 @@ async fn cmd_mcp(storage_dir: &std::path::Path) -> Result<()> {
     std::fs::create_dir_all(storage_dir).context("create storage dir")?;
 
     let db_path = lobster::app::config::db_path(storage_dir);
-    let _db = lobster::store::db::open(&db_path).context("open database")?;
+    let db = lobster::store::db::open(&db_path).context("open database")?;
+    let grafeo = lobster::graph::db::new_in_memory();
 
     tracing::info!("MCP server starting on stdio");
+    eprintln!("lobster: MCP server ready (JSON-RPC on stdio)");
 
-    // TODO: run JSON-RPC server on stdin/stdout
-    eprintln!("lobster: MCP server not yet implemented");
-
-    Ok(())
+    lobster::mcp::server::run_server(&db, &grafeo)
+        .map_err(|e| anyhow::anyhow!("MCP server error: {e}"))
 }
 
 fn cmd_status(storage_dir: &std::path::Path) -> Result<()> {
@@ -128,11 +128,14 @@ fn cmd_status(storage_dir: &std::path::Path) -> Result<()> {
         return Ok(());
     }
 
-    let _db = lobster::store::db::open(&db_path).context("open database")?;
+    let db = lobster::store::db::open(&db_path).context("open database")?;
 
-    // TODO: query episode counts, processing states
     println!("Lobster status: initialized");
     println!("Storage: {}", storage_dir.display());
+    println!();
+
+    let report = lobster::app::status::scan(&db);
+    print!("{report}");
 
     Ok(())
 }
@@ -179,6 +182,16 @@ fn cmd_init(storage_dir: &std::path::Path) -> Result<()> {
 }
 
 fn cmd_install(_storage_dir: &std::path::Path) -> Result<()> {
-    // TODO: download and install PyLate model
-    anyhow::bail!("model install not yet implemented")
+    use candle_core::Device;
+    use pylate_rs::ColBERT;
+
+    println!("Downloading GTE-ModernColBERT-v1 from HuggingFace...");
+
+    let _model: ColBERT = ColBERT::from("lightonai/GTE-ModernColBERT-v1")
+        .with_device(Device::Cpu)
+        .try_into()
+        .context("failed to download/load ColBERT model")?;
+
+    println!("Model installed successfully (CPU backend).");
+    Ok(())
 }
