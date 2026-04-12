@@ -709,10 +709,170 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}...", &s[..max])
+        // Find the last char boundary at or before `max` to avoid
+        // slicing inside a multi-byte UTF-8 sequence.
+        let mut end = max;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &s[..end])
     }
 }
 
 fn format_json(val: &serde_json::Value) -> String {
     serde_json::to_string(val).unwrap_or_else(|_| format!("{val}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use hegel::{TestCase, generators as gs};
+
+    use super::*;
+
+    // ── format_ts ───────────────────────────────────────────────
+
+    /// Any i64 produces a non-empty string (never panics).
+    #[hegel::test(test_cases = 500)]
+    fn prop_format_ts_never_panics(tc: TestCase) {
+        let ms: i64 = tc.draw(gs::integers());
+        let out = format_ts(ms);
+        assert!(!out.is_empty());
+    }
+
+    /// Valid timestamps (post-epoch, pre-year-9999) produce the
+    /// expected `YYYY-MM-DD HH:MM:SS` format (19 chars).
+    #[hegel::test(test_cases = 500)]
+    fn prop_format_ts_valid_range_format(tc: TestCase) {
+        // 1970-01-01 to 2100-01-01 in millis
+        let ms: i64 = tc
+            .draw(gs::integers().min_value(0_i64).max_value(4_102_444_800_000));
+        let out = format_ts(ms);
+        assert_eq!(
+            out.len(),
+            19,
+            "expected YYYY-MM-DD HH:MM:SS (19 chars), got {out:?}"
+        );
+        assert_eq!(&out[4..5], "-");
+        assert_eq!(&out[7..8], "-");
+        assert_eq!(&out[10..11], " ");
+        assert_eq!(&out[13..14], ":");
+        assert_eq!(&out[16..17], ":");
+    }
+
+    /// Out-of-range timestamps fall back to `{ms}ms`.
+    #[test]
+    fn test_format_ts_fallback() {
+        // chrono cannot represent i64::MIN as millis
+        let out = format_ts(i64::MIN);
+        assert!(out.ends_with("ms"), "expected fallback, got {out:?}");
+    }
+
+    // ── hex_short ───────────────────────────────────────────────
+
+    /// Output is always exactly 11 bytes: 8 hex chars + "...".
+    #[hegel::test(test_cases = 500)]
+    fn prop_hex_short_length(tc: TestCase) {
+        let bytes: [u8; 32] = tc.draw(gs::arrays(gs::integers()));
+        let out = hex_short(&bytes);
+        assert_eq!(out.len(), 11, "got {out:?}");
+    }
+
+    /// Output matches manual formatting of the first 4 bytes.
+    #[hegel::test(test_cases = 500)]
+    fn prop_hex_short_matches_reference(tc: TestCase) {
+        let bytes: [u8; 32] = tc.draw(gs::arrays(gs::integers()));
+        let expected = format!(
+            "{:02x}{:02x}{:02x}{:02x}...",
+            bytes[0], bytes[1], bytes[2], bytes[3]
+        );
+        assert_eq!(hex_short(&bytes), expected);
+    }
+
+    // ── truncate ────────────────────────────────────────────────
+
+    /// Output length never exceeds max + 3 (for the "..." suffix).
+    #[hegel::test(test_cases = 500)]
+    fn prop_truncate_bounded(tc: TestCase) {
+        let s: String = tc.draw(gs::text().max_size(500));
+        let max: usize =
+            tc.draw(gs::integers::<usize>().min_value(0).max_value(500));
+        let out = truncate(&s, max);
+        assert!(
+            out.len() <= max + 3,
+            "truncate({:?}, {max}) = {:?} (len {})",
+            s,
+            out,
+            out.len()
+        );
+    }
+
+    /// Strings at or below max are returned unchanged.
+    #[hegel::test(test_cases = 500)]
+    fn prop_truncate_identity_when_short(tc: TestCase) {
+        let s: String = tc.draw(gs::text().max_size(200));
+        let max: usize = tc.draw(
+            gs::integers::<usize>()
+                .min_value(s.len())
+                .max_value(s.len() + 100),
+        );
+        assert_eq!(truncate(&s, max), s);
+    }
+
+    /// Strings longer than max get the "..." suffix.
+    #[hegel::test(test_cases = 500)]
+    fn prop_truncate_adds_ellipsis(tc: TestCase) {
+        let s: String = tc.draw(gs::text().min_size(2).max_size(500));
+        let max: usize = tc.draw(
+            gs::integers::<usize>()
+                .min_value(0)
+                .max_value(s.len().saturating_sub(1)),
+        );
+        let out = truncate(&s, max);
+        assert!(out.ends_with("..."), "expected '...' suffix, got {out:?}");
+    }
+
+    // ── strip_quotes ────────────────────────────────────────────
+
+    /// Wrapping a string in quotes then stripping recovers original.
+    #[hegel::test(test_cases = 500)]
+    fn prop_strip_quotes_round_trip(tc: TestCase) {
+        let s: String = tc.draw(gs::text().max_size(200));
+        let quoted = format!("\"{s}\"");
+        assert_eq!(strip_quotes(&quoted), s);
+    }
+
+    /// Applying `strip_quotes` twice to an unquoted string is the
+    /// same as applying it once (idempotent on unquoted input).
+    #[hegel::test(test_cases = 500)]
+    fn prop_strip_quotes_idempotent_unquoted(tc: TestCase) {
+        // Generate strings that don't start AND end with quotes
+        let s: String = tc.draw(gs::text().max_size(200));
+        let once = strip_quotes(&s);
+        let twice = strip_quotes(&once);
+        assert_eq!(once, twice);
+    }
+
+    /// Strings without matching quotes are returned unchanged.
+    #[test]
+    fn test_strip_quotes_partial() {
+        assert_eq!(strip_quotes("\"hello"), "\"hello");
+        assert_eq!(strip_quotes("hello\""), "hello\"");
+        assert_eq!(strip_quotes("hello"), "hello");
+        assert_eq!(strip_quotes(""), "");
+    }
+
+    // ── format_json ─────────────────────────────────────────────
+
+    /// `format_json` round-trips with `serde_json::from_str` for any
+    /// valid JSON value.
+    #[hegel::test(test_cases = 200)]
+    fn prop_format_json_roundtrip(tc: TestCase) {
+        // Generate simple JSON values
+        let n: i64 = tc.draw(gs::integers());
+        let val = serde_json::Value::Number(n.into());
+        let out = format_json(&val);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&out).expect("valid json");
+        assert_eq!(val, parsed);
+    }
 }
