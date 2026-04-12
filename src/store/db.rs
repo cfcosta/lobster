@@ -23,6 +23,31 @@ pub fn open(path: &Path) -> Result<Database, redb::Error> {
     Ok(db)
 }
 
+/// Try to open the database, returning `None` if the file is locked
+/// by another process (e.g., the MCP server).
+///
+/// This is used by hooks to opportunistically access redb when the
+/// MCP server is not running, without blocking or crashing.
+#[must_use]
+pub fn try_open(path: &Path) -> Option<Database> {
+    if !path.exists() {
+        return None;
+    }
+    match Database::create(path) {
+        Ok(db) => match init_tables(&db) {
+            Ok(()) => Some(db),
+            Err(e) => {
+                tracing::debug!(error = %e, "try_open: init_tables failed");
+                None
+            }
+        },
+        Err(e) => {
+            tracing::debug!(error = %e, "try_open: database locked or error");
+            None
+        }
+    }
+}
+
 /// Create an in-memory database for testing.
 ///
 /// # Errors
@@ -99,5 +124,43 @@ mod tests {
         let val = table.get("schema_version").expect("get");
         assert!(val.is_some());
         assert_eq!(val.unwrap().value(), b"1");
+    }
+
+    #[test]
+    fn test_try_open_nonexistent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nonexistent.redb");
+        assert!(try_open(&path).is_none());
+    }
+
+    #[test]
+    fn test_try_open_unlocked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("test.redb");
+
+        // Create the DB first, then close it
+        {
+            let _db = open(&path).expect("create");
+        }
+
+        // try_open should succeed on an unlocked file
+        let db = try_open(&path);
+        assert!(db.is_some());
+    }
+
+    #[test]
+    fn test_try_open_locked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("test.redb");
+
+        // Hold the DB open (simulating MCP server)
+        let _holder = open(&path).expect("open");
+
+        // try_open should fail because the file is locked
+        let result = try_open(&path);
+        assert!(
+            result.is_none(),
+            "try_open should return None when DB is locked"
+        );
     }
 }

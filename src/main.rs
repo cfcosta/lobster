@@ -91,15 +91,49 @@ async fn cmd_hook(
 
     // Stage the event to the filesystem. The MCP server (the sole
     // owner of the redb database) will watch the staging directory
-    // and ingest this event. If MCP is not running, the next hook
-    // invocation that gets the DB lock (task 5) will ingest it.
+    // and ingest this event.
     if let Err(e) = lobster::store::staging::stage_event(storage_dir, &input) {
         tracing::warn!(error = %e, "failed to stage event");
     }
 
-    // Output empty hook response — recall is handled by MCP tools
-    // when the MCP server is running, or by the standalone fallback.
-    let output = lobster::hooks::events::HookOutput::empty();
+    // Standalone fallback: if MCP is not running, try to open the
+    // database non-blocking. If we get the lock, ingest staged
+    // events and run recall. If locked, MCP will handle it.
+    let db_path = lobster::app::config::db_path(storage_dir);
+    let output = if let Some(db) = lobster::store::db::try_open(&db_path) {
+        tracing::debug!("standalone mode: acquired DB lock");
+
+        // Ingest all pending staged events
+        let grafeo = lobster::graph::db::new_in_memory();
+        if let Err(e) = lobster::graph::rebuild::rebuild_from_redb(&db, &grafeo)
+        {
+            tracing::warn!(error = %e, "failed to rebuild Grafeo");
+        }
+        lobster::graph::indexes::ensure_indexes(&grafeo);
+
+        lobster::store::ingest::ingest_staged(storage_dir, &db, &grafeo).await;
+
+        // Run recall on the current event
+        let payload = lobster::hooks::recall::run_recall(&event, &db, &grafeo);
+
+        if payload.items.is_empty() {
+            lobster::hooks::events::HookOutput::empty()
+        } else {
+            let hint = lobster::hooks::tiered::format_hint(&payload);
+            if hint.is_empty() {
+                lobster::hooks::events::HookOutput::empty()
+            } else {
+                lobster::hooks::events::HookOutput::with_message(hint)
+            }
+        }
+    } else {
+        tracing::debug!(
+            "MCP server has DB lock or DB not initialized; \
+             event staged for later ingestion"
+        );
+        lobster::hooks::events::HookOutput::empty()
+    };
+
     let json =
         serde_json::to_string(&output).context("serialize hook output")?;
     println!("{json}");
