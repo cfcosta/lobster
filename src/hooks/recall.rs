@@ -195,6 +195,20 @@ fn result_to_item(result: &RetrievalResult, db: &Database) -> RecallItem {
                 }
             }
         }
+        "entity" => {
+            if let Ok(entity) = crud::get_entity(db, &result.episode_id) {
+                RecallItem::Hint {
+                    text: format!(
+                        "{:?}: {}",
+                        entity.kind, entity.canonical_name
+                    ),
+                }
+            } else {
+                RecallItem::Hint {
+                    text: format!("Entity (score: {:.2})", result.score),
+                }
+            }
+        }
         _ => RecallItem::Hint {
             text: format!(
                 "Related {} (score: {:.2})",

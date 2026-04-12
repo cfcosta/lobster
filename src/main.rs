@@ -127,14 +127,18 @@ fn try_hook_recall(
     };
 
     // Only run recall for events that produce queries
-    if lobster::hooks::recall::construct_query(event).is_none() {
+    let Some(query) = lobster::hooks::recall::construct_query(event) else {
+        tracing::debug!("hook recall: no query for this event");
         return HookOutput::empty();
-    }
+    };
+    tracing::debug!(query = %query, "hook recall: constructed query");
 
     let db_path = lobster::app::config::db_path(storage_dir);
     let Some(db) = lobster::store::db::open_snapshot(&db_path) else {
+        tracing::debug!(path = %db_path.display(), "hook recall: snapshot unavailable");
         return HookOutput::empty();
     };
+    tracing::debug!("hook recall: snapshot opened");
 
     // Rebuild Grafeo from the snapshot for retrieval
     let grafeo = lobster::graph::db::new_in_memory();
@@ -143,9 +147,20 @@ fn try_hook_recall(
         return HookOutput::empty();
     }
     lobster::graph::indexes::ensure_indexes(&grafeo);
+    tracing::debug!(
+        nodes = grafeo.node_count(),
+        edges = grafeo.edge_count(),
+        "hook recall: grafeo rebuilt"
+    );
 
     let payload = run_recall(event, &db, &grafeo);
     let tier = classify_tier(&payload);
+    tracing::debug!(
+        items = payload.items.len(),
+        ?tier,
+        latency_ms = payload.latency_ms,
+        "hook recall: result"
+    );
 
     match tier {
         OutputTier::Silent => HookOutput::empty(),
