@@ -39,15 +39,16 @@ impl Extractor for HeuristicExtractor {
                     dec.get("decision_id").and_then(serde_json::Value::as_str)
                 {
                     decision_refs.push(id.to_string());
-                }
 
-                // Create decision->entity relations
-                for entity in &entities {
-                    relations.push(ExtractedRelation {
-                        relation_type: RelationType::DecisionEntity,
-                        from: decision_refs.last().cloned().unwrap_or_default(),
-                        to: entity.name.clone(),
-                    });
+                    // Create decision->entity relations only when
+                    // we have a valid decision ref
+                    for entity in &entities {
+                        relations.push(ExtractedRelation {
+                            relation_type: RelationType::DecisionEntity,
+                            from: id.to_string(),
+                            to: entity.name.clone(),
+                        });
+                    }
                 }
             }
         }

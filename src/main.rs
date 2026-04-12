@@ -80,7 +80,14 @@ async fn cmd_hook(
 
     let db_path = lobster::app::config::db_path(storage_dir);
     let db = lobster::store::db::open(&db_path).context("open database")?;
+
+    // Rebuild Grafeo from redb so previous episodes are searchable.
+    // This is what the architecture designed: Grafeo is a rebuildable
+    // projection of the canonical state in redb.
     let grafeo = lobster::graph::db::new_in_memory();
+    if let Err(e) = lobster::graph::rebuild::rebuild_from_redb(&db, &grafeo) {
+        tracing::warn!(error = %e, "failed to rebuild Grafeo");
+    }
 
     // Read hook payload from stdin
     let mut input = String::new();
@@ -157,7 +164,12 @@ async fn cmd_mcp(storage_dir: &std::path::Path) -> Result<()> {
 
     let db_path = lobster::app::config::db_path(storage_dir);
     let db = lobster::store::db::open(&db_path).context("open database")?;
+
+    // Rebuild Grafeo from redb for the MCP session
     let grafeo = lobster::graph::db::new_in_memory();
+    if let Err(e) = lobster::graph::rebuild::rebuild_from_redb(&db, &grafeo) {
+        tracing::warn!(error = %e, "failed to rebuild Grafeo");
+    }
 
     tracing::info!("MCP server starting on stdio");
     eprintln!("lobster: MCP server ready (JSON-RPC on stdio)");
