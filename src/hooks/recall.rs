@@ -89,11 +89,11 @@ pub fn run_recall(
         };
     }
 
-    // Assemble output payload
+    // Assemble output payload — load actual content from redb
     let items: Vec<RecallItem> = results
         .iter()
         .take(MAX_RECALL_ITEMS)
-        .map(result_to_item)
+        .map(|r| result_to_item(r, db))
         .collect();
 
     let truncated = if results.len() > MAX_RECALL_ITEMS {
@@ -127,20 +127,47 @@ pub fn construct_query(event: &HookEvent) -> Option<String> {
     }
 }
 
-fn result_to_item(result: &RetrievalResult) -> RecallItem {
+fn result_to_item(result: &RetrievalResult, db: &Database) -> RecallItem {
+    use crate::store::crud;
+
     match result.artifact_type.as_str() {
-        "decision" => RecallItem::Decision(expand_decision(
-            "recalled decision",
-            "",
-            "unknown",
-            &[],
-            None,
-        )),
-        "summary" => RecallItem::Summary(expand_summary(
-            "recalled summary",
-            &result.episode_id.to_string(),
-            &[],
-        )),
+        "decision" => {
+            // Load actual decision from redb
+            if let Ok(dec) = crud::get_decision(db, &result.episode_id) {
+                RecallItem::Decision(expand_decision(
+                    &dec.statement,
+                    &dec.rationale,
+                    &format!("{:?}", dec.confidence),
+                    &dec.evidence
+                        .iter()
+                        .map(|e| {
+                            (e.episode_id.to_string(), e.span_summary.clone())
+                        })
+                        .collect::<Vec<_>>(),
+                    None,
+                ))
+            } else {
+                RecallItem::Hint {
+                    text: format!("Decision (score: {:.2})", result.score),
+                }
+            }
+        }
+        "summary" => {
+            // Load actual summary from redb
+            if let Ok(summary) =
+                crud::get_summary_artifact(db, &result.episode_id)
+            {
+                RecallItem::Summary(expand_summary(
+                    &summary.summary_text,
+                    &result.episode_id.to_string(),
+                    &[],
+                ))
+            } else {
+                RecallItem::Hint {
+                    text: format!("Summary (score: {:.2})", result.score),
+                }
+            }
+        }
         _ => RecallItem::Hint {
             text: format!(
                 "Related {} (score: {:.2})",

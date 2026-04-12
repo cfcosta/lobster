@@ -92,10 +92,21 @@ pub fn execute_query(
         }
     });
 
-    // Intersect with ready set and apply threshold
+    // Intersect with ready set and apply threshold.
+    // Decisions and entities inherit visibility from their parent
+    // episode (which was Ready when projected). Only filter
+    // episode-typed candidates against the ready set directly.
     diverse
         .into_iter()
-        .filter(|c| visibility::is_episode_visible(db, &c.id))
+        .filter(|c| {
+            if c.artifact_type == "summary" {
+                visibility::is_episode_visible(db, &c.id)
+            } else {
+                // Decisions/entities were only projected from
+                // Ready episodes, so they're implicitly visible
+                true
+            }
+        })
         .filter(|c| {
             let input = ScoringInput {
                 semantic: c.score,
