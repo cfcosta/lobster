@@ -1134,4 +1134,119 @@ mod tests {
         assert_eq!(grafeo.node_count(), 0);
         assert_eq!(grafeo.edge_count(), 0);
     }
+
+    // ── Snapshot fallback ───────────────────────────────────────
+
+    /// A cleanly-closed database can be copied and opened via the
+    /// snapshot fallback path, and reads back the same record count.
+    #[hegel::test(test_cases = 20)]
+    fn prop_snapshot_reads_same_data(tc: TestCase) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.redb");
+
+        // Write N raw events to a file-based database
+        let n: usize =
+            tc.draw(gs::integers::<usize>().min_value(1).max_value(15));
+        {
+            let database = db::open(&db_path).unwrap();
+            for seq in 0..n {
+                let event = tc.draw(gen_raw_event(seq as u64));
+                crud::append_raw_event(&database, &event).unwrap();
+            }
+            // database dropped here — cleanly closed
+        }
+
+        // Simulate the snapshot fallback: copy + repair + open
+        let copy_path = dir.path().join("snapshot.redb");
+        std::fs::copy(&db_path, &copy_path).unwrap();
+        let snapshot = redb::Builder::new()
+            .set_repair_callback(|_| {})
+            .open(&copy_path)
+            .expect("open snapshot copy");
+
+        let count = count_table_entries(&snapshot, tables::RAW_EVENTS);
+        assert_eq!(count, n, "snapshot should have all {n} events");
+    }
+
+    /// Snapshot fallback preserves episode data including all fields.
+    #[hegel::test(test_cases = 20)]
+    fn prop_snapshot_preserves_episodes(tc: TestCase) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.redb");
+
+        let n: usize =
+            tc.draw(gs::integers::<usize>().min_value(1).max_value(10));
+        let mut written = Vec::new();
+        {
+            let database = db::open(&db_path).unwrap();
+            for i in 0..n {
+                let mut ep = tc.draw(gen_episode());
+                ep.episode_id =
+                    EpisodeId::derive(format!("snap-ep-{i}").as_bytes());
+                crud::put_episode(&database, &ep).unwrap();
+                written.push(ep);
+            }
+        }
+
+        let copy_path = dir.path().join("snapshot.redb");
+        std::fs::copy(&db_path, &copy_path).unwrap();
+        let snapshot = redb::Builder::new()
+            .set_repair_callback(|_| {})
+            .open(&copy_path)
+            .unwrap();
+
+        let txn = snapshot.begin_read().unwrap();
+        let table = txn.open_table(tables::EPISODES).unwrap();
+        let mut read_back: Vec<Episode> = Vec::new();
+        for entry in table.iter().unwrap() {
+            let (_, v) = entry.unwrap();
+            read_back.push(serde_json::from_slice(v.value()).unwrap());
+        }
+
+        written.sort_by_key(|e| e.episode_id);
+        read_back.sort_by_key(|e| e.episode_id);
+        assert_eq!(written, read_back);
+    }
+
+    /// `rebuild_grafeo` on a snapshot copy produces the same graph
+    /// as on the original database.
+    #[test]
+    fn test_snapshot_rebuild_matches_original() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.redb");
+
+        let database = db::open(&db_path).unwrap();
+        let grafeo = grafeo_db::new_in_memory();
+
+        let result = rt.block_on(finalize_episode(
+            &database,
+            &grafeo,
+            "/test/repo",
+            b"[]",
+            0,
+            5,
+            None,
+        ));
+        assert!(matches!(result, FinalizeResult::Ready { .. }));
+        let original_nodes = grafeo.node_count();
+
+        // Close the original to release the lock
+        drop(database);
+
+        // Snapshot path
+        let copy_path = dir.path().join("snapshot.redb");
+        std::fs::copy(&db_path, &copy_path).unwrap();
+        let snapshot = redb::Builder::new()
+            .set_repair_callback(|_| {})
+            .open(&copy_path)
+            .unwrap();
+
+        let rebuilt = rebuild_grafeo(&snapshot).unwrap();
+        assert_eq!(rebuilt.node_count(), original_nodes);
+    }
 }
