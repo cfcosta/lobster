@@ -12,9 +12,13 @@ use serde::{Deserialize, Serialize};
 use crate::mcp::tools;
 
 /// A JSON-RPC request (simplified).
+///
+/// `id` is optional — notifications (like `notifications/initialized`)
+/// have no `id` and expect no response.
 #[derive(Debug, Deserialize)]
 pub struct JsonRpcRequest {
     pub jsonrpc: String,
+    #[serde(default)]
     pub id: serde_json::Value,
     pub method: String,
     #[serde(default)]
@@ -73,19 +77,30 @@ pub fn run_server(
             continue;
         }
 
-        let response = match serde_json::from_str::<JsonRpcRequest>(&body) {
-            Ok(req) => handle_request(&req, db, grafeo),
-            Err(e) => JsonRpcResponse {
-                jsonrpc: "2.0".into(),
-                id: serde_json::Value::Null,
-                result: None,
-                error: Some(JsonRpcError {
-                    code: -32700,
-                    message: format!("Parse error: {e}"),
-                }),
-            },
+        let req = match serde_json::from_str::<JsonRpcRequest>(&body) {
+            Ok(r) => r,
+            Err(e) => {
+                let resp = JsonRpcResponse {
+                    jsonrpc: "2.0".into(),
+                    id: serde_json::Value::Null,
+                    result: None,
+                    error: Some(JsonRpcError {
+                        code: -32700,
+                        message: format!("Parse error: {e}"),
+                    }),
+                };
+                let json = serde_json::to_string(&resp)?;
+                write_message(&mut stdout, &json)?;
+                continue;
+            }
         };
 
+        // Notifications (no id) get no response
+        if req.id.is_null() {
+            continue;
+        }
+
+        let response = handle_request(&req, db, grafeo);
         let json = serde_json::to_string(&response)?;
         write_message(&mut stdout, &json)?;
     }
@@ -147,10 +162,145 @@ fn handle_request(
     db: &Database,
     grafeo: &GrafeoDB,
 ) -> JsonRpcResponse {
-    let result = match req.method.as_str() {
+    match req.method.as_str() {
+        "initialize" => ok_response(req, initialize_result()),
+        "tools/list" => ok_response(req, tools_list()),
+        "tools/call" => handle_tools_call(req, db, grafeo),
+        _ => JsonRpcResponse {
+            jsonrpc: "2.0".into(),
+            id: req.id.clone(),
+            result: None,
+            error: Some(JsonRpcError {
+                code: -32601,
+                message: format!("Method not found: {}", req.method),
+            }),
+        },
+    }
+}
+
+fn ok_response(
+    req: &JsonRpcRequest,
+    result: serde_json::Value,
+) -> JsonRpcResponse {
+    JsonRpcResponse {
+        jsonrpc: "2.0".into(),
+        id: req.id.clone(),
+        result: Some(result),
+        error: None,
+    }
+}
+
+/// MCP `initialize` response: declare protocol version and capabilities.
+fn initialize_result() -> serde_json::Value {
+    serde_json::json!({
+        "protocolVersion": "2024-11-05",
+        "capabilities": {
+            "tools": {}
+        },
+        "serverInfo": {
+            "name": "lobster",
+            "version": env!("CARGO_PKG_VERSION")
+        }
+    })
+}
+
+/// MCP `tools/list` response: declare available tools with schemas.
+fn tools_list() -> serde_json::Value {
+    serde_json::json!({
+        "tools": [
+            {
+                "name": "memory_context",
+                "description": "Task-oriented context bundle: returns ranked decisions, summaries, tasks, and entities for the current situation.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Natural-language query describing the current task or question"
+                        }
+                    },
+                    "required": ["query"]
+                }
+            },
+            {
+                "name": "memory_recent",
+                "description": "List the newest ready artifacts (episodes, decisions, tasks).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            },
+            {
+                "name": "memory_search",
+                "description": "Search memory for ranked hits with snippets and confidence scores.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Search query"
+                        }
+                    },
+                    "required": ["query"]
+                }
+            },
+            {
+                "name": "memory_decisions",
+                "description": "Return decision timeline with rationale.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            },
+            {
+                "name": "memory_neighbors",
+                "description": "Graph neighbor traversal from a given entity node.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "node_id": {
+                            "type": "string",
+                            "description": "ID of the node to get neighbors for"
+                        }
+                    },
+                    "required": ["node_id"]
+                }
+            },
+            {
+                "name": "memory_status",
+                "description": "Processing state diagnostics: episode counts, artifacts, pending/failed status.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            }
+        ]
+    })
+}
+
+/// Dispatch a `tools/call` request to the appropriate tool.
+fn handle_tools_call(
+    req: &JsonRpcRequest,
+    db: &Database,
+    grafeo: &GrafeoDB,
+) -> JsonRpcResponse {
+    let tool_name = req
+        .params
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let arguments = req
+        .params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    let tool_result = match tool_name {
         "memory_context" => {
-            let query = req
-                .params
+            let query = arguments
                 .get("query")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("");
@@ -162,8 +312,7 @@ fn handle_request(
             serde_json::to_value(result).ok()
         }
         "memory_search" => {
-            let query = req
-                .params
+            let query = arguments
                 .get("query")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("");
@@ -175,8 +324,7 @@ fn handle_request(
             serde_json::to_value(result).ok()
         }
         "memory_neighbors" => {
-            let node_id = req
-                .params
+            let node_id = arguments
                 .get("node_id")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("");
@@ -199,21 +347,28 @@ fn handle_request(
         _ => None,
     };
 
-    result.map_or_else(
+    tool_result.map_or_else(
         || JsonRpcResponse {
             jsonrpc: "2.0".into(),
             id: req.id.clone(),
-            result: None,
-            error: Some(JsonRpcError {
-                code: -32601,
-                message: format!("Method not found: {}", req.method),
-            }),
-        },
-        |val| JsonRpcResponse {
-            jsonrpc: "2.0".into(),
-            id: req.id.clone(),
-            result: Some(val),
+            result: Some(serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!("Unknown tool: {tool_name}")
+                }],
+                "isError": true
+            })),
             error: None,
+        },
+        |value| {
+            // MCP tools/call response wraps result in content array
+            let content = serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": serde_json::to_string(&value).unwrap_or_default()
+                }]
+            });
+            ok_response(req, content)
         },
     )
 }
@@ -222,67 +377,110 @@ fn handle_request(
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_parse_jsonrpc_request() {
-        let json = r#"{
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "memory_context",
-            "params": {"query": "storage decision"}
-        }"#;
-        let req: JsonRpcRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.method, "memory_context");
-        assert_eq!(req.params["query"].as_str().unwrap(), "storage decision");
-    }
-
-    #[test]
-    fn test_handle_memory_context() {
-        let db = crate::store::db::open_in_memory().unwrap();
-        let grafeo = crate::graph::db::new_in_memory();
-
-        let req = JsonRpcRequest {
+    fn make_req(method: &str, params: serde_json::Value) -> JsonRpcRequest {
+        JsonRpcRequest {
             jsonrpc: "2.0".into(),
             id: serde_json::json!(1),
-            method: "memory_context".into(),
-            params: serde_json::json!({"query": "test"}),
-        };
-
-        let resp = handle_request(&req, &db, &grafeo);
-        assert!(resp.result.is_some());
-        assert!(resp.error.is_none());
+            method: method.into(),
+            params,
+        }
     }
 
     #[test]
-    fn test_handle_memory_recent() {
+    fn test_initialize() {
         let db = crate::store::db::open_in_memory().unwrap();
         let grafeo = crate::graph::db::new_in_memory();
 
-        let req = JsonRpcRequest {
-            jsonrpc: "2.0".into(),
-            id: serde_json::json!(2),
-            method: "memory_recent".into(),
-            params: serde_json::json!({}),
-        };
-
+        let req = make_req("initialize", serde_json::json!({}));
         let resp = handle_request(&req, &db, &grafeo);
-        assert!(resp.result.is_some());
+
         assert!(resp.error.is_none());
+        let result = resp.result.unwrap();
+        assert_eq!(result["protocolVersion"], "2024-11-05");
+        assert_eq!(result["serverInfo"]["name"], "lobster");
+        assert!(result["capabilities"]["tools"].is_object());
     }
 
     #[test]
-    fn test_handle_unknown_method() {
+    fn test_tools_list() {
         let db = crate::store::db::open_in_memory().unwrap();
         let grafeo = crate::graph::db::new_in_memory();
 
-        let req = JsonRpcRequest {
-            jsonrpc: "2.0".into(),
-            id: serde_json::json!(3),
-            method: "nonexistent".into(),
-            params: serde_json::json!({}),
-        };
-
+        let req = make_req("tools/list", serde_json::json!({}));
         let resp = handle_request(&req, &db, &grafeo);
-        assert!(resp.result.is_none());
+
+        assert!(resp.error.is_none());
+        let result = resp.result.unwrap();
+        let tool_list = result["tools"].as_array().unwrap();
+        assert_eq!(tool_list.len(), 6);
+
+        let names: Vec<&str> = tool_list
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"memory_context"));
+        assert!(names.contains(&"memory_search"));
+        assert!(names.contains(&"memory_status"));
+    }
+
+    #[test]
+    fn test_tools_call_memory_context() {
+        let db = crate::store::db::open_in_memory().unwrap();
+        let grafeo = crate::graph::db::new_in_memory();
+
+        let req = make_req(
+            "tools/call",
+            serde_json::json!({
+                "name": "memory_context",
+                "arguments": {"query": "test"}
+            }),
+        );
+        let resp = handle_request(&req, &db, &grafeo);
+
+        assert!(resp.error.is_none());
+        let result = resp.result.unwrap();
+        assert!(result["content"].is_array());
+        assert_eq!(result["content"][0]["type"], "text");
+    }
+
+    #[test]
+    fn test_tools_call_memory_recent() {
+        let db = crate::store::db::open_in_memory().unwrap();
+        let grafeo = crate::graph::db::new_in_memory();
+
+        let req = make_req(
+            "tools/call",
+            serde_json::json!({"name": "memory_recent", "arguments": {}}),
+        );
+        let resp = handle_request(&req, &db, &grafeo);
+
+        assert!(resp.error.is_none());
+        let result = resp.result.unwrap();
+        assert!(result["content"].is_array());
+    }
+
+    #[test]
+    fn test_tools_call_unknown_tool() {
+        let db = crate::store::db::open_in_memory().unwrap();
+        let grafeo = crate::graph::db::new_in_memory();
+
+        let req =
+            make_req("tools/call", serde_json::json!({"name": "nonexistent"}));
+        let resp = handle_request(&req, &db, &grafeo);
+
+        assert!(resp.error.is_none()); // MCP errors go in result, not JSON-RPC error
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+    }
+
+    #[test]
+    fn test_unknown_method() {
+        let db = crate::store::db::open_in_memory().unwrap();
+        let grafeo = crate::graph::db::new_in_memory();
+
+        let req = make_req("nonexistent", serde_json::json!({}));
+        let resp = handle_request(&req, &db, &grafeo);
+
         assert!(resp.error.is_some());
         assert_eq!(resp.error.unwrap().code, -32601);
     }
@@ -297,7 +495,16 @@ mod tests {
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"jsonrpc\":\"2.0\""));
-        // error should not appear when None
         assert!(!json.contains("error"));
+    }
+
+    #[test]
+    fn test_notification_has_null_id() {
+        let json = r#"{
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }"#;
+        let req: JsonRpcRequest = serde_json::from_str(json).unwrap();
+        assert!(req.id.is_null());
     }
 }
