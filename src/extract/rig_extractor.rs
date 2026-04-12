@@ -267,4 +267,124 @@ mod tests {
             ));
         }
     }
+
+    // ── Decision extraction parsing ─────────────────────────
+
+    #[test]
+    fn test_parse_with_decisions() {
+        let json = r#"{
+            "entities": [{"kind": "component", "name": "redb"}],
+            "relations": [],
+            "task_refs": [],
+            "decision_refs": [],
+            "decisions": [
+                {
+                    "statement": "Use redb for storage",
+                    "rationale": "Embedded, ACID, Rust-native",
+                    "confidence": "high"
+                }
+            ]
+        }"#;
+
+        let result = parse_extraction_response(json).unwrap();
+        assert_eq!(result.decisions.len(), 1);
+        assert_eq!(result.decisions[0].statement, "Use redb for storage");
+        assert_eq!(result.decisions[0].confidence, "high");
+    }
+
+    #[test]
+    fn test_parse_without_decisions_defaults_empty() {
+        let json = r#"{
+            "entities": [{"kind": "component", "name": "grafeo"}],
+            "relations": [],
+            "task_refs": [],
+            "decision_refs": []
+        }"#;
+
+        let result = parse_extraction_response(json).unwrap();
+        assert!(result.decisions.is_empty());
+    }
+
+    #[test]
+    fn test_parse_decisions_missing_fields_skipped() {
+        let json = r#"{
+            "entities": [],
+            "relations": [],
+            "task_refs": [],
+            "decision_refs": [],
+            "decisions": [
+                {"statement": "valid", "rationale": "reason", "confidence": "high"},
+                {"statement": "no rationale"},
+                {"rationale": "no statement"}
+            ]
+        }"#;
+
+        let result = parse_extraction_response(json).unwrap();
+        // Only the first decision has both required fields
+        assert_eq!(result.decisions.len(), 1);
+        assert_eq!(result.decisions[0].statement, "valid");
+    }
+
+    use hegel::{TestCase, generators as gs};
+
+    /// `ExtractedDecision` serde round-trip.
+    #[hegel::test(test_cases = 200)]
+    fn prop_extracted_decision_roundtrip(tc: TestCase) {
+        let dec = ExtractedDecision {
+            statement: tc.draw(gs::text().min_size(1).max_size(100)),
+            rationale: tc.draw(gs::text().min_size(1).max_size(100)),
+            confidence: tc.draw(gs::sampled_from(vec![
+                "high".to_string(),
+                "medium".to_string(),
+                "low".to_string(),
+            ])),
+        };
+        let json = serde_json::to_string(&dec).unwrap();
+        let parsed: ExtractedDecision = serde_json::from_str(&json).unwrap();
+        assert_eq!(dec, parsed);
+    }
+
+    /// `parse_extraction_response` with decisions round-trips
+    /// the decision count.
+    #[hegel::test(test_cases = 100)]
+    fn prop_parse_preserves_decision_count(tc: TestCase) {
+        let n: usize =
+            tc.draw(gs::integers::<usize>().min_value(0).max_value(5));
+        let mut decisions = Vec::new();
+        for _ in 0..n {
+            let stmt: String = tc.draw(
+                gs::text()
+                    .min_size(1)
+                    .max_size(50)
+                    .alphabet("abcdefghijklmnopqrstuvwxyz "),
+            );
+            let rationale: String = tc.draw(
+                gs::text()
+                    .min_size(1)
+                    .max_size(50)
+                    .alphabet("abcdefghijklmnopqrstuvwxyz "),
+            );
+            let conf: String = tc.draw(gs::sampled_from(vec![
+                "high".to_string(),
+                "medium".to_string(),
+                "low".to_string(),
+            ]));
+            decisions.push(serde_json::json!({
+                "statement": stmt,
+                "rationale": rationale,
+                "confidence": conf,
+            }));
+        }
+
+        let json = serde_json::json!({
+            "entities": [{"kind": "repo", "name": "test"}],
+            "relations": [],
+            "task_refs": [],
+            "decision_refs": [],
+            "decisions": decisions,
+        });
+
+        let result = parse_extraction_response(&json.to_string()).unwrap();
+        assert_eq!(result.decisions.len(), n);
+    }
 }
