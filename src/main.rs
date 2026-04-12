@@ -88,6 +88,7 @@ async fn cmd_hook(
     if let Err(e) = lobster::graph::rebuild::rebuild_from_redb(&db, &grafeo) {
         tracing::warn!(error = %e, "failed to rebuild Grafeo");
     }
+    lobster::graph::indexes::ensure_indexes(&grafeo);
 
     // Read hook payload from stdin
     let mut input = String::new();
@@ -178,6 +179,7 @@ async fn cmd_mcp(storage_dir: &std::path::Path) -> Result<()> {
     if let Err(e) = lobster::graph::rebuild::rebuild_from_redb(&db, &grafeo) {
         tracing::warn!(error = %e, "failed to rebuild Grafeo");
     }
+    lobster::graph::indexes::ensure_indexes(&grafeo);
 
     tracing::info!("MCP server starting on stdio");
     eprintln!("lobster: MCP server ready (JSON-RPC on stdio)");

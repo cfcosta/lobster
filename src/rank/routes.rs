@@ -76,11 +76,20 @@ pub fn execute_query(
     // replaced with HNSW vector search when embeddings are active.
     let candidates = search_grafeo(grafeo, query, route);
 
-    // Apply MMR diversity
+    // Rerank with cosine similarity on proxy vectors when available.
+    // Load proxy vectors for each candidate from redb, then use
+    // cosine similarity for MMR pairwise comparison.
+    let proxy_vectors = load_proxy_vectors(db, &candidates);
     let diverse = apply_mmr(&candidates, budget, lambda, |a, b| {
-        // Placeholder similarity — real impl uses cosine on
-        // pooled vectors
-        if a == b { 1.0 } else { 0.0 }
+        if a == b {
+            return 1.0;
+        }
+        match (proxy_vectors.get(a), proxy_vectors.get(b)) {
+            (Some(va), Some(vb)) => {
+                crate::rank::retrieval::cosine_similarity(va, vb)
+            }
+            _ => 0.0,
+        }
     });
 
     // Intersect with ready set and apply threshold
@@ -109,19 +118,91 @@ pub fn execute_query(
         .collect()
 }
 
+/// Load proxy vectors for candidates from embedding artifacts.
+fn load_proxy_vectors(
+    db: &Database,
+    candidates: &[ScoredCandidate],
+) -> std::collections::HashMap<crate::store::ids::RawId, Vec<f32>> {
+    use crate::store::crud;
+
+    let mut vectors = std::collections::HashMap::new();
+    for c in candidates {
+        // Try loading embedding artifact keyed by the candidate's
+        // episode ID. The artifact stores pooled_vector_bytes.
+        if let Ok(emb) = crud::get_embedding_artifact(db, &c.id) {
+            let proxy = crate::embeddings::proxy::bytes_to_vector(
+                &emb.pooled_vector_bytes,
+            );
+            if !proxy.is_empty() {
+                vectors.insert(c.id, proxy);
+            }
+        }
+    }
+    vectors
+}
+
 /// Search Grafeo for candidates matching the query.
 ///
-/// Uses GQL property matching on decision statements and entity
-/// names. Returns scored candidates for the downstream pipeline.
+/// Uses BM25 text search (when indexes exist) plus GQL property
+/// matching as fallback. Returns scored candidates.
+#[allow(clippy::too_many_lines)]
 fn search_grafeo(
     grafeo: &GrafeoDB,
     query: &str,
     _route: RetrievalRoute,
 ) -> Vec<ScoredCandidate> {
     let mut candidates = Vec::new();
-
-    // Search decision nodes by matching statement text
     let query_lower = query.to_lowercase();
+
+    // Try BM25 text search on decision statements (uses index)
+    if let Ok(hits) = grafeo.text_search(
+        crate::graph::db::labels::DECISION,
+        "statement",
+        query,
+        20,
+    ) {
+        for (node_id, _distance) in &hits {
+            if let Some(node) = grafeo.get_node(*node_id) {
+                if let Some(id_val) = node.get_property("decision_id") {
+                    if let Some(id_str) = id_val.as_str() {
+                        if let Ok(raw_id) = id_str.parse() {
+                            candidates.push(ScoredCandidate {
+                                id: raw_id,
+                                score: 0.9,
+                                artifact_type: "decision".into(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Try BM25 text search on episode summaries
+    if let Ok(hits) = grafeo.text_search(
+        crate::graph::db::labels::EPISODE,
+        "summary_text",
+        query,
+        20,
+    ) {
+        for (node_id, _distance) in &hits {
+            if let Some(node) = grafeo.get_node(*node_id) {
+                if let Some(id_val) = node.get_property("episode_id") {
+                    if let Some(id_str) = id_val.as_str() {
+                        if let Ok(raw_id) = id_str.parse() {
+                            candidates.push(ScoredCandidate {
+                                id: raw_id,
+                                score: 0.8,
+                                artifact_type: "summary".into(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: GQL property matching for broader coverage
     let session = grafeo.session();
 
     // Search decisions
