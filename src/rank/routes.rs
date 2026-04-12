@@ -47,6 +47,17 @@ pub fn execute_query(
     grafeo: &GrafeoDB,
     is_mcp: bool,
 ) -> Vec<RetrievalResult> {
+    execute_query_with_context(query, db, grafeo, is_mcp, None)
+}
+
+/// Execute a query with optional task context for scoring.
+pub fn execute_query_with_context(
+    query: &str,
+    db: &Database,
+    grafeo: &GrafeoDB,
+    is_mcp: bool,
+    _current_task_id: Option<&crate::store::ids::TaskId>,
+) -> Vec<RetrievalResult> {
     let route = classify_query(query);
 
     if route == RetrievalRoute::Abstain {
@@ -74,7 +85,10 @@ pub fn execute_query(
     // Search Grafeo using GQL text matching on decision statements
     // and entity names. This is a basic implementation that will be
     // replaced with HNSW vector search when embeddings are active.
-    let candidates = search_grafeo(grafeo, query, route);
+    let mut candidates = search_grafeo(grafeo, query, route);
+
+    // Apply stable tie-breakers before MMR per spec
+    crate::rank::retrieval::stable_sort(&mut candidates);
 
     // Rerank with cosine similarity on proxy vectors when available.
     // Load proxy vectors for each candidate from redb, then use

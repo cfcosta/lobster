@@ -35,6 +35,39 @@ pub struct ScoredCandidate {
     pub artifact_type: String,
 }
 
+/// Artifact priority for stable tie-breaking.
+/// Per spec: decision > task > summary > entity.
+#[must_use]
+pub fn artifact_priority(artifact_type: &str) -> u8 {
+    match artifact_type {
+        "decision" => 0,
+        "task" => 1,
+        "summary" => 2,
+        "entity" => 3,
+        _ => 4,
+    }
+}
+
+/// Sort candidates with stable tie-breakers per spec:
+/// 1. Higher composite score first
+/// 2. Artifact priority (decision > task > summary > entity)
+/// 3. Stable artifact ID (lexicographic)
+pub fn stable_sort(candidates: &mut [ScoredCandidate]) {
+    candidates.sort_by(|a, b| {
+        // Primary: score descending
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            // Secondary: artifact priority ascending (lower = higher priority)
+            .then_with(|| {
+                artifact_priority(&a.artifact_type)
+                    .cmp(&artifact_priority(&b.artifact_type))
+            })
+            // Tertiary: stable ID lexicographic
+            .then_with(|| a.id.cmp(&b.id))
+    });
+}
+
 /// Apply Maximal Marginal Relevance to deduplicate results.
 ///
 /// `lambda` controls the diversity/relevance trade-off:
