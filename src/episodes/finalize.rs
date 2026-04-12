@@ -237,35 +237,29 @@ pub async fn finalize_episode(
     }
 
     // ── Step 8b: Create and persist EmbeddingArtifact ────
-    // Convert summary text to a simple byte-level "embedding"
-    // (real ColBERT encoding deferred to model runtime), then
-    // mean-pool to a proxy vector.
-    let text_bytes: Vec<f32> = summary
-        .summary_text
-        .bytes()
-        .map(|b| f32::from(b) / 255.0)
-        .collect();
-    let dims = 16; // proxy vector dimensions
-    let padded_len = text_bytes.len().div_ceil(dims) * dims;
-    let mut padded = text_bytes;
-    padded.resize(padded_len, 0.0);
-    let proxy = crate::embeddings::proxy::mean_pool(&padded, dims);
-    let pooled_bytes = crate::embeddings::proxy::vector_to_bytes(&proxy);
+    // Try real ColBERT encoding if the model is available.
+    // Falls back to byte-level proxy if model not installed.
+    let artifact_id = crate::store::ids::ArtifactId::derive(
+        format!("emb:{episode_id}").as_bytes(),
+    );
+    let policy = crate::embeddings::proxy::policy_for("summary");
 
-    let mut emb_hasher = Sha256::new();
-    emb_hasher.update(&pooled_bytes);
-    let emb_checksum: [u8; 32] = emb_hasher.finalize().into();
-
-    let embedding_artifact = crate::store::schema::EmbeddingArtifact {
-        artifact_id: crate::store::ids::ArtifactId::derive(
-            format!("emb:{episode_id}").as_bytes(),
-        ),
-        revision: crate::embeddings::proxy::PROXY_REDUCTION_VERSION.to_string(),
-        backend: crate::store::schema::EmbeddingBackend::Cpu,
-        quantization: None,
-        pooled_vector_bytes: pooled_bytes,
-        late_interaction_bytes: None,
-        payload_checksum: emb_checksum,
+    let embedding_artifact = if let Ok(mut model) =
+        crate::embeddings::encoder::load_model()
+    {
+        // Real ColBERT encoding with hierarchical_pooling
+        match crate::embeddings::encoder::encode_text(
+            &mut model,
+            &summary.summary_text,
+            artifact_id,
+            policy,
+        ) {
+            Ok(art) => art,
+            Err(_) => fallback_embedding(&summary.summary_text, artifact_id),
+        }
+    } else {
+        // Model not installed — use byte-level fallback
+        fallback_embedding(&summary.summary_text, artifact_id)
     };
     let _ = crud::put_embedding_artifact(db, &embedding_artifact);
 
@@ -337,6 +331,36 @@ pub async fn finalize_episode(
     FinalizeResult::Ready {
         episode_id,
         decisions_created: created_decisions.len(),
+    }
+}
+
+/// Fallback embedding when `ColBERT` model is not available.
+/// Uses byte-level proxy vector from text content.
+fn fallback_embedding(
+    text: &str,
+    artifact_id: crate::store::ids::ArtifactId,
+) -> crate::store::schema::EmbeddingArtifact {
+    let text_bytes: Vec<f32> =
+        text.bytes().map(|b| f32::from(b) / 255.0).collect();
+    let dims = 16;
+    let padded_len = text_bytes.len().div_ceil(dims) * dims;
+    let mut padded = text_bytes;
+    padded.resize(padded_len, 0.0);
+    let proxy = crate::embeddings::proxy::mean_pool(&padded, dims);
+    let pooled_bytes = crate::embeddings::proxy::vector_to_bytes(&proxy);
+
+    let mut hasher = Sha256::new();
+    hasher.update(&pooled_bytes);
+    let checksum: [u8; 32] = hasher.finalize().into();
+
+    crate::store::schema::EmbeddingArtifact {
+        artifact_id,
+        revision: crate::embeddings::proxy::PROXY_REDUCTION_VERSION.to_string(),
+        backend: crate::store::schema::EmbeddingBackend::Cpu,
+        quantization: None,
+        pooled_vector_bytes: pooled_bytes,
+        late_interaction_bytes: None,
+        payload_checksum: checksum,
     }
 }
 
