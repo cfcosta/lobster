@@ -40,17 +40,26 @@ pub enum RelationType {
     EntityEntity,
 }
 
+/// A decision detected by the LLM extractor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtractedDecision {
+    /// What was decided (one clear sentence).
+    pub statement: String,
+    /// Why it was decided.
+    pub rationale: String,
+    /// LLM's assessment: "high", "medium", or "low".
+    pub confidence: String,
+}
+
 /// Typed structured facts emitted by the extractor.
-///
-/// The extractor may reference existing decisions but does not
-/// create new canonical Decision records (canonical ownership
-/// rule).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtractionOutput {
     pub task_refs: Vec<String>,
     pub decision_refs: Vec<String>,
     pub entities: Vec<ExtractedEntity>,
     pub relations: Vec<ExtractedRelation>,
+    #[serde(default)]
+    pub decisions: Vec<ExtractedDecision>,
 }
 
 /// Error from the extraction pipeline.
@@ -135,6 +144,7 @@ mod tests {
             decision_refs: vec![],
             entities,
             relations,
+            decisions: vec![],
         };
         let json = serde_json::to_string(&output).unwrap();
         let parsed: ExtractionOutput = serde_json::from_str(&json).unwrap();
@@ -170,6 +180,7 @@ mod tests {
                     name: "Grafeo".into(),
                 }],
                 relations: vec![],
+                decisions: vec![],
             })
         }
     }

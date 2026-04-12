@@ -5,6 +5,7 @@
 //! - `OPENAI_API_KEY` + `OPENAI_MODEL` (default: gpt-4o-mini)
 
 use crate::extract::traits::{
+    ExtractedDecision,
     ExtractedEntity,
     ExtractedRelation,
     ExtractionError,
@@ -22,24 +23,44 @@ impl Extractor for RigExtractor {
         input: ExtractionInput,
     ) -> Result<ExtractionOutput, ExtractionError> {
         let prompt = format!(
-            "Extract entities and relations from this episode summary.\n\
+            "Repository: {repo}\n\
              \n\
-             Summary: {}\n\
-             Repo: {}\n\
-             \n\
-             Return a JSON object with:\n\
-             - \"entities\": array of {{\"kind\": \"concept|constraint|component|file-lite|repo\", \"name\": \"...\"}}\n\
-             - \"relations\": array of {{\"relation_type\": \"TaskDecision|TaskEntity|DecisionEntity|EntityEntity\", \"from\": \"...\", \"to\": \"...\"}}\n\
-             - \"task_refs\": array of task ID strings\n\
-             - \"decision_refs\": array of decision ID strings\n\
-             \n\
-             Only extract what is explicitly mentioned. Do not invent entities.",
-            input.summary_text, input.repo_path,
+             Summary of work session:\n\
+             {summary}\n",
+            repo = input.repo_path,
+            summary = input.summary_text,
         );
 
         let response = crate::app::llm::call(
-            "You are a precise entity and relation extractor. \
-             Output only valid JSON, no markdown fences.",
+            "You extract structured facts from developer work session summaries.\n\
+             Output a single JSON object with these fields:\n\
+             \n\
+             \"decisions\": array of decisions made during the session. Each has:\n\
+             - \"statement\": one clear sentence stating what was decided\n\
+             - \"rationale\": why it was decided (one sentence)\n\
+             - \"confidence\": \"high\" (explicit choice), \"medium\" (implied), or \"low\" (uncertain)\n\
+             Only include genuine technical decisions (architecture, design, tool choice, approach).\n\
+             Do NOT include routine actions like \"ran tests\" or \"read a file\".\n\
+             \n\
+             \"entities\": array of notable things mentioned. Each has:\n\
+             - \"kind\": one of \"component\", \"constraint\", \"file-lite\", \"concept\", \"repo\"\n\
+             - \"name\": canonical name\n\
+             Only include entities that would be useful to recall in future sessions.\n\
+             Prefer components and constraints over generic concepts.\n\
+             \n\
+             \"relations\": array of relationships. Each has:\n\
+             - \"relation_type\": \"EntityEntity\", \"DecisionEntity\", \"TaskEntity\", or \"TaskDecision\"\n\
+             - \"from\": name of source entity\n\
+             - \"to\": name of target entity\n\
+             \n\
+             \"task_refs\": array of task title strings (empty if none)\n\
+             \"decision_refs\": array of decision statement strings (empty if none)\n\
+             \n\
+             Rules:\n\
+             - Output ONLY valid JSON, no markdown fences or prose.\n\
+             - Only extract what is explicitly stated. Do not invent.\n\
+             - If nothing meaningful was decided, return an empty \"decisions\" array.\n\
+             - Prefer fewer, higher-quality items over exhaustive extraction.",
             &prompt,
         )
         .await
@@ -122,8 +143,32 @@ fn parse_extraction_response(
         })
         .unwrap_or_default();
 
+    let decisions: Vec<ExtractedDecision> = parsed
+        .get("decisions")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|d| {
+                    Some(ExtractedDecision {
+                        statement: d.get("statement")?.as_str()?.to_string(),
+                        rationale: d.get("rationale")?.as_str()?.to_string(),
+                        confidence: d
+                            .get("confidence")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("low")
+                            .to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     // Ensure at least one reference exists
-    if entities.is_empty() && task_refs.is_empty() && decision_refs.is_empty() {
+    if entities.is_empty()
+        && task_refs.is_empty()
+        && decision_refs.is_empty()
+        && decisions.is_empty()
+    {
         // Fall back to a repo entity so validation passes
         return Ok(ExtractionOutput {
             task_refs,
@@ -133,6 +178,7 @@ fn parse_extraction_response(
                 name: "unknown".to_string(),
             }],
             relations,
+            decisions: vec![],
         });
     }
 
@@ -141,6 +187,7 @@ fn parse_extraction_response(
         decision_refs,
         entities,
         relations,
+        decisions,
     })
 }
 

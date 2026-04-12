@@ -10,7 +10,6 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     episodes::{
-        decisions,
         rig_summarizer::RigSummarizer,
         summarizer::{Summarizer, SummaryInput},
     },
@@ -153,60 +152,9 @@ pub async fn finalize_episode_at(
         ));
     }
 
-    // ── Steps 4-5: Detect decisions, promote, persist ────
-    let signals = decisions::detect_signals(&summary.summary_text);
-    let confidence = decisions::aggregate_confidence(&signals);
-
+    // Decisions will be created from extraction output below
+    // (not from heuristic text pattern matching).
     let mut created_decisions: Vec<Decision> = Vec::new();
-
-    // Auto-promote if confidence is Medium or High
-    if let Some(conf) = confidence {
-        if conf == Confidence::High || conf == Confidence::Medium {
-            // Group signals into a single decision statement.
-            // In a real system each distinct decision would be
-            // separate, but the decision detector produces
-            // signals from a single summary so we merge them.
-            let statement: String = signals
-                .iter()
-                .map(|s| s.matched_text.as_str())
-                .collect::<Vec<_>>()
-                .join("; ");
-
-            if !statement.is_empty() {
-                let decision = Decision {
-                    decision_id: DecisionId::derive(
-                        format!("{episode_id}:{statement}").as_bytes(),
-                    ),
-                    repo_id,
-                    episode_id,
-                    task_id: None,
-                    statement,
-                    rationale: format!(
-                        "Auto-promoted from {} signal(s)",
-                        signals.len()
-                    ),
-                    confidence: conf,
-                    valid_from_ts_utc_ms: now_ms,
-                    valid_to_ts_utc_ms: None,
-                    evidence: vec![EvidenceRef {
-                        episode_id,
-                        span_summary: summary
-                            .summary_text
-                            .chars()
-                            .take(200)
-                            .collect(),
-                    }],
-                };
-
-                if let Err(e) = crud::put_decision(db, &decision) {
-                    return FinalizeResult::Failed(format!(
-                        "steps 4-5 (persist decision): {e}"
-                    ));
-                }
-                created_decisions.push(decision);
-            }
-        }
-    }
 
     // ── Step 5b: Create/update Task record if task_title present
     if let Some(title) = &task_title {
@@ -265,11 +213,9 @@ pub async fn finalize_episode_at(
 
     // ── Steps 6-8: Extract, validate, persist ────────────
     let extractor = RigExtractor;
-    let decisions_for_extraction =
-        serde_json::to_vec(&signals).unwrap_or_default();
     let extraction_input = ExtractionInput {
         summary_text: summary.summary_text.clone(),
-        decisions_json: decisions_for_extraction,
+        decisions_json: b"[]".to_vec(),
         tool_outcomes_json: b"[]".to_vec(),
         conversation_spans_json: b"[]".to_vec(),
         repo_path: repo_path.to_string(),
@@ -319,6 +265,42 @@ pub async fn finalize_episode_at(
         return FinalizeResult::Failed(format!(
             "step 8 (persist extraction): {e}"
         ));
+    }
+
+    // ── Step 8b: Create decisions from extraction output ──
+    for ext_dec in &extraction_output.decisions {
+        let conf = match ext_dec.confidence.as_str() {
+            "high" => Confidence::High,
+            "medium" => Confidence::Medium,
+            _ => Confidence::Low,
+        };
+        // Only persist medium+ confidence decisions
+        if conf == Confidence::Low {
+            continue;
+        }
+        let decision = Decision {
+            decision_id: DecisionId::derive(
+                format!("{episode_id}:{}", ext_dec.statement).as_bytes(),
+            ),
+            repo_id,
+            episode_id,
+            task_id: None,
+            statement: ext_dec.statement.clone(),
+            rationale: ext_dec.rationale.clone(),
+            confidence: conf,
+            valid_from_ts_utc_ms: now_ms,
+            valid_to_ts_utc_ms: None,
+            evidence: vec![EvidenceRef {
+                episode_id,
+                span_summary: summary.summary_text.chars().take(200).collect(),
+            }],
+        };
+        if let Err(e) = crud::put_decision(db, &decision) {
+            return FinalizeResult::Failed(format!(
+                "step 8b (persist decision): {e}"
+            ));
+        }
+        created_decisions.push(decision);
     }
 
     // ── Step 9: Project to Grafeo ────────────────────────
@@ -538,36 +520,16 @@ mod tests {
         }
     }
 
-    /// When the summary text contains decision language,
-    /// auto-promotion must create and persist a Decision record.
+    /// Verify that Decision records round-trip through CRUD.
+    /// (Decision detection is now handled by the LLM extractor,
+    /// not heuristic text matching.)
     #[tokio::test]
-    async fn test_decision_detection_actually_persists() {
-        if !has_api_key() {
-            eprintln!("skipping: no API key");
-            return;
-        }
+    async fn test_decision_persistence_via_crud() {
         let database = db::open_in_memory().unwrap();
 
-        // We'll test the decision persistence directly by calling
-        // the detect+promote logic with known text
-        let summary_text = "I chose redb for storage because it is ACID.";
-        let signals = decisions::detect_signals(summary_text);
-        assert!(!signals.is_empty(), "should detect 'I chose' signal");
-
-        let confidence = decisions::aggregate_confidence(&signals);
-        assert_eq!(confidence, Some(Confidence::High));
-
-        // Now verify the full pipeline: if we could control the
-        // summary text, decisions would be created. Let's just
-        // confirm the detection → persistence path works.
         let episode_id = EpisodeId::derive(b"test-ep");
         let repo_id = RepoId::derive(b"repo");
-
-        let statement: String = signals
-            .iter()
-            .map(|s| s.matched_text.as_str())
-            .collect::<Vec<_>>()
-            .join("; ");
+        let statement = "Use redb for storage because it is ACID.".to_string();
 
         let decision = Decision {
             decision_id: DecisionId::derive(
@@ -576,17 +538,15 @@ mod tests {
             repo_id,
             episode_id,
             task_id: None,
-            statement,
-            rationale: format!(
-                "Auto-promoted from {} signal(s)",
-                signals.len()
-            ),
+            statement: statement.clone(),
+            rationale: "Extracted by LLM".to_string(),
             confidence: Confidence::High,
             valid_from_ts_utc_ms: 1_700_000_000_000,
             valid_to_ts_utc_ms: None,
             evidence: vec![EvidenceRef {
                 episode_id,
-                span_summary: summary_text.chars().take(200).collect(),
+                span_summary: "I chose redb for storage because it is ACID."
+                    .to_string(),
             }],
         };
 
@@ -595,7 +555,7 @@ mod tests {
         // Read it back
         let loaded =
             crud::get_decision(&database, &decision.decision_id.raw()).unwrap();
-        assert_eq!(loaded.statement, decision.statement);
+        assert_eq!(loaded.statement, statement);
         assert_eq!(loaded.confidence, Confidence::High);
         assert_eq!(loaded.evidence.len(), 1);
     }

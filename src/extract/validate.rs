@@ -117,6 +117,7 @@ mod tests {
                 from: "task:build-memory".into(),
                 to: "decision:9d2".into(),
             }],
+            decisions: vec![],
         }
     }
 
@@ -168,6 +169,7 @@ mod tests {
             decision_refs: vec![],
             entities: vec![],
             relations: vec![],
+            decisions: vec![],
         };
         let errs = validate(&output).unwrap_err();
         assert!(
