@@ -159,7 +159,6 @@ fn result_to_item(result: &RetrievalResult, db: &Database) -> RecallItem {
 
     match result.artifact_type.as_str() {
         "decision" => {
-            // Load actual decision from redb
             if let Ok(dec) = crud::get_decision(db, &result.episode_id) {
                 RecallItem::Decision(expand_decision(
                     &dec.statement,
@@ -180,7 +179,6 @@ fn result_to_item(result: &RetrievalResult, db: &Database) -> RecallItem {
             }
         }
         "summary" => {
-            // Load actual summary from redb
             if let Ok(summary) =
                 crud::get_summary_artifact(db, &result.episode_id)
             {
