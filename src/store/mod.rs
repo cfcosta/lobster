@@ -6,6 +6,7 @@ pub mod crud;
 pub mod db;
 pub mod ids;
 pub mod schema;
+pub mod staging;
 pub mod states;
 pub mod tables;
 pub mod visibility;
