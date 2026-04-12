@@ -113,7 +113,7 @@ fn init_tables(db: &Database) -> Result<(), redb::Error> {
 
 #[cfg(test)]
 mod tests {
-    use redb::ReadableDatabase;
+    use redb::{ReadableDatabase, ReadableTable};
 
     use super::*;
 
@@ -192,5 +192,105 @@ mod tests {
             result.is_none(),
             "try_open should return None when DB is locked"
         );
+    }
+
+    // ── open_snapshot ───────────────────────────────────────────
+
+    #[test]
+    fn test_open_snapshot_nonexistent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nope.redb");
+        assert!(open_snapshot(&path).is_none());
+    }
+
+    #[test]
+    fn test_open_snapshot_reads_data() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("test.redb");
+
+        // Write data, then close
+        {
+            let db = open(&path).expect("create");
+            let write_txn = db.begin_write().expect("write");
+            {
+                let mut table =
+                    write_txn.open_table(tables::METADATA).expect("open");
+                table
+                    .insert("test_key", b"test_val".as_slice())
+                    .expect("insert");
+            }
+            write_txn.commit().expect("commit");
+        }
+
+        // Snapshot should read the same data
+        let snap = open_snapshot(&path).expect("snapshot");
+        let read_txn = snap.begin_read().expect("read");
+        let table = read_txn.open_table(tables::METADATA).expect("open");
+        let val = table.get("test_key").expect("get");
+        assert!(val.is_some());
+        assert_eq!(val.unwrap().value(), b"test_val");
+    }
+
+    use hegel::{TestCase, generators as gs};
+
+    /// `open_snapshot` on a populated DB produces a snapshot with
+    /// the same number of raw events.
+    #[hegel::test(test_cases = 20)]
+    fn prop_open_snapshot_preserves_event_count(tc: TestCase) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.redb");
+
+        let n: usize =
+            tc.draw(gs::integers::<usize>().min_value(1).max_value(15));
+        {
+            let db = open(&path).unwrap();
+            for seq in 0..n {
+                let event = crate::store::schema::RawEvent {
+                    seq: seq as u64,
+                    repo_id: crate::store::ids::RepoId::derive(b"repo"),
+                    ts_utc_ms: 1_700_000_000_000,
+                    event_kind:
+                        crate::store::schema::EventKind::UserPromptSubmit,
+                    payload_hash: [0; 32],
+                    payload_bytes: vec![],
+                };
+                crate::store::crud::append_raw_event(&db, &event).unwrap();
+            }
+        }
+
+        let snap = open_snapshot(&path).expect("snapshot");
+        let read_txn = snap.begin_read().unwrap();
+        let table = read_txn.open_table(tables::RAW_EVENTS).unwrap();
+        let count = table.iter().unwrap().count();
+        assert_eq!(count, n);
+    }
+
+    /// `open_snapshot` works even when the original DB is locked.
+    #[hegel::test(test_cases = 10)]
+    fn prop_open_snapshot_while_locked(tc: TestCase) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.redb");
+
+        let n: usize =
+            tc.draw(gs::integers::<usize>().min_value(1).max_value(10));
+        let db = open(&path).unwrap();
+        for seq in 0..n {
+            let event = crate::store::schema::RawEvent {
+                seq: seq as u64,
+                repo_id: crate::store::ids::RepoId::derive(b"repo"),
+                ts_utc_ms: 1_700_000_000_000,
+                event_kind: crate::store::schema::EventKind::UserPromptSubmit,
+                payload_hash: [0; 32],
+                payload_bytes: vec![],
+            };
+            crate::store::crud::append_raw_event(&db, &event).unwrap();
+        }
+
+        // DB is still open (locked) — snapshot should still work
+        let snap = open_snapshot(&path).expect("snapshot while locked");
+        let read_txn = snap.begin_read().unwrap();
+        let table = read_txn.open_table(tables::RAW_EVENTS).unwrap();
+        let count = table.iter().unwrap().count();
+        assert_eq!(count, n);
     }
 }
