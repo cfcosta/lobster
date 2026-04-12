@@ -278,20 +278,89 @@ fn cmd_reset(storage_dir: &std::path::Path, force: bool) -> Result<()> {
 fn cmd_init(storage_dir: &std::path::Path) -> Result<()> {
     std::fs::create_dir_all(storage_dir).context("create storage dir")?;
 
+    // 1. Initialize the database
     let db_path = lobster::app::config::db_path(storage_dir);
     let _db =
         lobster::store::db::open(&db_path).context("initialize database")?;
-
-    println!("Lobster initialized at {}", storage_dir.display());
     println!("Database: {}", db_path.display());
-    println!();
 
-    // Generate Claude Code hook configuration
-    let hook_json = lobster::app::hooks_config::to_json("lobster")
-        .context("generate hook config")?;
-    println!("Add this to .claude/settings.json hooks:");
-    println!("{hook_json}");
+    // 2. Resolve the binary path (current exe)
+    let bin_path = std::env::current_exe()
+        .context("resolve binary path")?
+        .to_string_lossy()
+        .to_string();
 
+    // 3. Write .claude/settings.json with hook configuration
+    let repo_root = storage_dir
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let claude_dir = repo_root.join(".claude");
+    std::fs::create_dir_all(&claude_dir).context("create .claude dir")?;
+
+    let settings_path = claude_dir.join("settings.json");
+    let settings = serde_json::json!({
+        "hooks": {
+            "UserPromptSubmit": [{
+                "hooks": [{
+                    "type": "command",
+                    "command": format!("{bin_path} hook UserPromptSubmit"),
+                    "timeout": 10
+                }]
+            }],
+            "PostToolUse": [{
+                "hooks": [{
+                    "type": "command",
+                    "command": format!("{bin_path} hook PostToolUse"),
+                    "timeout": 10
+                }]
+            }]
+        }
+    });
+    std::fs::write(
+        &settings_path,
+        serde_json::to_string_pretty(&settings)
+            .context("serialize settings")?,
+    )
+    .context("write .claude/settings.json")?;
+    println!("Hooks: {}", settings_path.display());
+
+    // 4. Write .mcp.json with MCP server configuration
+    let mcp_path = repo_root.join(".mcp.json");
+    let mcp = serde_json::json!({
+        "mcpServers": {
+            "lobster": {
+                "command": bin_path,
+                "args": ["mcp"]
+            }
+        }
+    });
+    std::fs::write(
+        &mcp_path,
+        serde_json::to_string_pretty(&mcp).context("serialize mcp config")?,
+    )
+    .context("write .mcp.json")?;
+    println!("MCP:   {}", mcp_path.display());
+
+    // 5. Add .lobster/ to .gitignore if not already there
+    let gitignore_path = repo_root.join(".gitignore");
+    let needs_entry = if gitignore_path.exists() {
+        let contents = std::fs::read_to_string(&gitignore_path)
+            .context("read .gitignore")?;
+        !contents.lines().any(|l| l.trim() == ".lobster/")
+    } else {
+        true
+    };
+    if needs_entry {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&gitignore_path)
+            .context("open .gitignore")?;
+        writeln!(f, ".lobster/").context("append to .gitignore")?;
+    }
+
+    println!("\nLobster initialized. Restart Claude Code to activate.");
     Ok(())
 }
 
