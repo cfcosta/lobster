@@ -2,6 +2,7 @@
 
 pub mod classifier;
 pub mod evidence;
+pub mod recency;
 pub mod rerank;
 pub mod retrieval;
 pub mod route;

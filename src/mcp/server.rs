@@ -122,6 +122,19 @@ fn handle_request(
             let result = tools::memory_neighbors(grafeo, node_id);
             serde_json::to_value(result).ok()
         }
+        "memory_status" => {
+            let report = crate::app::status::scan(db);
+            serde_json::to_value(serde_json::json!({
+                "episodes_total": report.total_episodes(),
+                "ready": report.ready,
+                "pending": report.pending,
+                "retry_queued": report.retry_queued,
+                "failed_final": report.failed_final,
+                "summary_artifacts": report.summary_artifacts,
+                "extraction_artifacts": report.extraction_artifacts,
+            }))
+            .ok()
+        }
         _ => None,
     };
 

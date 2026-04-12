@@ -212,6 +212,26 @@ async fn cmd_mcp(storage_dir: &std::path::Path) -> Result<()> {
     }
     lobster::graph::indexes::ensure_indexes(&grafeo);
 
+    // Spawn dreaming scheduler in a background task.
+    // Per spec: "dreaming belongs to the long-lived process"
+    let dream_db = db.clone();
+    let _dreaming = tokio::spawn(async move {
+        let config = lobster::dream::scheduler::DreamConfig::default();
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            let result =
+                lobster::dream::scheduler::run_cycle(&dream_db, &config);
+            if result.retries_attempted > 0 {
+                tracing::info!(
+                    retries = result.retries_attempted,
+                    succeeded = result.retries_succeeded,
+                    failed = result.episodes_failed_final,
+                    "dreaming cycle completed"
+                );
+            }
+        }
+    });
+
     tracing::info!("MCP server starting on stdio");
     eprintln!("lobster: MCP server ready (JSON-RPC on stdio)");
 

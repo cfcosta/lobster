@@ -72,12 +72,41 @@ pub async fn finalize_episode(
     episode_seq_end: u64,
     task_title: Option<String>,
 ) -> FinalizeResult {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    finalize_episode_at(
+        db,
+        grafeo,
+        repo_path,
+        events_json,
+        episode_seq_start,
+        episode_seq_end,
+        task_title,
+        now_ms,
+    )
+    .await
+}
+
+/// Deterministic finalization with explicit timestamp.
+///
+/// Same as `finalize_episode` but accepts a fixed timestamp for
+/// test determinism. Per spec: "same inputs produce the same
+/// durable state."
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+pub async fn finalize_episode_at(
+    db: &Database,
+    grafeo: &GrafeoDB,
+    repo_path: &str,
+    events_json: &[u8],
+    episode_seq_start: u64,
+    episode_seq_end: u64,
+    task_title: Option<String>,
+    now_ms: i64,
+) -> FinalizeResult {
     let repo_id = RepoId::derive(repo_path.as_bytes());
     let episode_id = EpisodeId::derive(
         &format!("{repo_path}:{episode_seq_start}:{episode_seq_end}")
             .into_bytes(),
     );
-    let now_ms = chrono::Utc::now().timestamp_millis();
 
     // ── Step 1: Persist episode shell as Pending ─────────
     let episode = Episode {
@@ -175,6 +204,24 @@ pub async fn finalize_episode(
                 }
                 created_decisions.push(decision);
             }
+        }
+    }
+
+    // ── Step 5b: Create/update Task record if task_title present
+    if let Some(title) = &task_title {
+        if !title.is_empty() {
+            let task_id = crate::store::ids::TaskId::derive(
+                format!("{repo_path}:{title}").as_bytes(),
+            );
+            let task = crate::store::schema::Task {
+                task_id,
+                repo_id,
+                title: title.clone(),
+                status: crate::store::schema::TaskStatus::Open,
+                opened_in: episode_id,
+                last_seen_in: episode_id,
+            };
+            let _ = crud::put_task(db, &task);
         }
     }
 

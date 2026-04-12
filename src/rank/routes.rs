@@ -108,9 +108,18 @@ pub fn execute_query(
             }
         })
         .filter(|c| {
+            // Compute real recency from episode timestamp
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let artifact_ts = crate::store::crud::get_episode(db, &c.id)
+                .map_or(now_ms, |ep| ep.finalized_ts_utc_ms);
+            let recency = crate::rank::recency::recency_score_default(
+                artifact_ts,
+                now_ms,
+            );
+
             let input = ScoringInput {
                 semantic: c.score,
-                recency: 0.5,
+                recency,
                 task_overlap: 0.0,
                 graph_support: 0.0,
                 is_decision: c.artifact_type == "decision",
