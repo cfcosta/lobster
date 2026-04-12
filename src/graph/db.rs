@@ -42,7 +42,7 @@ pub fn new_in_memory() -> GrafeoDB {
     GrafeoDB::new_in_memory()
 }
 
-/// Create a graph node for an episode.
+/// Create a graph node for an episode with optional summary text.
 pub fn create_episode_node(
     db: &GrafeoDB,
     episode_id: &str,
@@ -64,6 +64,19 @@ pub fn create_episode_node(
         grafeo::Value::from(finalized_ts_ms),
     );
     node
+}
+
+/// Set summary text on an episode node for text search.
+pub fn set_episode_summary(
+    db: &GrafeoDB,
+    node: grafeo::NodeId,
+    summary_text: &str,
+) {
+    db.set_node_property(
+        node,
+        "summary_text",
+        grafeo::Value::from(summary_text),
+    );
 }
 
 /// Create a graph node for a decision.

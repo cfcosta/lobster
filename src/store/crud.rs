@@ -64,7 +64,13 @@ fn put_by_id<V: Serialize>(
     value: &V,
 ) -> Result<(), StoreError> {
     let bytes = serde_json::to_vec(value)?;
-    let write_txn = db.begin_write().map_err(StoreError::redb)?;
+    let mut write_txn = db.begin_write().map_err(StoreError::redb)?;
+    // Spec: Durability::Immediate for episodes, accepted
+    // artifacts, and visibility-state flips. These must survive
+    // crashes.
+    write_txn
+        .set_durability(redb::Durability::Immediate)
+        .map_err(StoreError::redb)?;
     {
         let mut table =
             write_txn.open_table(table_def).map_err(StoreError::redb)?;

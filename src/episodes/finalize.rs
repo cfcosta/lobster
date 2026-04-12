@@ -232,12 +232,17 @@ pub async fn finalize_episode(
 
     // ── Step 9: Project to Grafeo ────────────────────────
     let ep_node = projection::project_episode(grafeo, &episode);
+    // Set summary text on episode node for text search
+    crate::graph::db::set_episode_summary(
+        grafeo,
+        ep_node,
+        &summary.summary_text,
+    );
 
-    // Project decisions
+    // Project decisions and persist entities to redb (Fix #4)
     for dec in &created_decisions {
         let dec_node = projection::project_decision(grafeo, dec, ep_node);
 
-        // Link decision to any extracted entities
         for entity_fact in &extraction_output.entities {
             let ent = crate::store::schema::Entity {
                 entity_id: crate::store::ids::EntityId::derive(
@@ -247,6 +252,8 @@ pub async fn finalize_episode(
                 kind: parse_entity_kind(&entity_fact.kind),
                 canonical_name: entity_fact.name.clone(),
             };
+            // Persist entity to redb (canonical truth)
+            let _ = crud::put_entity(db, &ent);
             let ent_node = projection::project_entity(grafeo, &ent, ep_node);
             projection::link_decision_entity(
                 grafeo, dec_node, ent_node, now_ms,
@@ -254,7 +261,6 @@ pub async fn finalize_episode(
         }
     }
 
-    // Project remaining entities not already linked
     if created_decisions.is_empty() {
         for entity_fact in &extraction_output.entities {
             let ent = crate::store::schema::Entity {
@@ -265,9 +271,22 @@ pub async fn finalize_episode(
                 kind: parse_entity_kind(&entity_fact.kind),
                 canonical_name: entity_fact.name.clone(),
             };
+            // Persist entity to redb (canonical truth)
+            let _ = crud::put_entity(db, &ent);
             projection::project_entity(grafeo, &ent, ep_node);
         }
     }
+
+    // Record projection metadata (Fix #2: required by visibility
+    // protocol before flipping to Ready)
+    let projection_meta = serde_json::json!({
+        "projected_at_ms": now_ms,
+        "episode_id": episode_id.to_string(),
+        "node_count": grafeo.node_count(),
+        "edge_count": grafeo.edge_count(),
+    });
+    let _ =
+        crud::put_projection_metadata(db, &episode_id.raw(), &projection_meta);
 
     // ── Step 10: Mark Ready ──────────────────────────────
     let mut ready_ep = episode;

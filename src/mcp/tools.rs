@@ -17,10 +17,19 @@ pub struct ContextBundle {
     pub total_candidates: usize,
 }
 
-/// A single item in the context bundle.
+/// A single item in the context bundle, with all fields
+/// required by the MCP tool contract.
 #[derive(Debug, Clone, Serialize)]
 pub struct ContextItem {
     pub artifact_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<String>,
     pub score: f64,
     pub content: String,
 }
@@ -43,6 +52,10 @@ pub fn memory_context(
         .into_iter()
         .map(|r| ContextItem {
             artifact_type: r.artifact_type,
+            repo_id: None,
+            task_id: None,
+            confidence: None,
+            provenance: None,
             score: r.score,
             content: format!("Retrieved via {:?} route", r.route),
         })
@@ -117,6 +130,163 @@ pub fn memory_recent(db: &Database, _repo_id: Option<&str>) -> RecentResult {
     RecentResult { episodes }
 }
 
+// ── memory_search ────────────────────────────────────────
+
+/// Result of `memory_search`.
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchResult {
+    pub hits: Vec<ContextItem>,
+    pub query: String,
+}
+
+/// Return mixed ranked hits across decisions, summaries, tasks,
+/// and entities.
+#[must_use]
+pub fn memory_search(
+    query: &str,
+    db: &Database,
+    grafeo: &GrafeoDB,
+) -> SearchResult {
+    let results = execute_query(query, db, grafeo, true);
+    let hits: Vec<ContextItem> = results
+        .into_iter()
+        .map(|r| ContextItem {
+            artifact_type: r.artifact_type,
+            repo_id: None,
+            task_id: None,
+            confidence: None,
+            provenance: Some(r.episode_id.to_string()),
+            score: r.score,
+            content: format!("Score: {:.2}", r.score),
+        })
+        .collect();
+    SearchResult {
+        hits,
+        query: query.to_string(),
+    }
+}
+
+// ── memory_decisions ─────────────────────────────────────
+
+/// A decision in the timeline.
+#[derive(Debug, Clone, Serialize)]
+pub struct DecisionTimelineEntry {
+    pub decision_id: String,
+    pub statement: String,
+    pub rationale: String,
+    pub confidence: String,
+    pub valid_from_ms: i64,
+    pub episode_id: String,
+}
+
+/// Result of `memory_decisions`.
+#[derive(Debug, Clone, Serialize)]
+pub struct DecisionsResult {
+    pub decisions: Vec<DecisionTimelineEntry>,
+}
+
+/// Return decision timeline for a repo.
+#[must_use]
+pub fn memory_decisions(db: &Database) -> DecisionsResult {
+    use redb::{ReadableDatabase, ReadableTable};
+
+    use crate::store::tables;
+
+    let mut decisions = Vec::new();
+
+    if let Ok(read_txn) = db.begin_read() {
+        if let Ok(table) = read_txn.open_table(tables::DECISIONS) {
+            if let Ok(iter) = table.iter() {
+                for entry in iter.flatten() {
+                    let (_, value) = entry;
+                    if let Ok(dec) = serde_json::from_slice::<
+                        crate::store::schema::Decision,
+                    >(value.value())
+                    {
+                        decisions.push(DecisionTimelineEntry {
+                            decision_id: dec.decision_id.to_string(),
+                            statement: dec.statement,
+                            rationale: dec.rationale,
+                            confidence: format!("{:?}", dec.confidence),
+                            valid_from_ms: dec.valid_from_ts_utc_ms,
+                            episode_id: dec.episode_id.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Sort by valid_from (newest first)
+    decisions.sort_by_key(|d| std::cmp::Reverse(d.valid_from_ms));
+
+    DecisionsResult { decisions }
+}
+
+// ── memory_neighbors ─────────────────────────────────────
+
+/// A graph neighbor.
+#[derive(Debug, Clone, Serialize)]
+pub struct NeighborEntry {
+    pub node_id: String,
+    pub label: String,
+    pub edge_type: String,
+}
+
+/// Result of `memory_neighbors`.
+#[derive(Debug, Clone, Serialize)]
+pub struct NeighborsResult {
+    pub neighbors: Vec<NeighborEntry>,
+    pub query_node: String,
+}
+
+/// Return evidence-backed graph neighbors of a node.
+#[must_use]
+pub fn memory_neighbors(
+    grafeo: &GrafeoDB,
+    node_id_str: &str,
+) -> NeighborsResult {
+    let mut neighbors = Vec::new();
+
+    // Query outgoing edges from the node
+    let session = grafeo.session();
+    let query = format!(
+        "MATCH (n)-[r]->(m) WHERE n.episode_id = '{node_id_str}' \
+         OR n.decision_id = '{node_id_str}' \
+         OR n.entity_id = '{node_id_str}' \
+         RETURN m.episode_id, m.decision_id, m.entity_id, \
+                m.canonical_name, TYPE(r)"
+    );
+
+    if let Ok(result) = session.execute(&query) {
+        for row in result.iter() {
+            let node_label = row[0]
+                .as_str()
+                .or_else(|| row[1].as_str())
+                .or_else(|| row[2].as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let name = row[3].as_str().unwrap_or("").to_string();
+            let edge = row[4].as_str().unwrap_or("RELATED").to_string();
+
+            neighbors.push(NeighborEntry {
+                node_id: if name.is_empty() {
+                    node_label.clone()
+                } else {
+                    name
+                },
+                label: node_label,
+                edge_type: edge,
+            });
+        }
+    }
+
+    NeighborsResult {
+        neighbors,
+        query_node: node_id_str.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,6 +312,10 @@ mod tests {
         let bundle = ContextBundle {
             items: vec![ContextItem {
                 artifact_type: "decision".into(),
+                repo_id: None,
+                task_id: None,
+                confidence: Some("High".into()),
+                provenance: None,
                 score: 0.85,
                 content: "Use redb".into(),
             }],

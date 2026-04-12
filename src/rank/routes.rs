@@ -152,6 +152,34 @@ fn search_grafeo(
         }
     }
 
+    // Search episode summaries
+    if let Ok(result) = session
+        .execute("MATCH (ep:Episode) RETURN ep.episode_id, ep.summary_text")
+    {
+        for row in result.iter() {
+            if let (Some(id), Some(text)) = (row[0].as_str(), row[1].as_str()) {
+                let text_lower = text.to_lowercase();
+                let overlap = query_lower
+                    .split_whitespace()
+                    .filter(|w| text_lower.contains(w))
+                    .count();
+                if overlap > 0 {
+                    #[allow(clippy::cast_precision_loss)]
+                    let score = overlap as f64
+                        / query_lower.split_whitespace().count().max(1) as f64
+                        * 0.8; // slightly lower than decisions
+                    if let Ok(raw_id) = id.parse() {
+                        candidates.push(ScoredCandidate {
+                            id: raw_id,
+                            score,
+                            artifact_type: "summary".into(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     // Search entity nodes
     if let Ok(result) =
         session.execute("MATCH (e:Entity) RETURN e.entity_id, e.canonical_name")

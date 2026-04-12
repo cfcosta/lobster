@@ -100,6 +100,28 @@ fn handle_request(
             let result = tools::memory_recent(db, None);
             serde_json::to_value(result).ok()
         }
+        "memory_search" => {
+            let query = req
+                .params
+                .get("query")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let result = tools::memory_search(query, db, grafeo);
+            serde_json::to_value(result).ok()
+        }
+        "memory_decisions" => {
+            let result = tools::memory_decisions(db);
+            serde_json::to_value(result).ok()
+        }
+        "memory_neighbors" => {
+            let node_id = req
+                .params
+                .get("node_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let result = tools::memory_neighbors(grafeo, node_id);
+            serde_json::to_value(result).ok()
+        }
         _ => None,
     };
 

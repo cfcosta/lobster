@@ -94,21 +94,22 @@ pub enum PoolingPolicy {
 }
 
 /// Determine the pooling policy for an artifact class.
+/// Determine the pooling policy for an artifact class.
+///
+/// Per spec table:
+/// - Decisions: full (no pooling)
+/// - Active task summaries: light (`pool_factor=2`)
+/// - Durable constraints: full (no pooling)
+/// - Episode summaries (recent): light (`pool_factor=2`)
+/// - Episode summaries (old): proxy only
 #[must_use]
-pub const fn policy_for(artifact_class: &str) -> PoolingPolicy {
-    // const fn can't do string matching, so use byte comparison
-    if artifact_class.is_empty() {
-        return PoolingPolicy::ProxyOnly;
-    }
-    let bytes = artifact_class.as_bytes();
-    if bytes[0] == b'd' {
-        // "decision" or "durable_constraint"
-        PoolingPolicy::Full
-    } else if bytes[0] == b't' {
-        // "task"
-        PoolingPolicy::Light
-    } else {
-        PoolingPolicy::ProxyOnly
+#[allow(clippy::match_same_arms)]
+pub fn policy_for(artifact_class: &str) -> PoolingPolicy {
+    match artifact_class {
+        "decision" | "durable_constraint" | "constraint" => PoolingPolicy::Full,
+        "task" | "summary_recent" | "summary" => PoolingPolicy::Light,
+        "summary_old" | "component" => PoolingPolicy::ProxyOnly,
+        _ => PoolingPolicy::ProxyOnly,
     }
 }
 
@@ -224,7 +225,10 @@ mod tests {
     fn test_pooling_policy() {
         assert_eq!(policy_for("decision"), PoolingPolicy::Full);
         assert_eq!(policy_for("durable_constraint"), PoolingPolicy::Full);
+        assert_eq!(policy_for("constraint"), PoolingPolicy::Full);
         assert_eq!(policy_for("task"), PoolingPolicy::Light);
-        assert_eq!(policy_for("summary"), PoolingPolicy::ProxyOnly);
+        assert_eq!(policy_for("summary"), PoolingPolicy::Light);
+        assert_eq!(policy_for("summary_recent"), PoolingPolicy::Light);
+        assert_eq!(policy_for("summary_old"), PoolingPolicy::ProxyOnly);
     }
 }

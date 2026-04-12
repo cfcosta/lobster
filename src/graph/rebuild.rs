@@ -57,10 +57,29 @@ pub fn rebuild_from_redb(
         let ep_node = projection::project_episode(grafeo, &episode);
         stats.episodes_projected += 1;
 
-        // Try to load and project decisions for this episode
-        // (decisions are keyed by their own ID, not episode ID,
-        // so we'd need a secondary index. For now, the rebuild
-        // projects what we can from the episode record itself.)
+        // Project decisions for this episode by scanning the
+        // decisions table for matching episode_id
+        if let Ok(dec_txn) = db.begin_read() {
+            if let Ok(dec_table) = dec_txn.open_table(tables::DECISIONS) {
+                if let Ok(dec_iter) = dec_table.iter() {
+                    for dec_entry in dec_iter.flatten() {
+                        let (_, dec_val) = dec_entry;
+                        if let Ok(dec) =
+                            serde_json::from_slice::<
+                                crate::store::schema::Decision,
+                            >(dec_val.value())
+                        {
+                            if dec.episode_id == episode.episode_id {
+                                projection::project_decision(
+                                    grafeo, &dec, ep_node,
+                                );
+                                stats.decisions_projected += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // Try to load extraction artifact for this episode
         if let Ok(extraction) =
@@ -95,6 +114,7 @@ pub struct RebuildStats {
     pub episodes_scanned: usize,
     pub episodes_projected: usize,
     pub episodes_skipped: usize,
+    pub decisions_projected: usize,
     pub entities_projected: usize,
 }
 
