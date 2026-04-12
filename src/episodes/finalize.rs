@@ -11,11 +11,11 @@ use sha2::{Digest, Sha256};
 use crate::{
     episodes::{
         decisions,
-        heuristic_summarizer::HeuristicSummarizer,
+        rig_summarizer::RigSummarizer,
         summarizer::{Summarizer, SummaryInput},
     },
     extract::{
-        heuristic::HeuristicExtractor,
+        rig_extractor::RigExtractor,
         traits::{ExtractionInput, Extractor},
         validate,
     },
@@ -128,7 +128,7 @@ pub async fn finalize_episode_at(
     }
 
     // ── Steps 2-3: Summarize and persist ─────────────────
-    let summarizer = HeuristicSummarizer::default();
+    let summarizer = RigSummarizer::default();
     let summary_input = SummaryInput {
         episode_events_json: events_json.to_vec(),
         repo_path: repo_path.to_string(),
@@ -232,29 +232,39 @@ pub async fn finalize_episode_at(
     );
     let policy = crate::embeddings::proxy::policy_for("summary");
 
-    let embedding_artifact = if let Ok(mut model) =
-        crate::embeddings::encoder::load_model()
-    {
-        match crate::embeddings::encoder::encode_text(
-            &mut model,
-            &summary.summary_text,
-            artifact_id,
-            policy,
-        ) {
-            Ok(art) => art,
-            Err(_) => fallback_embedding(&summary.summary_text, artifact_id),
-        }
-    } else {
-        fallback_embedding(&summary.summary_text, artifact_id)
-    };
-    let _ = crud::put_embedding_artifact(db, &embedding_artifact);
-
-    let proxy_vector = crate::embeddings::proxy::bytes_to_vector(
-        &embedding_artifact.pooled_vector_bytes,
-    );
+    // Embedding requires the ColBERT model. If not installed,
+    // skip embedding (episode still proceeds — retrieval will
+    // use BM25 text search instead of vector similarity).
+    let proxy_vector =
+        if let Ok(mut model) = crate::embeddings::encoder::load_model() {
+            match crate::embeddings::encoder::encode_text(
+                &mut model,
+                &summary.summary_text,
+                artifact_id,
+                policy,
+            ) {
+                Ok(art) => {
+                    let pv = crate::embeddings::proxy::bytes_to_vector(
+                        &art.pooled_vector_bytes,
+                    );
+                    let _ = crud::put_embedding_artifact(db, &art);
+                    pv
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "ColBERT encoding failed, skipping embedding"
+                    );
+                    vec![]
+                }
+            }
+        } else {
+            tracing::debug!("ColBERT model not installed, skipping embedding");
+            vec![]
+        };
 
     // ── Steps 6-8: Extract, validate, persist ────────────
-    let extractor = HeuristicExtractor;
+    let extractor = RigExtractor;
     let decisions_for_extraction =
         serde_json::to_vec(&signals).unwrap_or_default();
     let extraction_input = ExtractionInput {
@@ -383,36 +393,6 @@ pub async fn finalize_episode_at(
     FinalizeResult::Ready {
         episode_id,
         decisions_created: created_decisions.len(),
-    }
-}
-
-/// Fallback embedding when `ColBERT` model is not available.
-/// Uses byte-level proxy vector from text content.
-fn fallback_embedding(
-    text: &str,
-    artifact_id: crate::store::ids::ArtifactId,
-) -> crate::store::schema::EmbeddingArtifact {
-    let text_bytes: Vec<f32> =
-        text.bytes().map(|b| f32::from(b) / 255.0).collect();
-    let dims = 16;
-    let padded_len = text_bytes.len().div_ceil(dims) * dims;
-    let mut padded = text_bytes;
-    padded.resize(padded_len, 0.0);
-    let proxy = crate::embeddings::proxy::mean_pool(&padded, dims);
-    let pooled_bytes = crate::embeddings::proxy::vector_to_bytes(&proxy);
-
-    let mut hasher = Sha256::new();
-    hasher.update(&pooled_bytes);
-    let checksum: [u8; 32] = hasher.finalize().into();
-
-    crate::store::schema::EmbeddingArtifact {
-        artifact_id,
-        revision: crate::embeddings::proxy::PROXY_REDUCTION_VERSION.to_string(),
-        backend: crate::store::schema::EmbeddingBackend::Cpu,
-        quantization: None,
-        pooled_vector_bytes: pooled_bytes,
-        late_interaction_bytes: None,
-        payload_checksum: checksum,
     }
 }
 

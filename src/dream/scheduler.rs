@@ -79,7 +79,7 @@ pub fn run_cycle(db: &Database, config: &DreamConfig) -> DreamCycleResult {
                         .map(|s| s.summary_text)
                         .unwrap_or_default();
 
-                let extractor = crate::extract::heuristic::HeuristicExtractor;
+                let extractor = crate::extract::rig_extractor::RigExtractor;
                 let input = crate::extract::traits::ExtractionInput {
                     summary_text,
                     decisions_json: b"[]".to_vec(),
