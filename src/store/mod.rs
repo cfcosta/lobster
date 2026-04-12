@@ -5,6 +5,7 @@ pub mod coordinator;
 pub mod crud;
 pub mod db;
 pub mod ids;
+pub mod ingest;
 pub mod schema;
 pub mod staging;
 pub mod states;

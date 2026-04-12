@@ -229,12 +229,83 @@ async fn cmd_mcp(storage_dir: &std::path::Path) -> Result<()> {
     // write_handle is available for tools that need to write
     let _ = write_handle;
 
-    // Rebuild Grafeo from redb for the MCP session
-    let grafeo = lobster::graph::db::new_in_memory();
+    // Rebuild Grafeo from redb for the MCP session.
+    // Wrap in Arc for sharing with background tasks (GrafeoDB uses
+    // interior mutability and is Send+Sync).
+    let grafeo = std::sync::Arc::new(lobster::graph::db::new_in_memory());
     if let Err(e) = lobster::graph::rebuild::rebuild_from_redb(&db, &grafeo) {
         tracing::warn!(error = %e, "failed to rebuild Grafeo");
     }
     lobster::graph::indexes::ensure_indexes(&grafeo);
+
+    // Ingest any events that were staged while MCP was not running
+    let initial =
+        lobster::store::ingest::ingest_staged(storage_dir, &db, &grafeo).await;
+    if initial.events_ingested > 0 {
+        tracing::info!(
+            events = initial.events_ingested,
+            "ingested pre-existing staged events"
+        );
+        // Rebuild Grafeo after initial ingestion
+        if let Err(e) = lobster::graph::rebuild::rebuild_from_redb(&db, &grafeo)
+        {
+            tracing::warn!(error = %e, "failed to rebuild Grafeo after ingestion");
+        }
+    }
+
+    // Start watching the staging directory for new events from hooks
+    let storage_dir_owned = storage_dir.to_path_buf();
+    let ingest_db = db.clone();
+    let ingest_grafeo = grafeo.clone();
+    let _ingestion = tokio::spawn(async move {
+        let watch_result =
+            lobster::store::watcher::watch_staging(&storage_dir_owned);
+        let (mut rx, _guard) = match watch_result {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "failed to start staging watcher, \
+                     falling back to polling"
+                );
+                // Fall back to polling every 2 seconds
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    lobster::store::ingest::ingest_staged(
+                        &storage_dir_owned,
+                        &ingest_db,
+                        &ingest_grafeo,
+                    )
+                    .await;
+                }
+            }
+        };
+
+        tracing::info!("staging watcher started");
+
+        // Debounce: wait a short time after notification to batch
+        // multiple rapid file creates into one ingestion cycle.
+        loop {
+            // Wait for a notification
+            if rx.recv().await.is_none() {
+                tracing::warn!("staging watcher channel closed");
+                break;
+            }
+
+            // Debounce: drain any additional notifications that
+            // arrived in the next 50ms
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            while rx.try_recv().is_ok() {}
+
+            // Run ingestion
+            lobster::store::ingest::ingest_staged(
+                &storage_dir_owned,
+                &ingest_db,
+                &ingest_grafeo,
+            )
+            .await;
+        }
+    });
 
     // Spawn dreaming scheduler in a background task.
     // Per spec: "dreaming belongs to the long-lived process"
