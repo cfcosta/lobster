@@ -71,142 +71,35 @@ async fn main() -> Result<()> {
     }
 }
 
-#[allow(clippy::unused_async, clippy::too_many_lines)]
+#[allow(clippy::unused_async)]
 async fn cmd_hook(
     storage_dir: &std::path::Path,
     _hook_type: &str,
 ) -> Result<()> {
     std::fs::create_dir_all(storage_dir).context("create storage dir")?;
 
-    let db_path = lobster::app::config::db_path(storage_dir);
-    let db = lobster::store::db::open(&db_path).context("open database")?;
-
-    // Rebuild Grafeo from redb so previous episodes are searchable.
-    // This is what the architecture designed: Grafeo is a rebuildable
-    // projection of the canonical state in redb.
-    let grafeo = lobster::graph::db::new_in_memory();
-    if let Err(e) = lobster::graph::rebuild::rebuild_from_redb(&db, &grafeo) {
-        tracing::warn!(error = %e, "failed to rebuild Grafeo");
-    }
-    lobster::graph::indexes::ensure_indexes(&grafeo);
-
     // Read hook payload from stdin
     let mut input = String::new();
     std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)
         .context("read stdin")?;
 
-    // Parse the hook event
+    // Validate it's parseable JSON before staging
     let event: lobster::hooks::events::HookEvent =
         serde_json::from_str(&input).context("parse hook event")?;
 
     tracing::debug!(hook_type = event.hook_type(), "hook invoked");
 
-    // Step 1: Capture the raw event into redb
-    let seq = lobster::hooks::capture::next_seq(&db);
-    if let Err(e) = lobster::hooks::capture::capture_event(&db, &event, seq) {
-        tracing::warn!(error = %e, "failed to capture event");
-        // Fail open — continue to recall even if capture fails
+    // Stage the event to the filesystem. The MCP server (the sole
+    // owner of the redb database) will watch the staging directory
+    // and ingest this event. If MCP is not running, the next hook
+    // invocation that gets the DB lock (task 5) will ingest it.
+    if let Err(e) = lobster::store::staging::stage_event(storage_dir, &input) {
+        tracing::warn!(error = %e, "failed to stage event");
     }
 
-    // Step 2: Opportunistically finalize under a time budget.
-    // Per spec: "Short-lived hook invocations should only append raw events"
-    // but finalization "may run opportunistically under a repo-local lease
-    // with a strict time budget" (line 151). We allow 200ms for finalization.
-    // Check if LLM API key is available before attempting finalization
-    let has_llm_key = std::env::var("ANTHROPIC_API_KEY").is_ok()
-        || std::env::var("OPENAI_API_KEY").is_ok();
-    if !has_llm_key {
-        tracing::warn!(
-            "No ANTHROPIC_API_KEY or OPENAI_API_KEY set. \
-             Events are captured but episodes cannot be finalized. \
-             Set an API key to enable summarization and extraction."
-        );
-    }
-
-    let finalization_deadline =
-        std::time::Instant::now() + std::time::Duration::from_millis(200);
-    if has_llm_key && event.is_prompt_submit() {
-        let repo_path = event
-            .working_directory()
-            .unwrap_or_else(|| "unknown".to_string());
-        let repo_id = lobster::store::ids::RepoId::derive(repo_path.as_bytes());
-        let config =
-            lobster::episodes::segmenter::SegmentationConfig::default();
-
-        let action = lobster::hooks::segmentation::check_segmentation(
-            &db,
-            chrono::Utc::now().timestamp_millis(),
-            &repo_id,
-            seq,
-            &config,
-        );
-
-        let (start_seq, end_seq) = match action {
-            lobster::hooks::segmentation::SegmentAction::StartNew {
-                seq: s,
-            } => (s, s),
-            lobster::hooks::segmentation::SegmentAction::ExtendCurrent {
-                start_seq,
-                end_seq,
-            } => (start_seq, end_seq),
-        };
-
-        // Only finalize if we still have time budget remaining
-        let result = if std::time::Instant::now() < finalization_deadline {
-            lobster::episodes::finalize::finalize_episode(
-                &db,
-                &grafeo,
-                &repo_path,
-                &serde_json::to_vec(&[&event]).unwrap_or_default(),
-                start_seq,
-                end_seq,
-                event.user_prompt(),
-            )
-            .await
-        } else {
-            tracing::debug!("skipping finalization: time budget exceeded");
-            lobster::episodes::finalize::FinalizeResult::Failed(
-                "time budget exceeded".into(),
-            )
-        };
-        match result {
-            lobster::episodes::finalize::FinalizeResult::Ready {
-                episode_id,
-                decisions_created,
-            } => {
-                tracing::debug!(
-                    %episode_id,
-                    decisions_created,
-                    "episode finalized"
-                );
-            }
-            lobster::episodes::finalize::FinalizeResult::RetryQueued {
-                reason,
-                ..
-            } => {
-                tracing::warn!(reason, "episode queued for retry");
-            }
-            lobster::episodes::finalize::FinalizeResult::Failed(msg) => {
-                tracing::debug!(msg, "finalization skipped or failed");
-            }
-        }
-    }
-
-    // Step 3: Run the recall pipeline
-    let payload = lobster::hooks::recall::run_recall(&event, &db, &grafeo);
-
-    // Format recall as a Claude Code hook output (systemMessage)
-    let output = if payload.items.is_empty() {
-        lobster::hooks::events::HookOutput::empty()
-    } else {
-        let hint = lobster::hooks::tiered::format_hint(&payload);
-        if hint.is_empty() {
-            lobster::hooks::events::HookOutput::empty()
-        } else {
-            lobster::hooks::events::HookOutput::with_message(hint)
-        }
-    };
-
+    // Output empty hook response — recall is handled by MCP tools
+    // when the MCP server is running, or by the standalone fallback.
+    let output = lobster::hooks::events::HookOutput::empty();
     let json =
         serde_json::to_string(&output).context("serialize hook output")?;
     println!("{json}");
