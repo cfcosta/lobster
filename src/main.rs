@@ -93,7 +93,54 @@ async fn cmd_hook(
 
     tracing::debug!(hook_type = ?event.hook_type, "hook invoked");
 
-    // Run the recall pipeline
+    // Step 1: Capture the raw event into redb
+    let seq = lobster::hooks::capture::next_seq(&db);
+    if let Err(e) = lobster::hooks::capture::capture_event(&db, &event, seq) {
+        tracing::warn!(error = %e, "failed to capture event");
+        // Fail open — continue to recall even if capture fails
+    }
+
+    // Step 2: Check if we should finalize an episode
+    // (For now, finalize after every UserPromptSubmit since
+    // that's the primary hook entry point. Real segmentation
+    // would check idle gaps and repo transitions.)
+    if event.hook_type == lobster::hooks::events::HookType::UserPromptSubmit {
+        let repo_path = event.working_directory.as_deref().unwrap_or("unknown");
+        let result = lobster::episodes::finalize::finalize_episode(
+            &db,
+            &grafeo,
+            repo_path,
+            // Use the captured event as the episode content
+            &serde_json::to_vec(&[&event]).unwrap_or_default(),
+            seq,
+            seq,
+            event.user_prompt.clone(),
+        )
+        .await;
+        match result {
+            lobster::episodes::finalize::FinalizeResult::Ready {
+                episode_id,
+                decisions_created,
+            } => {
+                tracing::debug!(
+                    %episode_id,
+                    decisions_created,
+                    "episode finalized"
+                );
+            }
+            lobster::episodes::finalize::FinalizeResult::RetryQueued {
+                reason,
+                ..
+            } => {
+                tracing::warn!(reason, "episode queued for retry");
+            }
+            lobster::episodes::finalize::FinalizeResult::Failed(msg) => {
+                tracing::warn!(msg, "episode finalization failed");
+            }
+        }
+    }
+
+    // Step 3: Run the recall pipeline
     let payload = lobster::hooks::recall::run_recall(&event, &db, &grafeo);
 
     // Output recall payload as JSON to stdout
