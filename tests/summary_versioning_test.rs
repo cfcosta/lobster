@@ -28,6 +28,7 @@ async fn test_summary_has_revision() {
         episode_events_json: b"[]".to_vec(),
         repo_path: "/test".into(),
         task_title: Some("test task".into()),
+        file_reads: vec![],
     };
 
     let artifact = summarizer.summarize(input).await.unwrap();
@@ -49,6 +50,7 @@ async fn test_summary_persistence_roundtrip() {
         episode_events_json: b"[]".to_vec(),
         repo_path: "/test".into(),
         task_title: Some("test task".into()),
+        file_reads: vec![],
     };
 
     let mut artifact = summarizer.summarize(input).await.unwrap();
@@ -79,6 +81,7 @@ async fn test_summarizer_requires_api_key() {
         episode_events_json: b"[]".to_vec(),
         repo_path: "/test".into(),
         task_title: None,
+        file_reads: vec![],
     };
     let result = summarizer.summarize(input).await;
     assert!(result.is_err(), "should fail without API key");

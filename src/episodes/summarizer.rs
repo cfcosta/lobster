@@ -12,6 +12,9 @@ pub struct SummaryInput {
     pub episode_events_json: Vec<u8>,
     pub repo_path: String,
     pub task_title: Option<String>,
+    /// Condensed contents of files read during the episode.
+    /// Each entry is `(file_path, truncated_content)`.
+    pub file_reads: Vec<(String, String)>,
 }
 
 /// Error from the summarization pipeline.
@@ -81,6 +84,7 @@ mod tests {
             episode_events_json: b"[]".to_vec(),
             repo_path: "/test/repo".into(),
             task_title: None,
+            file_reads: vec![],
         };
         let result = summarizer.summarize(input).await;
         assert!(result.is_ok());

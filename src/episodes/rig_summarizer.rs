@@ -32,15 +32,27 @@ impl Summarizer for RigSummarizer {
             &input.episode_events_json,
         ));
 
+        let mut file_context = String::new();
+        if !input.file_reads.is_empty() {
+            file_context.push_str("\nFiles read during this session:\n");
+            for (path, content) in &input.file_reads {
+                use std::fmt::Write;
+                let _ = writeln!(file_context, "\n--- {path} ---");
+                let _ = writeln!(file_context, "{content}");
+            }
+        }
+
         let prompt = format!(
             "Repository: {repo}\n\
              Task: {task}\n\
              \n\
              Events from this work session:\n\
-             {events}\n",
+             {events}\n\
+             {files}",
             repo = input.repo_path,
             task = input.task_title.as_deref().unwrap_or("(none)"),
             events = events_text,
+            files = file_context,
         );
 
         let response = crate::app::llm::call(
@@ -153,6 +165,7 @@ mod tests {
                 episode_events_json: b"[]".to_vec(),
                 repo_path: "/test".into(),
                 task_title: None,
+                file_reads: vec![],
             };
             let result = summarizer.summarize(input).await;
             assert!(matches!(result, Err(SummaryError::ModelUnavailable(_))));

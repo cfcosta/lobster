@@ -127,11 +127,13 @@ pub async fn finalize_episode_at(
     }
 
     // ── Steps 2-3: Summarize and persist ─────────────────
+    let file_reads = extract_file_reads(events_json);
     let summarizer = RigSummarizer::default();
     let summary_input = SummaryInput {
         episode_events_json: events_json.to_vec(),
         repo_path: repo_path.to_string(),
         task_title: task_title.clone(),
+        file_reads,
     };
 
     let mut summary = match summarizer.summarize(summary_input).await {
@@ -391,6 +393,70 @@ pub fn parse_entity_kind(kind: &str) -> crate::store::schema::EntityKind {
     }
 }
 
+/// Max chars of file content to include per file read.
+const FILE_READ_MAX_CHARS: usize = 2000;
+
+/// Max number of file reads to include in summarizer input.
+const FILE_READ_MAX_FILES: usize = 10;
+
+/// Extract file read contents from raw episode events.
+///
+/// Scans the events JSON for `PostToolUse` events with `tool_name` "Read"
+/// and extracts `file_path` + truncated stdout content. This gives the
+/// summarizer and extractor access to what was actually *in* the files,
+/// not just that they were read.
+fn extract_file_reads(events_json: &[u8]) -> Vec<(String, String)> {
+    let Ok(events) =
+        serde_json::from_slice::<Vec<serde_json::Value>>(events_json)
+    else {
+        return vec![];
+    };
+
+    let mut reads = Vec::new();
+    let mut seen_paths = std::collections::HashSet::new();
+
+    for event in &events {
+        let tool_name = event
+            .get("tool_name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+
+        if tool_name != "Read" {
+            continue;
+        }
+
+        let file_path = event
+            .get("tool_input")
+            .and_then(|v| v.get("file_path"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+
+        if file_path.is_empty() || !seen_paths.insert(file_path.to_string()) {
+            continue;
+        }
+
+        let content = event
+            .get("tool_response")
+            .and_then(|v| v.get("stdout"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+
+        if content.is_empty() {
+            continue;
+        }
+
+        let truncated: String =
+            content.chars().take(FILE_READ_MAX_CHARS).collect();
+        reads.push((file_path.to_string(), truncated));
+
+        if reads.len() >= FILE_READ_MAX_FILES {
+            break;
+        }
+    }
+
+    reads
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -620,6 +686,133 @@ mod tests {
             grafeo.node_count() >= 1,
             "Grafeo should have at least the episode node"
         );
+    }
+
+    // ── extract_file_reads ───────────────────────────────
+
+    #[test]
+    fn test_extract_file_reads_from_events() {
+        let events = serde_json::json!([
+            {
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Read",
+                "tool_input": {"file_path": "src/main.rs"},
+                "tool_response": {"stdout": "fn main() {\n    println!(\"hello\");\n}"}
+            },
+            {
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Bash",
+                "tool_input": {"command": "ls"},
+                "tool_response": {"stdout": "file1\nfile2"}
+            }
+        ]);
+        let json = serde_json::to_vec(&events).unwrap();
+        let reads = extract_file_reads(&json);
+
+        assert_eq!(reads.len(), 1);
+        assert_eq!(reads[0].0, "src/main.rs");
+        assert!(reads[0].1.contains("fn main()"));
+    }
+
+    #[test]
+    fn test_extract_file_reads_deduplicates() {
+        let events = serde_json::json!([
+            {
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Read",
+                "tool_input": {"file_path": "src/lib.rs"},
+                "tool_response": {"stdout": "// first read"}
+            },
+            {
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Read",
+                "tool_input": {"file_path": "src/lib.rs"},
+                "tool_response": {"stdout": "// second read"}
+            }
+        ]);
+        let json = serde_json::to_vec(&events).unwrap();
+        let reads = extract_file_reads(&json);
+
+        assert_eq!(reads.len(), 1, "duplicate file paths should be deduped");
+    }
+
+    #[test]
+    fn test_extract_file_reads_empty_events() {
+        assert!(extract_file_reads(b"[]").is_empty());
+        assert!(extract_file_reads(b"invalid").is_empty());
+    }
+
+    #[test]
+    fn test_extract_file_reads_truncates_content() {
+        let long_content = "x".repeat(5000);
+        let events = serde_json::json!([{
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Read",
+            "tool_input": {"file_path": "big.txt"},
+            "tool_response": {"stdout": long_content}
+        }]);
+        let json = serde_json::to_vec(&events).unwrap();
+        let reads = extract_file_reads(&json);
+
+        assert_eq!(reads.len(), 1);
+        assert!(
+            reads[0].1.len() <= FILE_READ_MAX_CHARS,
+            "content should be truncated to {FILE_READ_MAX_CHARS}"
+        );
+    }
+
+    use hegel::{TestCase, generators as gs};
+
+    /// `extract_file_reads` returns at most `FILE_READ_MAX_FILES` entries.
+    #[hegel::test(test_cases = 50)]
+    fn prop_extract_file_reads_bounded(tc: TestCase) {
+        let n: usize =
+            tc.draw(gs::integers::<usize>().min_value(0).max_value(20));
+        let events: Vec<serde_json::Value> = (0..n)
+            .map(|i| {
+                serde_json::json!({
+                    "hook_event_name": "PostToolUse",
+                    "tool_name": "Read",
+                    "tool_input": {"file_path": format!("file_{i}.rs")},
+                    "tool_response": {"stdout": format!("content of file {i}")}
+                })
+            })
+            .collect();
+        let json = serde_json::to_vec(&events).unwrap();
+        let reads = extract_file_reads(&json);
+
+        assert!(reads.len() <= FILE_READ_MAX_FILES);
+        assert!(reads.len() <= n);
+    }
+
+    /// Every extracted file read has a non-empty path and content.
+    #[hegel::test(test_cases = 50)]
+    fn prop_extract_file_reads_non_empty(tc: TestCase) {
+        let n: usize =
+            tc.draw(gs::integers::<usize>().min_value(1).max_value(5));
+        let events: Vec<serde_json::Value> = (0..n)
+            .map(|i| {
+                let content: String = tc.draw(
+                    gs::text()
+                        .min_size(1)
+                        .max_size(100)
+                        .alphabet("abcdefghijklmnopqrstuvwxyz\n"),
+                );
+                serde_json::json!({
+                    "hook_event_name": "PostToolUse",
+                    "tool_name": "Read",
+                    "tool_input": {"file_path": format!("file_{i}.rs")},
+                    "tool_response": {"stdout": content}
+                })
+            })
+            .collect();
+        let json = serde_json::to_vec(&events).unwrap();
+        let reads = extract_file_reads(&json);
+
+        for (path, content) in &reads {
+            assert!(!path.is_empty(), "path should not be empty");
+            assert!(!content.is_empty(), "content should not be empty");
+        }
     }
 
     #[tokio::test]
