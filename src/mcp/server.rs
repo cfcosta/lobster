@@ -47,6 +47,7 @@ pub struct JsonRpcError {
 /// # Errors
 ///
 /// Returns when stdin is closed or on I/O error.
+#[allow(clippy::significant_drop_tightening)]
 pub fn run_server(
     db: &Database,
     grafeo: &GrafeoDB,

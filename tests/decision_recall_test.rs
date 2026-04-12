@@ -8,11 +8,6 @@ use lobster::{
     store::{db, schema::Confidence},
 };
 
-fn has_api_key() -> bool {
-    std::env::var("ANTHROPIC_API_KEY").is_ok()
-        || std::env::var("OPENAI_API_KEY").is_ok()
-}
-
 fn make_prompt_event(prompt: &str) -> HookEvent {
     serde_json::from_value(serde_json::json!({
         "hook_event_name": "UserPromptSubmit",
