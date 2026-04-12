@@ -10,3 +10,4 @@ pub mod staging;
 pub mod states;
 pub mod tables;
 pub mod visibility;
+pub mod watcher;

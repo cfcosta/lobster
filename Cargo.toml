@@ -12,6 +12,7 @@ candle-core = "0.10.2"
 chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
 grafeo = "0.5.34"
+notify = "8.2.0"
 pylate-rs = { version = "1.0.4", git = "https://github.com/cfcosta/pylate-rs" }
 redb = "4.0.0"
 rig-core = "0.34.0"
