@@ -875,4 +875,176 @@ mod tests {
             serde_json::from_str(&out).expect("valid json");
         assert_eq!(val, parsed);
     }
+
+    // ── redb dump round-trip ────────────────────────────────────
+
+    use lobster::store::{
+        crud,
+        db,
+        ids::{EpisodeId, RepoId},
+        schema::{Episode, EventKind, ProcessingState, RawEvent},
+    };
+
+    #[hegel::composite]
+    fn gen_raw_event(tc: hegel::TestCase, seq: u64) -> RawEvent {
+        let repo_input: Vec<u8> =
+            tc.draw(gs::vecs(gs::integers::<u8>()).min_size(1).max_size(16));
+        let payload: Vec<u8> =
+            tc.draw(gs::vecs(gs::integers::<u8>()).max_size(128));
+        let mut hash = [0u8; 32];
+        hash[..payload.len().min(32)]
+            .copy_from_slice(&payload[..payload.len().min(32)]);
+        RawEvent {
+            seq,
+            repo_id: RepoId::derive(&repo_input),
+            ts_utc_ms: tc.draw(
+                gs::integers::<i64>()
+                    .min_value(0)
+                    .max_value(4_102_444_800_000),
+            ),
+            event_kind: EventKind::UserPromptSubmit,
+            payload_hash: hash,
+            payload_bytes: payload,
+        }
+    }
+
+    #[hegel::composite]
+    fn gen_episode(tc: hegel::TestCase) -> Episode {
+        let ep_input: Vec<u8> =
+            tc.draw(gs::vecs(gs::integers::<u8>()).min_size(1).max_size(32));
+        let repo_input: Vec<u8> =
+            tc.draw(gs::vecs(gs::integers::<u8>()).min_size(1).max_size(16));
+        let start: u64 =
+            tc.draw(gs::integers::<u64>().min_value(0).max_value(1_000_000));
+        let end: u64 = tc.draw(
+            gs::integers::<u64>()
+                .min_value(start)
+                .max_value(start + 10_000),
+        );
+        Episode {
+            episode_id: EpisodeId::derive(&ep_input),
+            repo_id: RepoId::derive(&repo_input),
+            start_seq: start,
+            end_seq: end,
+            task_id: None,
+            processing_state: ProcessingState::Pending,
+            finalized_ts_utc_ms: tc.draw(
+                gs::integers::<i64>()
+                    .min_value(0)
+                    .max_value(4_102_444_800_000),
+            ),
+            retry_count: 0,
+            is_noisy: false,
+        }
+    }
+
+    /// Helper: count entries in a redb table via the same iteration
+    /// pattern that the dump functions use.
+    fn count_table_entries<K: redb::Key + 'static, V: redb::Value + 'static>(
+        db: &impl ReadableDatabase,
+        table_def: redb::TableDefinition<K, V>,
+    ) -> usize {
+        let txn = db.begin_read().unwrap();
+        let table = txn.open_table(table_def).unwrap();
+        table.iter().unwrap().count()
+    }
+
+    /// Writing N raw events via CRUD produces exactly N entries
+    /// when iterated with the dump pattern.
+    #[hegel::test(test_cases = 50)]
+    fn prop_raw_events_dump_count(tc: TestCase) {
+        let n: usize =
+            tc.draw(gs::integers::<usize>().min_value(0).max_value(20));
+        let database = db::open_in_memory().unwrap();
+
+        for seq in 0..n {
+            let event = tc.draw(gen_raw_event(seq as u64));
+            crud::append_raw_event(&database, &event).unwrap();
+        }
+
+        assert_eq!(count_table_entries(&database, tables::RAW_EVENTS), n);
+    }
+
+    /// Writing N episodes via CRUD produces exactly N entries
+    /// when iterated with the dump pattern. Uses unique episode
+    /// IDs to avoid overwrites.
+    #[hegel::test(test_cases = 50)]
+    fn prop_episodes_dump_count(tc: TestCase) {
+        let n: usize =
+            tc.draw(gs::integers::<usize>().min_value(0).max_value(20));
+        let database = db::open_in_memory().unwrap();
+
+        for i in 0..n {
+            let mut ep = tc.draw(gen_episode());
+            // Ensure unique episode IDs by mixing in the index
+            ep.episode_id = EpisodeId::derive(format!("ep-{i}").as_bytes());
+            crud::put_episode(&database, &ep).unwrap();
+        }
+
+        assert_eq!(count_table_entries(&database, tables::EPISODES), n);
+    }
+
+    /// Every raw event written can be deserialized back through
+    /// the table iteration pattern (same as dump functions).
+    #[hegel::test(test_cases = 50)]
+    fn prop_raw_events_deserialize_roundtrip(tc: TestCase) {
+        let n: usize =
+            tc.draw(gs::integers::<usize>().min_value(1).max_value(10));
+        let database = db::open_in_memory().unwrap();
+        let mut written = Vec::new();
+
+        for seq in 0..n {
+            let event = tc.draw(gen_raw_event(seq as u64));
+            crud::append_raw_event(&database, &event).unwrap();
+            written.push(event);
+        }
+
+        // Read back via the same pattern as dump_raw_events
+        let txn = database.begin_read().unwrap();
+        let table = txn.open_table(tables::RAW_EVENTS).unwrap();
+        let mut read_back = Vec::new();
+        for entry in table.iter().unwrap() {
+            let (_, v) = entry.unwrap();
+            let event: RawEvent = serde_json::from_slice(v.value()).unwrap();
+            read_back.push(event);
+        }
+
+        assert_eq!(written.len(), read_back.len());
+        for (w, r) in written.iter().zip(read_back.iter()) {
+            assert_eq!(w, r);
+        }
+    }
+
+    /// Every episode written can be deserialized back through
+    /// table iteration.
+    #[hegel::test(test_cases = 50)]
+    fn prop_episodes_deserialize_roundtrip(tc: TestCase) {
+        let n: usize =
+            tc.draw(gs::integers::<usize>().min_value(1).max_value(10));
+        let database = db::open_in_memory().unwrap();
+        let mut written = Vec::new();
+
+        for i in 0..n {
+            let mut ep = tc.draw(gen_episode());
+            ep.episode_id = EpisodeId::derive(format!("ep-{i}").as_bytes());
+            crud::put_episode(&database, &ep).unwrap();
+            written.push(ep);
+        }
+
+        let txn = database.begin_read().unwrap();
+        let table = txn.open_table(tables::EPISODES).unwrap();
+        let mut read_back: Vec<Episode> = Vec::new();
+        for entry in table.iter().unwrap() {
+            let (_, v) = entry.unwrap();
+            read_back.push(serde_json::from_slice(v.value()).unwrap());
+        }
+
+        assert_eq!(written.len(), read_back.len());
+        // Sort both by episode_id for stable comparison
+        written.sort_by_key(|e| e.episode_id);
+        read_back.sort_by_key(|e| e.episode_id);
+        for (w, r) in written.iter().zip(read_back.iter()) {
+            assert_eq!(w, r);
+        }
+    }
 }
