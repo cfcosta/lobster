@@ -1047,4 +1047,91 @@ mod tests {
             assert_eq!(w, r);
         }
     }
+
+    // ── Grafeo rebuild ──────────────────────────────────────────
+
+    use lobster::{
+        episodes::finalize::{FinalizeResult, finalize_episode},
+        graph::db as grafeo_db,
+    };
+
+    /// `rebuild_grafeo` on a database with finalized episodes produces
+    /// the same node count as the original Grafeo that was built
+    /// during finalization.
+    #[hegel::test(test_cases = 20)]
+    fn prop_rebuild_matches_original_node_count(tc: TestCase) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let n: usize =
+            tc.draw(gs::integers::<usize>().min_value(1).max_value(3));
+
+        let database = db::open_in_memory().unwrap();
+        let original_grafeo = grafeo_db::new_in_memory();
+
+        for i in 0..n {
+            let result = rt.block_on(finalize_episode(
+                &database,
+                &original_grafeo,
+                "/test/repo",
+                b"[]",
+                i as u64 * 10,
+                i as u64 * 10 + 5,
+                None,
+            ));
+            assert!(
+                matches!(result, FinalizeResult::Ready { .. }),
+                "episode {i} failed to finalize: {result:?}"
+            );
+        }
+
+        let original_nodes = original_grafeo.node_count();
+        assert!(original_nodes >= n, "expected at least {n} nodes");
+
+        // Rebuild from the same redb
+        let rebuilt = rebuild_grafeo(&database).unwrap();
+
+        assert_eq!(
+            rebuilt.node_count(),
+            original_nodes,
+            "rebuilt node count should match original"
+        );
+    }
+
+    /// `rebuild_grafeo` skips non-Ready episodes: only Pending
+    /// episodes produce zero nodes.
+    #[test]
+    fn test_rebuild_skips_pending() {
+        let database = db::open_in_memory().unwrap();
+        let ep = Episode {
+            episode_id: EpisodeId::derive(b"pending-ep"),
+            repo_id: RepoId::derive(b"repo"),
+            start_seq: 0,
+            end_seq: 5,
+            task_id: None,
+            processing_state: ProcessingState::Pending,
+            finalized_ts_utc_ms: 1_700_000_000_000,
+            retry_count: 0,
+            is_noisy: false,
+        };
+        crud::put_episode(&database, &ep).unwrap();
+
+        let grafeo = rebuild_grafeo(&database).unwrap();
+        assert_eq!(
+            grafeo.node_count(),
+            0,
+            "Pending episodes should be skipped"
+        );
+    }
+
+    /// `rebuild_grafeo` on an empty database produces an empty graph.
+    #[test]
+    fn test_rebuild_empty_db() {
+        let database = db::open_in_memory().unwrap();
+        let grafeo = rebuild_grafeo(&database).unwrap();
+        assert_eq!(grafeo.node_count(), 0);
+        assert_eq!(grafeo.edge_count(), 0);
+    }
 }
