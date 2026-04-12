@@ -68,8 +68,8 @@ pub fn run_server(
             Ok(Some(b)) => b,
             Ok(None) => break, // EOF
             Err(e) => {
-                eprintln!("lobster: read error: {e}");
-                break;
+                eprintln!("lobster: read error (continuing): {e}");
+                continue;
             }
         };
 
@@ -108,41 +108,54 @@ pub fn run_server(
     Ok(())
 }
 
-/// Read a message using Content-Length framing or line-delimited fallback.
+/// Read a message using Content-Length framing (MCP/LSP protocol).
+///
+/// Reads headers until a blank line, extracts `Content-Length`,
+/// then reads exactly that many bytes of body. Additional headers
+/// (like `Content-Type`) are accepted and ignored.
 fn read_message(
     reader: &mut impl BufRead,
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
-    let mut header_line = String::new();
-    let n = reader.read_line(&mut header_line)?;
-    if n == 0 {
-        return Ok(None); // EOF
+    let mut content_length: Option<usize> = None;
+
+    // Read headers until blank line
+    loop {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line)?;
+        if n == 0 {
+            return Ok(None); // EOF
+        }
+
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            // Blank line = end of headers
+            break;
+        }
+
+        // Parse Content-Length header (case-insensitive)
+        if let Some(len_str) = trimmed
+            .strip_prefix("Content-Length:")
+            .or_else(|| trimmed.strip_prefix("content-length:"))
+        {
+            content_length = Some(
+                len_str
+                    .trim()
+                    .parse()
+                    .map_err(|e| format!("invalid Content-Length: {e}"))?,
+            );
+        }
+        // Other headers (Content-Type, etc.) are silently ignored
     }
 
-    let trimmed = header_line.trim();
-    if trimmed.is_empty() {
-        // Empty line — skip
+    let Some(len) = content_length else {
+        // No Content-Length found — return empty (skip this message)
         return Ok(Some(String::new()));
-    }
+    };
 
-    // Check for Content-Length header (MCP/LSP framing)
-    if let Some(len_str) = trimmed.strip_prefix("Content-Length:") {
-        let len: usize = len_str
-            .trim()
-            .parse()
-            .map_err(|e| format!("invalid Content-Length: {e}"))?;
-
-        // Read the blank separator line
-        let mut blank = String::new();
-        reader.read_line(&mut blank)?;
-
-        // Read exactly `len` bytes of body
-        let mut body = vec![0u8; len];
-        reader.read_exact(&mut body)?;
-        return Ok(Some(String::from_utf8(body)?));
-    }
-
-    // Fallback: treat the line itself as the message
-    Ok(Some(trimmed.to_string()))
+    // Read exactly `len` bytes of body
+    let mut body = vec![0u8; len];
+    reader.read_exact(&mut body)?;
+    Ok(Some(String::from_utf8(body)?))
 }
 
 /// Write a message with Content-Length framing.
