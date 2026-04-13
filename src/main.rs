@@ -304,6 +304,21 @@ async fn cmd_mcp(storage_dir: &std::path::Path) -> Result<()> {
                     "workflow mining completed"
                 );
             }
+
+            // Run decision supersession detection
+            let ss_config =
+                lobster::dream::supersession::SupersessionConfig::default();
+            let ss_result =
+                lobster::dream::supersession::scan_superseded_decisions(
+                    &dream_db, &ss_config,
+                );
+            if ss_result.decisions_superseded > 0 {
+                tracing::info!(
+                    scanned = ss_result.decisions_scanned,
+                    superseded = ss_result.decisions_superseded,
+                    "decision supersession completed"
+                );
+            }
         }
     });
 

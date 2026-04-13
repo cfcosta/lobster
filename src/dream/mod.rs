@@ -2,4 +2,5 @@
 
 pub mod patterns;
 pub mod scheduler;
+pub mod supersession;
 pub mod workers;
