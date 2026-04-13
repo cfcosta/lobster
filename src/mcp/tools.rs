@@ -23,14 +23,10 @@ fn load_artifact_text(
     id: &crate::store::ids::RawId,
 ) -> String {
     match artifact_type {
-        "decision" => crud::get_decision(db, id).map_or_else(
-            |_| format!("decision:{id}"),
-            |d| d.statement,
-        ),
-        "summary" => crud::get_summary_artifact(db, id).map_or_else(
-            |_| format!("summary:{id}"),
-            |s| s.summary_text,
-        ),
+        "decision" => crud::get_decision(db, id)
+            .map_or_else(|_| format!("decision:{id}"), |d| d.statement),
+        "summary" => crud::get_summary_artifact(db, id)
+            .map_or_else(|_| format!("summary:{id}"), |s| s.summary_text),
         "entity" => crud::get_entity(db, id).map_or_else(
             |_| format!("entity:{id}"),
             |e| {
@@ -128,18 +124,22 @@ pub struct RecentEpisode {
     pub state: String,
 }
 
-/// Return newest ready artifacts.
+/// Maximum episodes returned by `memory_recent`.
+const MAX_RECENT_EPISODES: usize = 20;
+
+/// Return newest ready episodes, sorted by finalized timestamp.
 ///
-/// This is the `memory_recent` MCP tool.
+/// This is the `memory_recent` MCP tool. Filters by `repo_id` when
+/// provided, sorts newest-first, and limits to [`MAX_RECENT_EPISODES`].
 #[must_use]
-pub fn memory_recent(db: &Database, _repo_id: Option<&str>) -> RecentResult {
-    // For now, scan episodes table and return Ready ones
-    // (a real implementation would use an index)
+pub fn memory_recent(db: &Database, repo_id: Option<&str>) -> RecentResult {
     use redb::{ReadableDatabase, ReadableTable};
 
-    use crate::store::tables;
+    use crate::store::{ids::RepoId, tables};
 
-    let mut episodes = Vec::new();
+    let repo_filter = repo_id.map(|r| RepoId::derive(r.as_bytes()));
+
+    let mut episodes: Vec<(i64, RecentEpisode)> = Vec::new();
 
     if let Ok(read_txn) = db.begin_read() {
         if let Ok(table) = read_txn.open_table(tables::EPISODES) {
@@ -151,29 +151,45 @@ pub fn memory_recent(db: &Database, _repo_id: Option<&str>) -> RecentResult {
                     >(value.value())
                     {
                         if ep.processing_state
-                            == crate::store::schema::ProcessingState::Ready
+                            != crate::store::schema::ProcessingState::Ready
                         {
-                            // Try to load summary
-                            let summary = crud::get_summary_artifact(
-                                db,
-                                &ep.episode_id.raw(),
-                            )
-                            .map(|s| s.summary_text)
-                            .unwrap_or_default();
+                            continue;
+                        }
+                        // Filter by repo_id when provided
+                        if let Some(ref filter_id) = repo_filter {
+                            if ep.repo_id != *filter_id {
+                                continue;
+                            }
+                        }
 
-                            episodes.push(RecentEpisode {
+                        let summary = crud::get_summary_artifact(
+                            db,
+                            &ep.episode_id.raw(),
+                        )
+                        .map(|s| s.summary_text)
+                        .unwrap_or_default();
+
+                        episodes.push((
+                            ep.finalized_ts_utc_ms,
+                            RecentEpisode {
                                 episode_id: ep.episode_id.to_string(),
                                 summary,
                                 state: format!("{:?}", ep.processing_state),
-                            });
-                        }
+                            },
+                        ));
                     }
                 }
             }
         }
     }
 
-    RecentResult { episodes }
+    // Sort newest first, limit results
+    episodes.sort_by_key(|&(ts, _)| std::cmp::Reverse(ts));
+    episodes.truncate(MAX_RECENT_EPISODES);
+
+    RecentResult {
+        episodes: episodes.into_iter().map(|(_, ep)| ep).collect(),
+    }
 }
 
 // ── memory_search ────────────────────────────────────────
@@ -469,6 +485,140 @@ mod tests {
         let database = db::open_in_memory().unwrap();
         let recent = memory_recent(&database, None);
         assert!(recent.episodes.is_empty());
+    }
+
+    #[test]
+    fn test_memory_recent_sorted_newest_first() {
+        use crate::store::{
+            crud,
+            ids::{EpisodeId, RepoId},
+            schema::{Episode, ProcessingState, SummaryArtifact},
+        };
+
+        let database = db::open_in_memory().unwrap();
+
+        // Create episodes with different timestamps
+        for ts in [3000_i64, 1000, 2000] {
+            let ep = Episode {
+                episode_id: EpisodeId::derive(&ts.to_le_bytes()),
+                repo_id: RepoId::derive(b"repo"),
+                start_seq: 0,
+                end_seq: 5,
+                task_id: None,
+                processing_state: ProcessingState::Ready,
+                finalized_ts_utc_ms: ts,
+                retry_count: 0,
+                is_noisy: false,
+            };
+            crud::put_episode(&database, &ep).unwrap();
+            let art = SummaryArtifact {
+                episode_id: ep.episode_id,
+                revision: "v1".into(),
+                summary_text: format!("ts={ts}"),
+                payload_checksum: [0; 32],
+            };
+            crud::put_summary_artifact(&database, &art).unwrap();
+        }
+
+        let recent = memory_recent(&database, None);
+        assert_eq!(recent.episodes.len(), 3);
+        // Newest first
+        assert!(recent.episodes[0].summary.contains("3000"));
+        assert!(recent.episodes[1].summary.contains("2000"));
+        assert!(recent.episodes[2].summary.contains("1000"));
+    }
+
+    #[test]
+    fn test_memory_recent_filters_by_repo_id() {
+        use crate::store::{
+            crud,
+            ids::{EpisodeId, RepoId},
+            schema::{Episode, ProcessingState, SummaryArtifact},
+        };
+
+        let database = db::open_in_memory().unwrap();
+
+        // Two repos
+        for (repo, label) in [("repo-a", "alpha"), ("repo-b", "beta")] {
+            let ep = Episode {
+                episode_id: EpisodeId::derive(label.as_bytes()),
+                repo_id: RepoId::derive(repo.as_bytes()),
+                start_seq: 0,
+                end_seq: 5,
+                task_id: None,
+                processing_state: ProcessingState::Ready,
+                finalized_ts_utc_ms: 1000,
+                retry_count: 0,
+                is_noisy: false,
+            };
+            crud::put_episode(&database, &ep).unwrap();
+            let art = SummaryArtifact {
+                episode_id: ep.episode_id,
+                revision: "v1".into(),
+                summary_text: label.into(),
+                payload_checksum: [0; 32],
+            };
+            crud::put_summary_artifact(&database, &art).unwrap();
+        }
+
+        // Filter by repo-a
+        let recent = memory_recent(&database, Some("repo-a"));
+        assert_eq!(recent.episodes.len(), 1);
+        assert!(recent.episodes[0].summary.contains("alpha"));
+
+        // No filter returns both
+        let all = memory_recent(&database, None);
+        assert_eq!(all.episodes.len(), 2);
+    }
+
+    // -- Property: memory_recent result count <= MAX_RECENT_EPISODES --
+    #[hegel::test(test_cases = 20)]
+    fn prop_memory_recent_bounded(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+
+        use crate::store::{
+            crud,
+            ids::{EpisodeId, RepoId},
+            schema::{Episode, ProcessingState, SummaryArtifact},
+        };
+
+        let database = db::open_in_memory().unwrap();
+        let n: usize =
+            tc.draw(gs::integers::<usize>().min_value(0).max_value(30));
+
+        for i in 0..n {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_possible_wrap
+            )]
+            let ep = Episode {
+                episode_id: EpisodeId::derive(&(i as u32).to_le_bytes()),
+                repo_id: RepoId::derive(b"repo"),
+                start_seq: 0,
+                end_seq: 5,
+                task_id: None,
+                processing_state: ProcessingState::Ready,
+                finalized_ts_utc_ms: (i * 1000) as i64,
+                retry_count: 0,
+                is_noisy: false,
+            };
+            crud::put_episode(&database, &ep).unwrap();
+            let art = SummaryArtifact {
+                episode_id: ep.episode_id,
+                revision: "v1".into(),
+                summary_text: format!("ep {i}"),
+                payload_checksum: [0; 32],
+            };
+            crud::put_summary_artifact(&database, &art).unwrap();
+        }
+
+        let recent = memory_recent(&database, None);
+        assert!(
+            recent.episodes.len() <= super::MAX_RECENT_EPISODES,
+            "got {} episodes, max is {}",
+            recent.episodes.len(),
+            super::MAX_RECENT_EPISODES
+        );
     }
 
     // ── Workflow surfacing tests ─────────────────────────────
