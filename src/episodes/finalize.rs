@@ -335,17 +335,7 @@ pub async fn finalize_episode_at(
         let dec_node = projection::project_decision(grafeo, dec, ep_node);
 
         for entity_fact in &extraction_output.entities {
-            let ent = crate::store::schema::Entity {
-                entity_id: crate::store::ids::EntityId::derive(
-                    entity_fact.name.as_bytes(),
-                ),
-                repo_id,
-                kind: parse_entity_kind(&entity_fact.kind),
-                canonical_name: entity_fact.name.clone(),
-                first_seen_episode: None,
-                last_seen_ts_utc_ms: None,
-                mention_count: 0,
-            };
+            let ent = make_entity(repo_path, repo_id, entity_fact);
             // Persist entity to redb (canonical truth)
             let _ = crud::put_entity(db, &ent);
             let ent_node = projection::project_entity(grafeo, &ent, ep_node);
@@ -357,17 +347,7 @@ pub async fn finalize_episode_at(
 
     if created_decisions.is_empty() {
         for entity_fact in &extraction_output.entities {
-            let ent = crate::store::schema::Entity {
-                entity_id: crate::store::ids::EntityId::derive(
-                    entity_fact.name.as_bytes(),
-                ),
-                repo_id,
-                kind: parse_entity_kind(&entity_fact.kind),
-                canonical_name: entity_fact.name.clone(),
-                first_seen_episode: None,
-                last_seen_ts_utc_ms: None,
-                mention_count: 0,
-            };
+            let ent = make_entity(repo_path, repo_id, entity_fact);
             // Persist entity to redb (canonical truth)
             let _ = crud::put_entity(db, &ent);
             projection::project_entity(grafeo, &ent, ep_node);
@@ -395,6 +375,28 @@ pub async fn finalize_episode_at(
     FinalizeResult::Ready {
         episode_id,
         decisions_created: created_decisions.len(),
+    }
+}
+
+/// Build an `Entity` with a repo-scoped ID via `canon::entity_id`.
+///
+/// Previously entity IDs were derived from the name alone, causing
+/// entities from different repos to collide.
+fn make_entity(
+    repo_path: &str,
+    repo_id: crate::store::ids::RepoId,
+    fact: &crate::extract::traits::ExtractedEntity,
+) -> crate::store::schema::Entity {
+    crate::store::schema::Entity {
+        entity_id: crate::store::canon::entity_id(
+            repo_path, &fact.kind, &fact.name,
+        ),
+        repo_id,
+        kind: parse_entity_kind(&fact.kind),
+        canonical_name: fact.name.clone(),
+        first_seen_episode: None,
+        last_seen_ts_utc_ms: None,
+        mention_count: 0,
     }
 }
 
@@ -875,6 +877,88 @@ mod tests {
     }
 
     use hegel::{TestCase, generators as gs};
+
+    /// Entity IDs must differ when the same entity name appears in
+    /// different repos. This is the property that was violated before
+    /// the fix: `EntityId::derive(name.as_bytes())` ignored repo.
+    #[hegel::test(test_cases = 200)]
+    fn prop_entity_id_scoped_by_repo(tc: TestCase) {
+        let repo_a: String = tc.draw(
+            gs::text()
+                .min_size(1)
+                .max_size(50)
+                .alphabet("abcdefghijklmnopqrstuvwxyz/"),
+        );
+        let repo_b: String = tc.draw(
+            gs::text()
+                .min_size(1)
+                .max_size(50)
+                .alphabet("abcdefghijklmnopqrstuvwxyz/"),
+        );
+        let name: String = tc.draw(
+            gs::text()
+                .min_size(1)
+                .max_size(50)
+                .alphabet("abcdefghijklmnopqrstuvwxyz"),
+        );
+        let kind = "component";
+
+        let fact = crate::extract::traits::ExtractedEntity {
+            kind: kind.to_string(),
+            name,
+        };
+
+        let repo_id_a = crate::store::ids::RepoId::derive(repo_a.as_bytes());
+        let repo_id_b = crate::store::ids::RepoId::derive(repo_b.as_bytes());
+
+        let ent_a = make_entity(&repo_a, repo_id_a, &fact);
+        let ent_b = make_entity(&repo_b, repo_id_b, &fact);
+
+        if crate::store::canon::normalize_path(&repo_a)
+            == crate::store::canon::normalize_path(&repo_b)
+        {
+            assert_eq!(
+                ent_a.entity_id, ent_b.entity_id,
+                "same repo (after normalization) must produce same ID"
+            );
+        } else {
+            assert_ne!(
+                ent_a.entity_id, ent_b.entity_id,
+                "same entity name in different repos must have different IDs"
+            );
+        }
+    }
+
+    /// Entity IDs are deterministic: same inputs → same ID.
+    #[hegel::test(test_cases = 200)]
+    fn prop_make_entity_deterministic(tc: TestCase) {
+        let repo: String = tc.draw(
+            gs::text()
+                .min_size(1)
+                .max_size(50)
+                .alphabet("abcdefghijklmnopqrstuvwxyz/"),
+        );
+        let name: String = tc.draw(
+            gs::text()
+                .min_size(1)
+                .max_size(50)
+                .alphabet("abcdefghijklmnopqrstuvwxyz"),
+        );
+        let kind: String = tc.draw(gs::sampled_from(vec![
+            "concept".to_string(),
+            "component".to_string(),
+            "constraint".to_string(),
+            "file-lite".to_string(),
+            "repo".to_string(),
+        ]));
+
+        let fact = crate::extract::traits::ExtractedEntity { kind, name };
+        let repo_id = crate::store::ids::RepoId::derive(repo.as_bytes());
+
+        let ent1 = make_entity(&repo, repo_id, &fact);
+        let ent2 = make_entity(&repo, repo_id, &fact);
+        assert_eq!(ent1.entity_id, ent2.entity_id);
+    }
 
     /// `extract_file_reads` returns at most `FILE_READ_MAX_FILES` entries.
     #[hegel::test(test_cases = 50)]
