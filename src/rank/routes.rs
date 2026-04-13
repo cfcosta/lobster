@@ -79,6 +79,17 @@ pub fn execute_query_with_context(
 
     let mut candidates = search_grafeo(grafeo, query, route);
 
+    // Rerank candidates with ColBERT query→candidate similarity.
+    // This replaces the initial Grafeo BM25 score with a real
+    // semantic score from the model.
+    for candidate in &mut candidates {
+        let reranked =
+            crate::rank::rerank::rerank_score(db, query, &candidate.id);
+        if reranked > 0.0 {
+            candidate.score = reranked;
+        }
+    }
+
     // Apply stable tie-breakers before MMR per spec
     crate::rank::retrieval::stable_sort(&mut candidates);
 
