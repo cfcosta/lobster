@@ -186,15 +186,18 @@ fn load_proxy_vectors(
 
 /// Search Grafeo for candidates matching the query.
 ///
-/// Uses `ColBERT` query encoding with Grafeo hybrid search (BM25 +
-/// vector RRF fusion) and BM25 text search on indexed properties.
+/// Route-aware search using `ColBERT` + Grafeo.
 ///
-/// Assumes `ColBERT` model is installed. Returns empty results on
-/// an empty graph.
+/// - **Exact**: BM25 text search only on decisions and entities
+///   (no summary search, no vector encoding needed).
+/// - **Hybrid**: `ColBERT` query encoding + hybrid search (BM25 +
+///   vector RRF) on summaries, BM25 on decisions and entities.
+/// - **`HybridGraph`**: same as Hybrid, plus 1-hop graph neighbor
+///   expansion on initial hits.
 fn search_grafeo(
     grafeo: &GrafeoDB,
     query: &str,
-    _route: RetrievalRoute,
+    route: RetrievalRoute,
 ) -> Vec<ScoredCandidate> {
     let mut candidates = Vec::new();
 
@@ -202,12 +205,64 @@ fn search_grafeo(
         return candidates;
     }
 
-    // Encode the query with ColBERT. Model must be installed.
+    match route {
+        RetrievalRoute::Exact => {
+            search_exact(grafeo, query, &mut candidates);
+        }
+        RetrievalRoute::Hybrid => {
+            search_hybrid(grafeo, query, &mut candidates);
+        }
+        RetrievalRoute::HybridGraph => {
+            search_hybrid(grafeo, query, &mut candidates);
+            expand_graph_neighbors(grafeo, &mut candidates);
+        }
+        RetrievalRoute::Abstain => {}
+    }
+
+    candidates
+}
+
+/// Exact route: BM25 text search on decisions and entities only.
+/// No `ColBERT` encoding — these are exact/lexical queries.
+fn search_exact(
+    grafeo: &GrafeoDB,
+    query: &str,
+    candidates: &mut Vec<ScoredCandidate>,
+) {
+    if let Ok(hits) = grafeo.text_search(
+        crate::graph::db::labels::DECISION,
+        "statement",
+        query,
+        20,
+    ) {
+        collect_hits(grafeo, &hits, "decision_id", "decision", candidates);
+    }
+
+    if let Ok(hits) = grafeo.text_search(
+        crate::graph::db::labels::ENTITY,
+        "canonical_name",
+        query,
+        20,
+    ) {
+        collect_hits(grafeo, &hits, "entity_id", "entity", candidates);
+    }
+}
+
+/// Hybrid route: `ColBERT` query encoding + hybrid search on
+/// summaries, BM25 on decisions and entities.
+fn search_hybrid(
+    grafeo: &GrafeoDB,
+    query: &str,
+    candidates: &mut Vec<ScoredCandidate>,
+) {
     let mut model = match crate::embeddings::encoder::load_model() {
         Ok(m) => m,
         Err(e) => {
-            tracing::error!(error = %e, "ColBERT model not available — run `lobster install`");
-            return candidates;
+            tracing::error!(
+                error = %e,
+                "ColBERT model not available — run `lobster install`"
+            );
+            return;
         }
     };
     let query_vector =
@@ -224,30 +279,78 @@ fn search_grafeo(
         20,
         None,
     ) {
-        collect_hits(grafeo, &hits, "episode_id", "summary", &mut candidates);
+        collect_hits(grafeo, &hits, "episode_id", "summary", candidates);
     }
 
-    // BM25 text search on decision statements
+    // BM25 text search on decisions
     if let Ok(hits) = grafeo.text_search(
         crate::graph::db::labels::DECISION,
         "statement",
         query,
         20,
     ) {
-        collect_hits(grafeo, &hits, "decision_id", "decision", &mut candidates);
+        collect_hits(grafeo, &hits, "decision_id", "decision", candidates);
     }
 
-    // BM25 text search on entity canonical names
+    // BM25 text search on entities
     if let Ok(hits) = grafeo.text_search(
         crate::graph::db::labels::ENTITY,
         "canonical_name",
         query,
         20,
     ) {
-        collect_hits(grafeo, &hits, "entity_id", "entity", &mut candidates);
+        collect_hits(grafeo, &hits, "entity_id", "entity", candidates);
     }
+}
 
-    candidates
+/// `HybridGraph` expansion: for each initial candidate, add its
+/// 1-hop Grafeo neighbors as additional candidates.
+fn expand_graph_neighbors(
+    grafeo: &GrafeoDB,
+    candidates: &mut Vec<ScoredCandidate>,
+) {
+    let session = grafeo.session();
+    let initial_ids: Vec<String> =
+        candidates.iter().map(|c| c.id.to_string()).collect();
+
+    for id_str in &initial_ids {
+        let query = format!(
+            "MATCH (n)-[]->(m) WHERE \
+             (n.episode_id = '{id_str}' \
+              OR n.decision_id = '{id_str}' \
+              OR n.entity_id = '{id_str}') \
+             RETURN m.episode_id, m.decision_id, m.entity_id"
+        );
+
+        let Ok(result) = session.execute(&query) else {
+            continue;
+        };
+
+        for row in result.iter() {
+            // Try each possible ID column
+            let neighbor = [
+                (row[0].as_str(), "summary"),
+                (row[1].as_str(), "decision"),
+                (row[2].as_str(), "entity"),
+            ];
+            for (id_val, artifact_type) in &neighbor {
+                if let Some(id) = id_val {
+                    if let Ok(raw_id) = id.parse() {
+                        // Avoid duplicates
+                        if !candidates.iter().any(|c| c.id == raw_id) {
+                            candidates.push(ScoredCandidate {
+                                id: raw_id,
+                                // Neighbors get a discount — they
+                                // weren't direct search hits
+                                score: 0.5,
+                                artifact_type: (*artifact_type).into(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Collect search hits from Grafeo into scored candidates.
