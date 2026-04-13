@@ -33,6 +33,7 @@ pub struct DreamCycleResult {
     pub retries_succeeded: usize,
     pub episodes_failed_final: usize,
     pub budget_exhausted: bool,
+    pub profile_updated: bool,
 }
 
 /// Run one dreaming cycle: process pending maintenance jobs.
@@ -117,7 +118,51 @@ pub fn run_cycle(db: &LobsterDb, config: &DreamConfig) -> DreamCycleResult {
         }
     }
 
+    // Update repo profiles from convention detection
+    if !result.budget_exhausted {
+        result.profile_updated = update_profiles(db);
+    }
+
     result
+}
+
+/// Rebuild and persist profiles for all repos found in episodes.
+fn update_profiles(db: &LobsterDb) -> bool {
+    let repo_ids = collect_repo_ids(db);
+    let mut updated = false;
+
+    for repo_id in &repo_ids {
+        let profile = crate::dream::profile::build_profile(db, repo_id);
+        if profile.fact_count() > 0 {
+            let _ = crud::put_repo_profile(db, &profile);
+            updated = true;
+        }
+    }
+
+    updated
+}
+
+/// Collect all distinct repo IDs from episodes.
+fn collect_repo_ids(db: &LobsterDb) -> Vec<crate::store::ids::RepoId> {
+    let mut repo_ids = std::collections::HashSet::new();
+
+    let Ok(rtxn) = db.env.read_txn() else {
+        return vec![];
+    };
+    let Ok(iter) = db.episodes.iter(&rtxn) else {
+        return vec![];
+    };
+
+    for entry in iter.flatten() {
+        let (_, value) = entry;
+        if let Ok(ep) =
+            serde_json::from_slice::<crate::store::schema::Episode>(value)
+        {
+            repo_ids.insert(ep.repo_id);
+        }
+    }
+
+    repo_ids.into_iter().collect()
 }
 
 /// Find all episodes in `RetryQueued` state.
@@ -268,5 +313,62 @@ mod tests {
 
         let retries = find_retry_queued(&database);
         assert_eq!(retries.len(), 2);
+    }
+
+    // ── Profile update tests ─────────────────────────────────
+
+    #[test]
+    fn test_collect_repo_ids_empty() {
+        let (database, _dir) = db::open_in_memory().unwrap();
+        let ids = collect_repo_ids(&database);
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn test_collect_repo_ids_deduplicates() {
+        let (database, _dir) = db::open_in_memory().unwrap();
+        // Two episodes with same repo_id
+        make_episode(&database, b"ep1", ProcessingState::Ready);
+        make_episode(&database, b"ep2", ProcessingState::Ready);
+        let ids = collect_repo_ids(&database);
+        assert_eq!(ids.len(), 1, "same repo should produce one ID");
+    }
+
+    #[test]
+    fn test_update_profiles_no_episodes() {
+        let (database, _dir) = db::open_in_memory().unwrap();
+        let updated = update_profiles(&database);
+        assert!(!updated, "no episodes means no profile to update");
+    }
+
+    #[test]
+    fn test_dream_cycle_includes_profile_update() {
+        let (database, _dir) = db::open_in_memory().unwrap();
+        let config = DreamConfig::default();
+        let result = run_cycle(&database, &config);
+        // With no episodes, profile_updated should be false
+        assert!(!result.profile_updated);
+    }
+
+    // -- Property: collect_repo_ids is idempotent --
+    #[hegel::test(test_cases = 20)]
+    fn prop_collect_repo_ids_deterministic(tc: hegel::TestCase) {
+        let (database, _dir) = db::open_in_memory().unwrap();
+        let n: usize = tc.draw(
+            hegel::generators::integers::<usize>()
+                .min_value(0)
+                .max_value(5),
+        );
+        for i in 0..n {
+            #[allow(clippy::cast_possible_truncation)]
+            make_episode(
+                &database,
+                &(i as u32).to_le_bytes(),
+                ProcessingState::Ready,
+            );
+        }
+        let ids1 = collect_repo_ids(&database);
+        let ids2 = collect_repo_ids(&database);
+        assert_eq!(ids1.len(), ids2.len());
     }
 }

@@ -15,7 +15,7 @@ const MIN_SUPPORT: u32 = 2;
 
 /// A convention signal extracted from a single event.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct Signal {
+pub(crate) struct Signal {
     /// Convention statement (e.g., "uses nix flakes").
     statement: String,
 }
@@ -158,7 +158,7 @@ fn detect_command_signals(cmd: &str, signals: &mut Vec<Signal>) {
 /// The `now_ms` parameter is the timestamp to use for new facts
 /// (avoids non-determinism from system clock).
 #[must_use]
-pub fn aggregate_conventions(
+pub(crate) fn aggregate_conventions(
     episode_signals: &[(EpisodeId, Vec<Signal>)],
     now_ms: i64,
 ) -> Vec<ProfileFact> {
