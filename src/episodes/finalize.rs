@@ -228,9 +228,9 @@ pub async fn finalize_episode_at(
     let extractor = RigExtractor;
     let extraction_input = ExtractionInput {
         summary_text: summary.summary_text.clone(),
-        decisions_json: b"[]".to_vec(),
-        tool_outcomes_json: b"[]".to_vec(),
-        conversation_spans_json: b"[]".to_vec(),
+        decisions_json: extract_decisions_json(events_json),
+        tool_outcomes_json: extract_tool_outcomes_json(events_json),
+        conversation_spans_json: extract_conversation_spans_json(events_json),
         repo_path: repo_path.to_string(),
     };
 
@@ -416,6 +416,101 @@ const FILE_READ_MAX_CHARS: usize = 2000;
 
 /// Max number of file reads to include in summarizer input.
 const FILE_READ_MAX_FILES: usize = 10;
+
+/// Extract decision signals from events for the extractor.
+///
+/// Looks for user messages containing decision-like language and
+/// assistant responses that confirm decisions.
+fn extract_decisions_json(events_json: &[u8]) -> Vec<u8> {
+    let Ok(events) =
+        serde_json::from_slice::<Vec<serde_json::Value>>(events_json)
+    else {
+        return b"[]".to_vec();
+    };
+
+    let mut decisions = Vec::new();
+    for event in &events {
+        // Detect decision signals from user prompts and assistant responses
+        if let Some(prompt) = event
+            .get("tool_input")
+            .and_then(|v| v.get("prompt"))
+            .and_then(|v| v.as_str())
+        {
+            let signals =
+                crate::episodes::decisions::detect_signals(prompt);
+            if !signals.is_empty() {
+                decisions.push(serde_json::json!({
+                    "source": "user_prompt",
+                    "text": prompt,
+                    "signal_count": signals.len(),
+                }));
+            }
+        }
+    }
+
+    serde_json::to_vec(&decisions).unwrap_or_else(|_| b"[]".to_vec())
+}
+
+/// Extract tool use/result pairs from events.
+fn extract_tool_outcomes_json(events_json: &[u8]) -> Vec<u8> {
+    let Ok(events) =
+        serde_json::from_slice::<Vec<serde_json::Value>>(events_json)
+    else {
+        return b"[]".to_vec();
+    };
+
+    let mut outcomes = Vec::new();
+    for event in &events {
+        if let Some(tool) = event.get("tool_name").and_then(|v| v.as_str()) {
+            let mut outcome = serde_json::json!({ "tool": tool });
+            if let Some(input) = event.get("tool_input") {
+                // Include key input fields (file path, command, etc.)
+                if let Some(path) = input
+                    .get("file_path")
+                    .or_else(|| input.get("path"))
+                    .or_else(|| input.get("command"))
+                {
+                    outcome["input_key"] = path.clone();
+                }
+            }
+            outcomes.push(outcome);
+        }
+    }
+
+    serde_json::to_vec(&outcomes).unwrap_or_else(|_| b"[]".to_vec())
+}
+
+/// Extract conversation spans (user/assistant message pairs).
+fn extract_conversation_spans_json(events_json: &[u8]) -> Vec<u8> {
+    let Ok(events) =
+        serde_json::from_slice::<Vec<serde_json::Value>>(events_json)
+    else {
+        return b"[]".to_vec();
+    };
+
+    let mut spans = Vec::new();
+    for event in &events {
+        let hook_type = event
+            .get("hook_event_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        if hook_type == "UserPromptSubmit" {
+            if let Some(prompt) = event
+                .get("tool_input")
+                .and_then(|v| v.get("prompt"))
+                .and_then(|v| v.as_str())
+            {
+                spans.push(serde_json::json!({
+                    "role": "user",
+                    "text": prompt,
+                }));
+            }
+        }
+    }
+
+    serde_json::to_vec(&spans).unwrap_or_else(|_| b"[]".to_vec())
+}
 
 /// Extract file read contents from raw episode events.
 ///
