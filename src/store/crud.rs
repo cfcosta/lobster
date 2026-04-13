@@ -19,6 +19,7 @@ use crate::store::{
         ExtractionArtifact,
         RawEvent,
         RecallEngagement,
+        RepoProfile,
         SummaryArtifact,
         Task,
         ToolSequence,
@@ -308,6 +309,22 @@ pub fn record_engagement(
     put_recall_engagement(db, &eng)
 }
 
+// ── Repo Profile ────────────────────────────────────────────
+
+pub fn put_repo_profile(
+    db: &LobsterDb,
+    profile: &RepoProfile,
+) -> Result<(), StoreError> {
+    put_by_id(db, db.repo_profiles, &profile.repo_id.raw(), profile)
+}
+
+pub fn get_repo_profile(
+    db: &LobsterDb,
+    repo_id: &RawId,
+) -> Result<RepoProfile, StoreError> {
+    get_by_id(db, db.repo_profiles, repo_id)
+}
+
 // ── Repo Config ──────────────────────────────────────────────
 
 pub fn put_repo_config(
@@ -382,6 +399,8 @@ mod tests {
             EventKind,
             EvidenceRef,
             ProcessingState,
+            ProfileFact,
+            RepoProfile,
             TaskStatus,
         },
     };
@@ -786,6 +805,122 @@ mod tests {
             eng.is_ignored(3, 0.1),
             "zero engagement with {surface} surfaces should be ignored"
         );
+    }
+
+    // ── RepoProfile round-trip ─────────────────────────────────
+
+    #[hegel::composite]
+    fn gen_profile_fact(tc: hegel::TestCase) -> ProfileFact {
+        let ep_input: Vec<u8> =
+            tc.draw(gs::vecs(gs::integers::<u8>()).min_size(1).max_size(16));
+        let first: i64 = tc.draw(
+            gs::integers::<i64>()
+                .min_value(1000)
+                .max_value(i64::MAX / 2),
+        );
+        ProfileFact {
+            statement: tc.draw(gs::text().min_size(1).max_size(100)),
+            evidence: vec![EvidenceRef {
+                episode_id: EpisodeId::derive(&ep_input),
+                span_summary: "test evidence".into(),
+            }],
+            first_seen_ts_utc_ms: first,
+            last_confirmed_ts_utc_ms: first,
+            support_count: tc
+                .draw(gs::integers::<u32>().min_value(1).max_value(50)),
+            confidence: tc.draw(gs::sampled_from(vec![
+                Confidence::Low,
+                Confidence::Medium,
+                Confidence::High,
+            ])),
+        }
+    }
+
+    #[hegel::composite]
+    fn gen_repo_profile(tc: hegel::TestCase) -> RepoProfile {
+        let repo_input: Vec<u8> =
+            tc.draw(gs::vecs(gs::integers::<u8>()).min_size(1).max_size(16));
+        let n_conv: usize =
+            tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
+        let n_pref: usize =
+            tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
+        let mut conventions = Vec::with_capacity(n_conv);
+        for _ in 0..n_conv {
+            conventions.push(tc.draw(gen_profile_fact()));
+        }
+        let mut preferences = Vec::with_capacity(n_pref);
+        for _ in 0..n_pref {
+            preferences.push(tc.draw(gen_profile_fact()));
+        }
+        RepoProfile {
+            repo_id: RepoId::derive(&repo_input),
+            conventions,
+            preferences,
+            updated_ts_utc_ms: tc.draw(
+                gs::integers::<i64>().min_value(0).max_value(i64::MAX / 2),
+            ),
+            revision: "v1".into(),
+        }
+    }
+
+    // -- Property: put then get RepoProfile = identity --
+    #[hegel::test(test_cases = 50)]
+    fn prop_repo_profile_roundtrip(tc: TestCase) {
+        let profile = tc.draw(gen_repo_profile());
+        let (db, _dir) = test_db();
+        put_repo_profile(&db, &profile).expect("put");
+        let loaded =
+            get_repo_profile(&db, &profile.repo_id.raw()).expect("get");
+        assert_eq!(profile, loaded);
+    }
+
+    // -- Property: put is idempotent --
+    #[hegel::test(test_cases = 30)]
+    fn prop_repo_profile_put_idempotent(tc: TestCase) {
+        let profile = tc.draw(gen_repo_profile());
+        let (db, _dir) = test_db();
+        put_repo_profile(&db, &profile).expect("put 1");
+        put_repo_profile(&db, &profile).expect("put 2");
+        let loaded =
+            get_repo_profile(&db, &profile.repo_id.raw()).expect("get");
+        assert_eq!(profile, loaded);
+    }
+
+    // -- Unit: get missing profile returns NotFound --
+    #[test]
+    fn test_get_missing_repo_profile() {
+        let (db, _dir) = test_db();
+        let id = RepoId::derive(b"nonexistent");
+        let result = get_repo_profile(&db, &id.raw());
+        assert!(matches!(result, Err(StoreError::NotFound)));
+    }
+
+    // -- Property: update overwrites previous profile --
+    #[hegel::test(test_cases = 30)]
+    fn prop_repo_profile_update_overwrites(tc: TestCase) {
+        let mut profile = tc.draw(gen_repo_profile());
+        let (db, _dir) = test_db();
+        put_repo_profile(&db, &profile).expect("put 1");
+
+        // Mutate and re-put
+        profile.revision = "v2".into();
+        profile.conventions.push(ProfileFact {
+            statement: "added later".into(),
+            evidence: vec![EvidenceRef {
+                episode_id: EpisodeId::derive(b"new-ep"),
+                span_summary: "new".into(),
+            }],
+            first_seen_ts_utc_ms: 5000,
+            last_confirmed_ts_utc_ms: 5000,
+            support_count: 1,
+            confidence: Confidence::Low,
+        });
+        put_repo_profile(&db, &profile).expect("put 2");
+
+        let loaded =
+            get_repo_profile(&db, &profile.repo_id.raw()).expect("get");
+        assert_eq!(loaded.revision, "v2");
+        assert_eq!(loaded.conventions.len(), profile.conventions.len());
     }
 
     // -- Property: RecallEngagement serde round-trip --

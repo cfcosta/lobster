@@ -52,6 +52,7 @@ pub struct LobsterDb {
     pub retrieval_stats: StrDb,
     pub tool_sequences: IdDb,
     pub recall_engagements: IdDb,
+    pub repo_profiles: IdDb,
     pub metadata: StrDb,
 }
 
@@ -130,6 +131,8 @@ fn create_databases(env: &Env) -> Result<LobsterDb, heed::Error> {
         env.create_database(&mut wtxn, Some("tool_sequences"))?;
     let recall_engagements =
         env.create_database(&mut wtxn, Some("recall_engagements"))?;
+    let repo_profiles =
+        env.create_database(&mut wtxn, Some("repo_profiles"))?;
     let metadata = env.create_database(&mut wtxn, Some("metadata"))?;
 
     wtxn.commit()?;
@@ -150,6 +153,7 @@ fn create_databases(env: &Env) -> Result<LobsterDb, heed::Error> {
         retrieval_stats,
         tool_sequences,
         recall_engagements,
+        repo_profiles,
         metadata,
     })
 }

@@ -20,6 +20,7 @@ pub const TABLE_NAMES: &[&str] = &[
     "retrieval_stats",
     "tool_sequences",
     "recall_engagements",
+    "repo_profiles",
     "metadata",
 ];
 
@@ -42,7 +43,7 @@ mod tests {
 
     #[test]
     fn test_table_count() {
-        assert_eq!(TABLE_NAMES.len(), 15);
+        assert_eq!(TABLE_NAMES.len(), 16);
     }
 
     /// Verify all table names correspond to databases on `LobsterDb`.
@@ -50,6 +51,6 @@ mod tests {
     fn test_tables_open_in_memory() {
         let (_db, _dir) =
             crate::store::db::open_in_memory().expect("create in-memory db");
-        // If open_in_memory succeeds, all 15 databases were created.
+        // If open_in_memory succeeds, all 16 databases were created.
     }
 }
