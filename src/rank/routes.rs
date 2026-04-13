@@ -214,7 +214,7 @@ fn search_grafeo(
     let mut model = match crate::embeddings::encoder::load_model() {
         Ok(m) => m,
         Err(e) => {
-            tracing::warn!(error = %e, "ColBERT model not available");
+            tracing::error!(error = %e, "ColBERT model not available — run `lobster install`");
             return candidates;
         }
     };

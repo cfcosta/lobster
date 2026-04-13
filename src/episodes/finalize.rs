@@ -182,11 +182,9 @@ pub async fn finalize_episode_at(
     );
     let policy = crate::embeddings::proxy::policy_for("summary");
 
-    // Embedding requires the ColBERT model. If not installed,
-    // skip embedding (episode still proceeds — retrieval will
-    // use BM25 text search instead of vector similarity).
-    let proxy_vector =
-        if let Ok(mut model) = crate::embeddings::encoder::load_model() {
+    // Encode summary with ColBERT. Model is expected to be installed.
+    let proxy_vector = match crate::embeddings::encoder::load_model() {
+        Ok(mut model) => {
             match crate::embeddings::encoder::encode_text(
                 &mut model,
                 &summary.summary_text,
@@ -201,17 +199,22 @@ pub async fn finalize_episode_at(
                     pv
                 }
                 Err(e) => {
-                    tracing::warn!(
+                    tracing::error!(
                         error = %e,
-                        "ColBERT encoding failed, skipping embedding"
+                        "ColBERT encoding failed — run `lobster install`"
                     );
                     vec![]
                 }
             }
-        } else {
-            tracing::debug!("ColBERT model not installed, skipping embedding");
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "ColBERT model not available — run `lobster install`"
+            );
             vec![]
-        };
+        }
+    };
 
     // ── Steps 6-8: Extract, validate, persist ────────────
     let extractor = RigExtractor;
