@@ -219,6 +219,53 @@ pub struct EmbeddingArtifact {
     pub payload_checksum: [u8; 32],
 }
 
+// ── RecallEngagement (feedback tracking) ────────────────────
+
+/// Tracks whether a recall result was engaged with or ignored.
+///
+/// When lobster surfaces a decision or summary in hook recall, we
+/// record it. If the user's subsequent actions reference the same
+/// entities, that's engagement. If they don't, it's a miss. Episodes
+/// surfaced many times but never acted on should decay in score.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecallEngagement {
+    /// The episode or decision ID that was surfaced.
+    pub surfaced_id: crate::store::ids::RawId,
+    /// Type of artifact that was surfaced ("decision", "summary", "entity").
+    pub artifact_type: String,
+    /// Timestamp when the recall was surfaced.
+    pub surfaced_ts_utc_ms: i64,
+    /// Number of times this artifact has been surfaced.
+    #[serde(default)]
+    pub surface_count: u32,
+    /// Number of times subsequent actions engaged with this artifact.
+    #[serde(default)]
+    pub engagement_count: u32,
+}
+
+impl RecallEngagement {
+    /// Engagement ratio (0.0 = never engaged, 1.0 = always engaged).
+    #[must_use]
+    pub fn engagement_ratio(&self) -> f64 {
+        if self.surface_count == 0 {
+            0.0
+        } else {
+            #[allow(clippy::cast_precision_loss)]
+            let ratio =
+                f64::from(self.engagement_count) / f64::from(self.surface_count);
+            ratio
+        }
+    }
+
+    /// Whether this artifact should be considered "ignored" (surfaced
+    /// multiple times but never or rarely engaged with).
+    #[must_use]
+    pub fn is_ignored(&self, min_surfaces: u32, max_ratio: f64) -> bool {
+        self.surface_count >= min_surfaces
+            && self.engagement_ratio() < max_ratio
+    }
+}
+
 // ── ToolSequence (procedural memory) ────────────────────────
 
 /// A recurring tool-use pattern detected across multiple episodes.

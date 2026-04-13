@@ -17,6 +17,7 @@ use crate::store::{
         Episode,
         ExtractionArtifact,
         RawEvent,
+        RecallEngagement,
         SummaryArtifact,
         Task,
         ToolSequence,
@@ -265,6 +266,59 @@ pub fn list_tool_sequences(db: &Database) -> Vec<ToolSequence> {
     }
 
     results
+}
+
+// ── Recall Engagement ────────────────────────────────────────
+
+pub fn put_recall_engagement(
+    db: &Database,
+    eng: &RecallEngagement,
+) -> Result<(), StoreError> {
+    put_by_id(db, tables::RECALL_ENGAGEMENTS, &eng.surfaced_id, eng)
+}
+
+pub fn get_recall_engagement(
+    db: &Database,
+    surfaced_id: &RawId,
+) -> Result<RecallEngagement, StoreError> {
+    get_by_id(db, tables::RECALL_ENGAGEMENTS, surfaced_id)
+}
+
+/// Record that an artifact was surfaced in recall. Creates or
+/// increments the surface_count.
+pub fn record_surface(
+    db: &Database,
+    surfaced_id: &RawId,
+    artifact_type: &str,
+) -> Result<(), StoreError> {
+    match get_recall_engagement(db, surfaced_id) {
+        Ok(mut eng) => {
+            eng.surface_count += 1;
+            eng.surfaced_ts_utc_ms = chrono::Utc::now().timestamp_millis();
+            put_recall_engagement(db, &eng)
+        }
+        Err(StoreError::NotFound | StoreError::Redb(_)) => {
+            let eng = RecallEngagement {
+                surfaced_id: *surfaced_id,
+                artifact_type: artifact_type.into(),
+                surfaced_ts_utc_ms: chrono::Utc::now().timestamp_millis(),
+                surface_count: 1,
+                engagement_count: 0,
+            };
+            put_recall_engagement(db, &eng)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Record that the user engaged with a previously surfaced artifact.
+pub fn record_engagement(
+    db: &Database,
+    surfaced_id: &RawId,
+) -> Result<(), StoreError> {
+    let mut eng = get_recall_engagement(db, surfaced_id)?;
+    eng.engagement_count += 1;
+    put_recall_engagement(db, &eng)
 }
 
 // ── Repo Config ──────────────────────────────────────────────
@@ -675,5 +729,114 @@ mod tests {
         let id = crate::store::ids::WorkflowId::derive(b"nonexistent");
         let result = get_tool_sequence(&db, &id.raw());
         assert!(matches!(result, Err(StoreError::NotFound)));
+    }
+
+    // ── Recall engagement tests ─────────────────────────────
+
+    #[test]
+    fn test_record_surface_creates() {
+        let db = test_db();
+        let id = RawId::derive("test", b"artifact1");
+        record_surface(&db, &id, "decision").unwrap();
+
+        let eng = get_recall_engagement(&db, &id).unwrap();
+        assert_eq!(eng.surface_count, 1);
+        assert_eq!(eng.engagement_count, 0);
+        assert_eq!(eng.artifact_type, "decision");
+    }
+
+    #[test]
+    fn test_record_surface_increments() {
+        let db = test_db();
+        let id = RawId::derive("test", b"artifact1");
+        record_surface(&db, &id, "decision").unwrap();
+        record_surface(&db, &id, "decision").unwrap();
+        record_surface(&db, &id, "decision").unwrap();
+
+        let eng = get_recall_engagement(&db, &id).unwrap();
+        assert_eq!(eng.surface_count, 3);
+    }
+
+    #[test]
+    fn test_record_engagement() {
+        let db = test_db();
+        let id = RawId::derive("test", b"artifact1");
+        record_surface(&db, &id, "summary").unwrap();
+        record_engagement(&db, &id).unwrap();
+
+        let eng = get_recall_engagement(&db, &id).unwrap();
+        assert_eq!(eng.surface_count, 1);
+        assert_eq!(eng.engagement_count, 1);
+    }
+
+    // -- Property: engagement_ratio is in [0, 1] --
+    #[hegel::test(test_cases = 50)]
+    fn prop_engagement_ratio_bounded(tc: TestCase) {
+        let surface: u32 =
+            tc.draw(gs::integers::<u32>().min_value(0).max_value(100));
+        let engage: u32 =
+            tc.draw(gs::integers::<u32>().min_value(0).max_value(surface));
+
+        let eng = RecallEngagement {
+            surfaced_id: RawId::derive("test", b"x"),
+            artifact_type: "decision".into(),
+            surfaced_ts_utc_ms: 1000,
+            surface_count: surface,
+            engagement_count: engage,
+        };
+        let ratio = eng.engagement_ratio();
+        assert!(
+            (0.0..=1.0).contains(&ratio),
+            "ratio must be in [0,1]: {ratio}"
+        );
+    }
+
+    // -- Property: is_ignored detects low engagement --
+    #[hegel::test(test_cases = 50)]
+    fn prop_ignored_threshold(tc: TestCase) {
+        let surface: u32 =
+            tc.draw(gs::integers::<u32>().min_value(3).max_value(20));
+
+        let eng = RecallEngagement {
+            surfaced_id: RawId::derive("test", b"x"),
+            artifact_type: "decision".into(),
+            surfaced_ts_utc_ms: 1000,
+            surface_count: surface,
+            engagement_count: 0,
+        };
+        // With 0 engagements, ratio is 0.0, which is < any positive threshold
+        assert!(
+            eng.is_ignored(3, 0.1),
+            "zero engagement with {} surfaces should be ignored",
+            surface
+        );
+    }
+
+    // -- Property: RecallEngagement serde round-trip --
+    #[hegel::test(test_cases = 50)]
+    fn prop_recall_engagement_roundtrip(tc: TestCase) {
+        let eng = RecallEngagement {
+            surfaced_id: RawId::derive(
+                "test",
+                &tc.draw(
+                    gs::vecs(gs::integers::<u8>()).min_size(1).max_size(16),
+                ),
+            ),
+            artifact_type: tc.draw(gs::sampled_from(vec![
+                "decision".to_string(),
+                "summary".to_string(),
+                "entity".to_string(),
+            ])),
+            surfaced_ts_utc_ms: tc.draw(
+                gs::integers::<i64>().min_value(0).max_value(i64::MAX / 2),
+            ),
+            surface_count: tc
+                .draw(gs::integers::<u32>().min_value(0).max_value(100)),
+            engagement_count: tc
+                .draw(gs::integers::<u32>().min_value(0).max_value(100)),
+        };
+        let json = serde_json::to_string(&eng).unwrap();
+        let parsed: RecallEngagement = serde_json::from_str(&json).unwrap();
+        assert_eq!(eng, parsed);
     }
 }

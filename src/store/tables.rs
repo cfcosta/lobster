@@ -70,6 +70,10 @@ pub const RETRIEVAL_STATS: TableDefinition<&str, &[u8]> =
 pub const TOOL_SEQUENCES: TableDefinition<&[u8; 16], &[u8]> =
     TableDefinition::new("tool_sequences");
 
+/// Recall engagement tracking, keyed by surfaced artifact ID bytes.
+pub const RECALL_ENGAGEMENTS: TableDefinition<&[u8; 16], &[u8]> =
+    TableDefinition::new("recall_engagements");
+
 /// Global metadata (schema version, last sequence number, etc.).
 pub const METADATA: TableDefinition<&str, &[u8]> =
     TableDefinition::new("metadata");
@@ -94,6 +98,7 @@ mod tests {
             "extraction_artifacts",
             "embedding_artifacts",
             "tool_sequences",
+            "recall_engagements",
             "processing_jobs",
             "projection_metadata",
             "repo_config",
@@ -142,6 +147,9 @@ mod tests {
         write_txn
             .open_table(TOOL_SEQUENCES)
             .expect("tool_sequences");
+        write_txn
+            .open_table(RECALL_ENGAGEMENTS)
+            .expect("recall_engagements");
         write_txn
             .open_table(PROCESSING_JOBS)
             .expect("processing_jobs");
