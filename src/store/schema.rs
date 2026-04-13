@@ -40,6 +40,15 @@ pub enum EventKind {
     TestRun,
     TestResult,
     PlanTransition,
+    // ── Multi-source event kinds ──────────────────────────
+    /// A git commit detected in the repository.
+    GitCommit,
+    /// A CI/CD pipeline result (pass/fail).
+    CiResult,
+    /// An external issue tracker event (created/closed/etc.).
+    IssueEvent,
+    /// A dependency change (added/removed/updated).
+    DependencyChange,
 }
 
 /// A raw hook event as captured from Claude Code.
@@ -591,6 +600,31 @@ mod tests {
         assert_eq!(parsed.mention_count, 0);
     }
 
+    // -- Property: all EventKind variants round-trip through serde --
+    #[test]
+    fn test_all_event_kinds_roundtrip() {
+        for kind in all_event_kinds() {
+            let json = serde_json::to_string(&kind).unwrap();
+            let parsed: EventKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(kind, parsed, "failed for {json}");
+        }
+    }
+
+    // -- Unit: new multi-source event kinds serialize correctly --
+    #[test]
+    fn test_multi_source_event_kinds() {
+        let kinds = [
+            (EventKind::GitCommit, "\"GitCommit\""),
+            (EventKind::CiResult, "\"CiResult\""),
+            (EventKind::IssueEvent, "\"IssueEvent\""),
+            (EventKind::DependencyChange, "\"DependencyChange\""),
+        ];
+        for (kind, expected) in &kinds {
+            let json = serde_json::to_string(kind).unwrap();
+            assert_eq!(&json, expected);
+        }
+    }
+
     #[test]
     fn test_entity_kind_variants() {
         let kinds = [
@@ -700,6 +734,10 @@ mod tests {
             EventKind::TestRun,
             EventKind::TestResult,
             EventKind::PlanTransition,
+            EventKind::GitCommit,
+            EventKind::CiResult,
+            EventKind::IssueEvent,
+            EventKind::DependencyChange,
         ]
     }
 

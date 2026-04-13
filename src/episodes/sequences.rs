@@ -69,6 +69,10 @@ pub fn sequence_label(pattern: &[EventKind]) -> String {
             EventKind::TestRun => "TestRun",
             EventKind::TestResult => "TestResult",
             EventKind::PlanTransition => "Plan",
+            EventKind::GitCommit => "GitCommit",
+            EventKind::CiResult => "CiResult",
+            EventKind::IssueEvent => "IssueEvent",
+            EventKind::DependencyChange => "DepChange",
         })
         .collect::<Vec<_>>()
         .join("→")
