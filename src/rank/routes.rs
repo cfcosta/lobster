@@ -194,177 +194,152 @@ fn load_proxy_vectors(
 
 /// Search Grafeo for candidates matching the query.
 ///
-/// Uses BM25 text search (when indexes exist) plus GQL property
-/// matching as fallback. Returns scored candidates.
-#[allow(clippy::too_many_lines)]
+/// Uses `ColBERT` query encoding with Grafeo hybrid search (BM25 +
+/// vector RRF fusion) and BM25 text search on indexed properties.
 fn search_grafeo(
     grafeo: &GrafeoDB,
     query: &str,
     _route: RetrievalRoute,
 ) -> Vec<ScoredCandidate> {
     let mut candidates = Vec::new();
-    let query_lower = query.to_lowercase();
 
-    // Per spec: "use Grafeo hybrid search to fetch top-K candidates"
-    // Try hybrid search (BM25 + vector) on episode summaries when
-    // proxy vectors exist on nodes. Falls through to BM25-only if
-    // no vector index or no query vector available.
+    // Only attempt ColBERT encoding if the graph has content.
+    // Model loading is expensive (~1s) so skip on empty graphs.
+    let query_vector = if grafeo.node_count() > 0 {
+        encode_query_vector(query)
+    } else {
+        None
+    };
+    let qv_slice = query_vector.as_deref();
+
+    // Hybrid search (BM25 + vector RRF) on episode summaries
     if let Ok(hits) = grafeo.hybrid_search(
         crate::graph::db::labels::EPISODE,
         "summary_text",
         "embedding",
         query,
-        None, // no query vector yet (would need model to encode)
+        qv_slice,
         20,
         None, // default RRF fusion
     ) {
-        for (node_id, _score) in &hits {
-            if let Some(node) = grafeo.get_node(*node_id) {
-                if let Some(id_val) = node.get_property("episode_id") {
-                    if let Some(id_str) = id_val.as_str() {
-                        if let Ok(raw_id) = id_str.parse() {
-                            candidates.push(ScoredCandidate {
-                                id: raw_id,
-                                score: 0.85,
-                                artifact_type: "summary".into(),
-                            });
-                        }
-                    }
-                }
-            }
-        }
+        collect_hits(
+            grafeo,
+            &hits,
+            "episode_id",
+            "summary",
+            0.85,
+            &mut candidates,
+        );
     }
 
-    // BM25 text search on decision statements (uses index)
+    // BM25 text search on decision statements
     if let Ok(hits) = grafeo.text_search(
         crate::graph::db::labels::DECISION,
         "statement",
         query,
         20,
     ) {
-        for (node_id, _distance) in &hits {
-            if let Some(node) = grafeo.get_node(*node_id) {
-                if let Some(id_val) = node.get_property("decision_id") {
-                    if let Some(id_str) = id_val.as_str() {
-                        if let Ok(raw_id) = id_str.parse() {
-                            candidates.push(ScoredCandidate {
-                                id: raw_id,
-                                score: 0.9,
-                                artifact_type: "decision".into(),
-                            });
-                        }
-                    }
-                }
-            }
-        }
+        collect_hits(
+            grafeo,
+            &hits,
+            "decision_id",
+            "decision",
+            0.9,
+            &mut candidates,
+        );
     }
 
-    // Try BM25 text search on episode summaries
+    // BM25 text search on episode summaries (catches cases
+    // where hybrid_search has no vector index yet)
     if let Ok(hits) = grafeo.text_search(
         crate::graph::db::labels::EPISODE,
         "summary_text",
         query,
         20,
     ) {
-        for (node_id, _distance) in &hits {
-            if let Some(node) = grafeo.get_node(*node_id) {
-                if let Some(id_val) = node.get_property("episode_id") {
-                    if let Some(id_str) = id_val.as_str() {
-                        if let Ok(raw_id) = id_str.parse() {
-                            candidates.push(ScoredCandidate {
-                                id: raw_id,
-                                score: 0.8,
-                                artifact_type: "summary".into(),
-                            });
-                        }
-                    }
-                }
-            }
-        }
+        collect_hits(
+            grafeo,
+            &hits,
+            "episode_id",
+            "summary",
+            0.8,
+            &mut candidates,
+        );
     }
 
-    // Fallback: GQL property matching for broader coverage
-    let session = grafeo.session();
-
-    // Search decisions
-    if let Ok(result) =
-        session.execute("MATCH (d:Decision) RETURN d.decision_id, d.statement")
-    {
-        for row in result.iter() {
-            if let (Some(id), Some(stmt)) = (row[0].as_str(), row[1].as_str()) {
-                let stmt_lower = stmt.to_lowercase();
-                // Simple text overlap scoring
-                let overlap = query_lower
-                    .split_whitespace()
-                    .filter(|w| stmt_lower.contains(w))
-                    .count();
-                if overlap > 0 {
-                    #[allow(clippy::cast_precision_loss)]
-                    let score = overlap as f64
-                        / query_lower.split_whitespace().count().max(1) as f64;
-                    if let Ok(raw_id) = id.parse() {
-                        candidates.push(ScoredCandidate {
-                            id: raw_id,
-                            score,
-                            artifact_type: "decision".into(),
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    // Search episode summaries
-    if let Ok(result) = session
-        .execute("MATCH (ep:Episode) RETURN ep.episode_id, ep.summary_text")
-    {
-        for row in result.iter() {
-            if let (Some(id), Some(text)) = (row[0].as_str(), row[1].as_str()) {
-                let text_lower = text.to_lowercase();
-                let overlap = query_lower
-                    .split_whitespace()
-                    .filter(|w| text_lower.contains(w))
-                    .count();
-                if overlap > 0 {
-                    #[allow(clippy::cast_precision_loss)]
-                    let score = overlap as f64
-                        / query_lower.split_whitespace().count().max(1) as f64
-                        * 0.8; // slightly lower than decisions
-                    if let Ok(raw_id) = id.parse() {
-                        candidates.push(ScoredCandidate {
-                            id: raw_id,
-                            score,
-                            artifact_type: "summary".into(),
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    // Search entity nodes
-    if let Ok(result) =
-        session.execute("MATCH (e:Entity) RETURN e.entity_id, e.canonical_name")
-    {
-        for row in result.iter() {
-            if let (Some(id), Some(name)) = (row[0].as_str(), row[1].as_str()) {
-                let name_lower = name.to_lowercase();
-                if query_lower.contains(&name_lower)
-                    || name_lower.contains(&query_lower)
-                {
-                    if let Ok(raw_id) = id.parse() {
-                        candidates.push(ScoredCandidate {
-                            id: raw_id,
-                            score: 0.7,
-                            artifact_type: "entity".into(),
-                        });
-                    }
-                }
-            }
-        }
+    // BM25 text search on entity canonical names
+    if let Ok(hits) = grafeo.text_search(
+        crate::graph::db::labels::ENTITY,
+        "canonical_name",
+        query,
+        20,
+    ) {
+        collect_hits(
+            grafeo,
+            &hits,
+            "entity_id",
+            "entity",
+            0.7,
+            &mut candidates,
+        );
     }
 
     candidates
+}
+
+/// Collect search hits from Grafeo into scored candidates.
+fn collect_hits(
+    grafeo: &GrafeoDB,
+    hits: &[(grafeo::NodeId, f64)],
+    id_property: &str,
+    artifact_type: &str,
+    base_score: f64,
+    candidates: &mut Vec<ScoredCandidate>,
+) {
+    for (node_id, _score) in hits {
+        if let Some(node) = grafeo.get_node(*node_id) {
+            if let Some(id_val) = node.get_property(id_property) {
+                if let Some(id_str) = id_val.as_str() {
+                    if let Ok(raw_id) = id_str.parse() {
+                        candidates.push(ScoredCandidate {
+                            id: raw_id,
+                            score: base_score,
+                            artifact_type: artifact_type.into(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Try to encode a query string with `ColBERT` for vector search.
+///
+/// Returns the pooled proxy vector, or `None` if the model is
+/// unavailable. Loads the model once per call (acceptable for the
+/// MCP/hook paths that call this infrequently).
+fn encode_query_vector(query: &str) -> Option<Vec<f32>> {
+    let mut model = crate::embeddings::encoder::load_model().ok()?;
+    let texts = vec![query.to_string()];
+    let embeddings = model.encode(&texts, true).ok()?;
+
+    // Mean-pool the query token embeddings into a single proxy vector
+    let shape = embeddings.shape();
+    let dims = shape.dims();
+    if dims.len() < 2 {
+        return None;
+    }
+    let n_dims = *dims.last()?;
+    let flat: Vec<f32> = embeddings
+        .flatten(0, dims.len() - 2)
+        .ok()?
+        .to_vec2::<f32>()
+        .ok()?
+        .into_iter()
+        .flatten()
+        .collect();
+
+    Some(crate::embeddings::proxy::mean_pool(&flat, n_dims))
 }
 
 #[cfg(test)]

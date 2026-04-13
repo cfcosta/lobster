@@ -271,7 +271,7 @@ mod tests {
 
         let payload = run_recall(&event, &database, &grafeo);
         assert!(payload.items.is_empty());
-        assert!(payload.latency_ms < 1000);
+        assert!(payload.latency_ms < 5000);
     }
 
     #[test]

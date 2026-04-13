@@ -1,7 +1,7 @@
-//! `PyLate` `MaxSim` reranking.
+//! `PyLate` `ColBERT` reranking.
 //!
-//! When `late_interaction_bytes` are available, compute exact `MaxSim`
-//! similarity. Otherwise fall back to pooled-vector cosine.
+//! Encodes the query with `ColBERT` and computes cosine similarity
+//! against candidate proxy vectors for reranking.
 
 use redb::Database;
 
@@ -13,8 +13,9 @@ use crate::{
 
 /// Compute the reranking score for a candidate.
 ///
-/// Uses `MaxSim` late-interaction when available, otherwise cosine
-/// on pooled proxy vectors.
+/// Encodes the query with `ColBERT` to produce a proxy vector, then
+/// computes cosine similarity against the candidate's stored proxy
+/// vector. Returns 0.0 if the model or embeddings are unavailable.
 #[must_use]
 pub fn rerank_score(
     db: &Database,
@@ -26,25 +27,43 @@ pub fn rerank_score(
         return 0.0;
     };
 
-    // If late_interaction_bytes exist, we could compute MaxSim
-    // with a query encoding. For now, use the pooled proxy
-    // vector as the reranking signal (the model would need to
-    // be loaded to encode the query for exact MaxSim).
-    let proxy = proxy::bytes_to_vector(&emb.pooled_vector_bytes);
-    if proxy.is_empty() {
+    let doc_proxy = proxy::bytes_to_vector(&emb.pooled_vector_bytes);
+    if doc_proxy.is_empty() {
         return 0.0;
     }
 
-    // Create a simple query vector from the text for comparison
-    let query_bytes: Vec<f32> =
-        query_text.bytes().map(|b| f32::from(b) / 255.0).collect();
-    let dims = proxy.len();
-    let padded_len = query_bytes.len().div_ceil(dims) * dims;
-    let mut padded = query_bytes;
-    padded.resize(padded_len, 0.0);
-    let query_proxy = proxy::mean_pool(&padded, dims);
+    // Encode query with ColBERT for a real semantic proxy vector
+    let Some(query_proxy) = encode_query_proxy(query_text) else {
+        return 0.0;
+    };
 
-    cosine_similarity(&query_proxy, &proxy)
+    cosine_similarity(&query_proxy, &doc_proxy)
+}
+
+/// Encode a query string into a proxy vector using `ColBERT`.
+///
+/// Returns `None` if the model is unavailable.
+fn encode_query_proxy(query_text: &str) -> Option<Vec<f32>> {
+    let mut model = crate::embeddings::encoder::load_model().ok()?;
+    let texts = vec![query_text.to_string()];
+    let embeddings = model.encode(&texts, true).ok()?;
+
+    let shape = embeddings.shape();
+    let dims = shape.dims();
+    if dims.len() < 2 {
+        return None;
+    }
+    let n_dims = *dims.last()?;
+    let flat: Vec<f32> = embeddings
+        .flatten(0, dims.len() - 2)
+        .ok()?
+        .to_vec2::<f32>()
+        .ok()?
+        .into_iter()
+        .flatten()
+        .collect();
+
+    Some(proxy::mean_pool(&flat, n_dims))
 }
 
 #[cfg(test)]
@@ -83,10 +102,58 @@ mod tests {
         crud::put_embedding_artifact(&database, &art).unwrap();
 
         let score = rerank_score(&database, "test query", &id.raw());
-        // Should produce a non-zero similarity
+        // When model is available: real cosine similarity in [-1, 1]
+        // When model is unavailable: returns 0.0 (graceful fallback)
         assert!(
-            score > -1.0 && score <= 1.0,
+            (-1.0..=1.0).contains(&score),
             "score should be in valid range: {score}"
+        );
+    }
+
+    #[test]
+    fn test_rerank_with_model() {
+        if crate::embeddings::encoder::load_model().is_err() {
+            eprintln!("skipping test_rerank_with_model: model not installed");
+            return;
+        }
+
+        let database = db::open_in_memory().unwrap();
+
+        // Encode a real document and store its proxy
+        let mut model =
+            crate::embeddings::encoder::load_model().unwrap();
+        let texts = vec!["Use redb for ACID storage".to_string()];
+        let emb = model.encode(&texts, false).unwrap();
+        let shape = emb.shape();
+        let n_dims = *shape.dims().last().unwrap();
+        let flat: Vec<f32> = emb
+            .flatten(0, shape.dims().len() - 2)
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .collect();
+        let doc_proxy = proxy::mean_pool(&flat, n_dims);
+
+        let id = ArtifactId::derive(b"real-test");
+        let art = EmbeddingArtifact {
+            artifact_id: id,
+            revision: "test".into(),
+            backend: EmbeddingBackend::Cpu,
+            quantization: None,
+            pooled_vector_bytes: proxy::vector_to_bytes(&doc_proxy),
+            late_interaction_bytes: None,
+            payload_checksum: [0; 32],
+        };
+        crud::put_embedding_artifact(&database, &art).unwrap();
+
+        // Query about the same topic should have positive similarity
+        let score =
+            rerank_score(&database, "redb storage ACID", &id.raw());
+        assert!(
+            score > 0.0,
+            "same-topic query should have positive similarity: {score}"
         );
     }
 }
