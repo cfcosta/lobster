@@ -285,7 +285,7 @@ pub fn get_recall_engagement(
 }
 
 /// Record that an artifact was surfaced in recall. Creates or
-/// increments the surface_count.
+/// increments the `surface_count`.
 pub fn record_surface(
     db: &Database,
     surfaced_id: &RawId,
@@ -807,8 +807,7 @@ mod tests {
         // With 0 engagements, ratio is 0.0, which is < any positive threshold
         assert!(
             eng.is_ignored(3, 0.1),
-            "zero engagement with {} surfaces should be ignored",
-            surface
+            "zero engagement with {surface} surfaces should be ignored"
         );
     }
 

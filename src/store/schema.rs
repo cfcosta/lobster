@@ -720,7 +720,7 @@ mod tests {
 
     // -- ToolSequence generators and property tests --
 
-    /// All EventKind variants for generation.
+    /// All `EventKind` variants for generation.
     fn all_event_kinds() -> Vec<EventKind> {
         vec![
             EventKind::UserPromptSubmit,

@@ -205,11 +205,11 @@ pub fn memory_search(
                                     )
                                 });
                             (
-                                ts_detail.or(Some(e.canonical_name.clone())),
+                                ts_detail.or(Some(e.canonical_name)),
                                 None,
                             )
                         }
-                        Ok(e) => (Some(e.canonical_name.clone()), None),
+                        Ok(e) => (Some(e.canonical_name), None),
                         Err(_) => (None, None),
                     }
                 }

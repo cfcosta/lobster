@@ -187,8 +187,8 @@ mod tests {
             tc.draw(gs::integers::<usize>().min_value(2).max_value(5));
         // Make diagonal the highest values
         let mut scores = vec![vec![0.5_f32; n]; n];
-        for i in 0..n {
-            scores[i][i] = 100.0; // self-similarity is huge
+        for (i, row) in scores.iter_mut().enumerate() {
+            row[i] = 100.0; // self-similarity is huge
         }
         let sim = PairwiseSimilarity { scores, n };
 
