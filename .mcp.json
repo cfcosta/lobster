@@ -3,6 +3,10 @@
     "lobster": {
       "command": "/home/cfcosta/Code/cfcosta/lobster/target/release/lobster",
       "args": ["mcp"]
+    },
+    "docbert": {
+      "command": "docbert",
+      "args": ["mcp"]
     }
   }
 }

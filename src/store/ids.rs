@@ -183,6 +183,12 @@ typed_id!(
     "artifact"
 );
 
+typed_id!(
+    /// Identifies a detected recurring tool-use workflow.
+    WorkflowId,
+    "workflow"
+);
+
 #[cfg(test)]
 mod tests {
     use hegel::{TestCase, generators as gs};
