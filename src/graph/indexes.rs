@@ -29,6 +29,7 @@ pub fn ensure_indexes(grafeo: &GrafeoDB) {
         Some("cosine"), // cosine similarity
         None,           // default M
         None,           // default ef_construction
+        None,           // no quantization
     );
 
     // Property indexes for fast filtering

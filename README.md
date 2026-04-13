@@ -92,7 +92,7 @@ When running `lobster mcp`, these tools are available:
 | `ANTHROPIC_API_KEY` | One of these | —                   | Anthropic API key |
 | `OPENAI_API_KEY`    | required     | —                   | OpenAI API key    |
 | `ANTHROPIC_MODEL`   | No           | `claude-sonnet-4-6` | Anthropic model   |
-| `OPENAI_MODEL`      | No           | `gpt-5.4-mini`       | OpenAI model      |
+| `OPENAI_MODEL`      | No           | `gpt-5.4-mini`      | OpenAI model      |
 
 ## Architecture
 
