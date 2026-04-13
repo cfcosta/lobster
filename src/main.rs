@@ -175,7 +175,7 @@ fn try_hook_recall(
     }
 }
 
-#[allow(clippy::unused_async)]
+#[allow(clippy::unused_async, clippy::too_many_lines)]
 async fn cmd_mcp(storage_dir: &std::path::Path) -> Result<()> {
     std::fs::create_dir_all(storage_dir).context("create storage dir")?;
 
@@ -271,8 +271,11 @@ async fn cmd_mcp(storage_dir: &std::path::Path) -> Result<()> {
     // Spawn dreaming scheduler in a background task.
     // Per spec: "dreaming belongs to the long-lived process"
     let dream_db = db.clone();
+    let dream_grafeo = grafeo.clone();
     let _dreaming = tokio::spawn(async move {
         let config = lobster::dream::scheduler::DreamConfig::default();
+        let pattern_config =
+            lobster::dream::patterns::PatternConfig::default();
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             let result =
@@ -283,6 +286,24 @@ async fn cmd_mcp(storage_dir: &std::path::Path) -> Result<()> {
                     succeeded = result.retries_succeeded,
                     failed = result.episodes_failed_final,
                     "dreaming cycle completed"
+                );
+            }
+
+            // Run workflow pattern mining
+            let wf_result =
+                lobster::dream::workers::scan_workflow_patterns(
+                    &dream_db,
+                    &dream_grafeo,
+                    &pattern_config,
+                );
+            if wf_result.workflows_created > 0
+                || wf_result.workflows_updated > 0
+            {
+                tracing::info!(
+                    scanned = wf_result.episodes_scanned,
+                    created = wf_result.workflows_created,
+                    updated = wf_result.workflows_updated,
+                    "workflow mining completed"
                 );
             }
         }

@@ -1,8 +1,10 @@
 //! Background maintenance workers.
 //!
 //! Each worker handles a specific type of maintenance task:
-//! entity merge proposals, task timeline updates, noise flagging.
+//! entity merge proposals, task timeline updates, noise flagging,
+//! and workflow pattern detection.
 
+use grafeo::GrafeoDB;
 use redb::{Database, ReadableDatabase, ReadableTable};
 
 use crate::store::{
@@ -83,6 +85,232 @@ pub fn find_duplicate_entities(db: &Database) -> Vec<(String, Vec<RawId>)> {
         .into_iter()
         .filter(|(_, ids)| ids.len() > 1)
         .collect()
+}
+
+/// Result of a workflow mining pass.
+#[derive(Debug, Default)]
+pub struct WorkflowMiningResult {
+    /// Number of episodes scanned.
+    pub episodes_scanned: usize,
+    /// Number of new workflows created.
+    pub workflows_created: usize,
+    /// Number of existing workflows updated with new sources.
+    pub workflows_updated: usize,
+}
+
+/// Mine recurring tool-use patterns across Ready episodes and
+/// promote them into `Workflow` entities and `ToolSequence` artifacts.
+///
+/// This worker:
+/// 1. Loads all Ready episodes
+/// 2. Extracts their tool-use sequences from raw events
+/// 3. Runs n-gram pattern detection
+/// 4. For patterns above threshold, creates `Workflow` entities and
+///    `ToolSequence` artifacts (or updates existing ones)
+/// 5. Projects workflow entities into Grafeo with edges to episodes
+///
+/// The worker is idempotent: running it twice produces the same
+/// graph state.
+#[allow(clippy::too_many_lines)]
+pub fn scan_workflow_patterns(
+    db: &Database,
+    grafeo: &GrafeoDB,
+    config: &super::patterns::PatternConfig,
+) -> WorkflowMiningResult {
+    use crate::{
+        dream::patterns::detect_patterns,
+        episodes::sequences::{extract_event_sequence, sequence_label},
+        store::{
+            crud,
+            ids::{EntityId, RepoId, WorkflowId},
+            schema::{
+                Entity, EntityKind, Episode, ProcessingState, ToolSequence,
+            },
+        },
+    };
+
+    let mut result = WorkflowMiningResult::default();
+
+    // 1. Load all Ready episodes
+    let Ok(read_txn) = db.begin_read() else {
+        return result;
+    };
+    let Ok(table) = read_txn.open_table(tables::EPISODES) else {
+        return result;
+    };
+    let Ok(iter) = table.iter() else {
+        return result;
+    };
+
+    let mut episodes: Vec<Episode> = Vec::new();
+    for entry in iter.flatten() {
+        let (_, value) = entry;
+        if let Ok(ep) = serde_json::from_slice::<Episode>(value.value()) {
+            if ep.processing_state == ProcessingState::Ready {
+                episodes.push(ep);
+            }
+        }
+    }
+    // Drop the read transaction before we write
+    drop(table);
+    drop(read_txn);
+
+    result.episodes_scanned = episodes.len();
+
+    if episodes.len() < config.min_frequency {
+        return result;
+    }
+
+    // 2. Extract tool-use sequences
+    let sequences: Vec<Vec<crate::store::schema::EventKind>> = episodes
+        .iter()
+        .map(|ep| extract_event_sequence(db, ep.start_seq, ep.end_seq))
+        .collect();
+
+    // 3. Run pattern detection
+    let patterns = detect_patterns(&sequences, config);
+
+    if patterns.is_empty() {
+        return result;
+    }
+
+    // Get existing workflows to check for duplicates
+    let existing = crud::list_tool_sequences(db);
+
+    // Determine the repo_id from the first episode
+    let repo_id = episodes
+        .first()
+        .map_or_else(|| RepoId::derive(b"unknown"), |ep| ep.repo_id);
+
+    // 4. For each detected pattern, create or update
+    for detected in &patterns {
+        // Derive a content-addressed workflow ID from the pattern
+        let pattern_bytes: Vec<u8> = detected
+            .pattern
+            .iter()
+            .flat_map(|k| serde_json::to_vec(k).unwrap_or_default())
+            .collect();
+        let workflow_id = WorkflowId::derive(&pattern_bytes);
+
+        // Map source indices back to episode IDs
+        let source_episodes: Vec<_> = detected
+            .source_indices
+            .iter()
+            .filter_map(|&idx| episodes.get(idx).map(|ep| ep.episode_id))
+            .collect();
+
+        // Check if this pattern already exists
+        let already_exists = existing
+            .iter()
+            .any(|ts| ts.workflow_id == workflow_id);
+
+        if already_exists {
+            // Update: merge new source episodes
+            if let Ok(mut existing_ts) =
+                crud::get_tool_sequence(db, &workflow_id.raw())
+            {
+                let mut changed = false;
+                for ep_id in &source_episodes {
+                    if !existing_ts.source_episodes.contains(ep_id) {
+                        existing_ts.source_episodes.push(*ep_id);
+                        changed = true;
+                    }
+                }
+                if changed {
+                    #[allow(clippy::cast_possible_truncation)]
+                    {
+                        existing_ts.frequency =
+                            existing_ts.source_episodes.len() as u32;
+                    }
+                    let _ = crud::put_tool_sequence(db, &existing_ts);
+                    result.workflows_updated += 1;
+                }
+            }
+        } else {
+            // Create new workflow
+            let label = sequence_label(&detected.pattern);
+            let now_ms = chrono::Utc::now().timestamp_millis();
+
+            let ts = ToolSequence {
+                workflow_id,
+                repo_id,
+                pattern: detected.pattern.clone(),
+                label: label.clone(),
+                #[allow(clippy::cast_possible_truncation)]
+                frequency: detected.frequency as u32,
+                source_episodes: source_episodes.clone(),
+                detected_ts_utc_ms: now_ms,
+            };
+
+            if crud::put_tool_sequence(db, &ts).is_ok() {
+                // Also create a Workflow entity
+                let entity = Entity {
+                    entity_id: EntityId::derive(
+                        &workflow_id.raw().as_bytes()[..],
+                    ),
+                    repo_id,
+                    kind: EntityKind::Workflow,
+                    canonical_name: label,
+                };
+                let _ = crud::put_entity(db, &entity);
+
+                // 5. Project into Grafeo
+                project_workflow_to_grafeo(
+                    grafeo,
+                    &ts,
+                    &entity,
+                    &source_episodes,
+                );
+
+                result.workflows_created += 1;
+            }
+        }
+    }
+
+    result
+}
+
+/// Project a workflow entity and its episode links into Grafeo.
+fn project_workflow_to_grafeo(
+    grafeo: &GrafeoDB,
+    ts: &crate::store::schema::ToolSequence,
+    entity: &Entity,
+    source_episodes: &[crate::store::ids::EpisodeId],
+) {
+    use crate::graph::db::labels;
+
+    // Create the workflow node
+    let session = grafeo.session();
+    let pattern_str = ts
+        .pattern
+        .iter()
+        .map(|k| format!("{k:?}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let query = format!(
+        "CREATE (w:{} {{entity_id: '{}', canonical_name: '{}', \
+         kind: 'Workflow', pattern: '{}', frequency: {}}})",
+        labels::ENTITY,
+        entity.entity_id,
+        entity.canonical_name,
+        pattern_str,
+        ts.frequency
+    );
+    let _ = session.execute(&query);
+
+    // Link to source episodes
+    for ep_id in source_episodes {
+        let edge_query = format!(
+            "MATCH (w:{} {{entity_id: '{}'}}), \
+             (ep:{} {{episode_id: '{}'}}) \
+             CREATE (w)-[:OBSERVED_IN]->(ep)",
+            labels::ENTITY,
+            entity.entity_id,
+            labels::EPISODE,
+            ep_id
+        );
+        let _ = session.execute(&edge_query);
+    }
 }
 
 #[cfg(test)]
@@ -169,5 +397,187 @@ mod tests {
         let dupes = find_duplicate_entities(&database);
         assert_eq!(dupes.len(), 1);
         assert_eq!(dupes[0].1.len(), 2);
+    }
+
+    // ── Workflow mining tests ───────────────────────────────
+
+    use crate::{
+        dream::patterns::PatternConfig,
+        graph::db as grafeo_db,
+        store::schema::{EventKind, ProcessingState, RawEvent},
+    };
+
+    /// Create a Ready episode with raw events of the given kinds.
+    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+    fn setup_episode_with_events(
+        database: &redb::Database,
+        ep_suffix: &[u8],
+        start_seq: u64,
+        kinds: &[EventKind],
+    ) {
+        let ep = crate::store::schema::Episode {
+            episode_id: EpisodeId::derive(ep_suffix),
+            repo_id: RepoId::derive(b"repo"),
+            start_seq,
+            end_seq: start_seq + kinds.len().saturating_sub(1) as u64,
+            task_id: None,
+            processing_state: ProcessingState::Ready,
+            finalized_ts_utc_ms: 1_700_000_000_000,
+            retry_count: 0,
+            is_noisy: false,
+        };
+        crud::put_episode(database, &ep).unwrap();
+
+        for (i, kind) in kinds.iter().enumerate() {
+            let event = RawEvent {
+                seq: start_seq + i as u64,
+                repo_id: RepoId::derive(b"repo"),
+                ts_utc_ms: 1_700_000_000_000 + i as i64,
+                event_kind: kind.clone(),
+                payload_hash: [0u8; 32],
+                payload_bytes: vec![],
+            };
+            crud::append_raw_event(database, &event).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_workflow_mining_empty_db() {
+        let database = db::open_in_memory().unwrap();
+        let grafeo = grafeo_db::new_in_memory();
+        let config = PatternConfig::default();
+
+        let result = scan_workflow_patterns(&database, &grafeo, &config);
+        assert_eq!(result.episodes_scanned, 0);
+        assert_eq!(result.workflows_created, 0);
+    }
+
+    #[test]
+    fn test_workflow_mining_detects_recurring_pattern() {
+        let database = db::open_in_memory().unwrap();
+        let grafeo = grafeo_db::new_in_memory();
+
+        // Same tool sequence in 3 episodes
+        let pattern = [
+            EventKind::FileEdit,
+            EventKind::TestRun,
+            EventKind::TestResult,
+        ];
+        setup_episode_with_events(&database, b"ep1", 0, &pattern);
+        setup_episode_with_events(&database, b"ep2", 100, &pattern);
+        setup_episode_with_events(&database, b"ep3", 200, &pattern);
+
+        let config = PatternConfig {
+            min_frequency: 2,
+            ..PatternConfig::default()
+        };
+        let result = scan_workflow_patterns(&database, &grafeo, &config);
+
+        assert_eq!(result.episodes_scanned, 3);
+        assert!(
+            result.workflows_created >= 1,
+            "should detect at least one workflow"
+        );
+
+        // Verify stored in redb
+        let stored = crud::list_tool_sequences(&database);
+        assert!(
+            !stored.is_empty(),
+            "workflows should be persisted to redb"
+        );
+    }
+
+    #[test]
+    fn test_workflow_mining_idempotent() {
+        let database = db::open_in_memory().unwrap();
+        let grafeo = grafeo_db::new_in_memory();
+
+        let pattern = [EventKind::ToolUse, EventKind::FileWrite];
+        setup_episode_with_events(&database, b"ep1", 0, &pattern);
+        setup_episode_with_events(&database, b"ep2", 100, &pattern);
+
+        let config = PatternConfig::default();
+
+        // Run twice
+        let r1 = scan_workflow_patterns(&database, &grafeo, &config);
+        let r2 = scan_workflow_patterns(&database, &grafeo, &config);
+
+        // Second run should not create new workflows
+        assert_eq!(r2.workflows_created, 0);
+        // Total stored should be same as after first run
+        let stored = crud::list_tool_sequences(&database);
+        assert_eq!(stored.len(), r1.workflows_created);
+    }
+
+    #[test]
+    fn test_workflow_mining_below_threshold() {
+        let database = db::open_in_memory().unwrap();
+        let grafeo = grafeo_db::new_in_memory();
+
+        // Only 1 episode — can't meet min_frequency=2
+        let pattern = [EventKind::FileEdit, EventKind::TestRun];
+        setup_episode_with_events(&database, b"ep1", 0, &pattern);
+
+        let config = PatternConfig::default();
+        let result = scan_workflow_patterns(&database, &grafeo, &config);
+
+        assert_eq!(result.episodes_scanned, 1);
+        assert_eq!(result.workflows_created, 0);
+    }
+
+    // -- Property: worker only creates workflows for patterns
+    //    meeting threshold --
+    #[hegel::test(test_cases = 30)]
+    fn prop_workflows_meet_threshold(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+
+        let database = db::open_in_memory().unwrap();
+        let grafeo = grafeo_db::new_in_memory();
+
+        let n_eps: usize =
+            tc.draw(gs::integers::<usize>().min_value(2).max_value(5));
+        let kinds_pool = vec![
+            EventKind::FileEdit,
+            EventKind::TestRun,
+            EventKind::TestResult,
+            EventKind::ToolUse,
+            EventKind::FileWrite,
+        ];
+
+        for i in 0..n_eps {
+            let len: usize =
+                tc.draw(gs::integers::<usize>().min_value(2).max_value(6));
+            let mut kinds = Vec::with_capacity(len);
+            for _ in 0..len {
+                kinds.push(tc.draw(gs::sampled_from(kinds_pool.clone())));
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            setup_episode_with_events(
+                &database,
+                &(i as u32).to_le_bytes(),
+                (i * 1000) as u64,
+                &kinds,
+            );
+        }
+
+        let min_freq: usize =
+            tc.draw(gs::integers::<usize>().min_value(2).max_value(n_eps));
+        let config = PatternConfig {
+            min_frequency: min_freq,
+            ..PatternConfig::default()
+        };
+
+        let _ = scan_workflow_patterns(&database, &grafeo, &config);
+
+        let stored = crud::list_tool_sequences(&database);
+        for ts in &stored {
+            assert!(
+                ts.frequency as usize >= min_freq,
+                "workflow {} has frequency {} < min {}",
+                ts.workflow_id,
+                ts.frequency,
+                min_freq
+            );
+        }
     }
 }
