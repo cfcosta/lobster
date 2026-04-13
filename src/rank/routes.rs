@@ -257,6 +257,16 @@ fn search_exact(
     ) {
         collect_hits(grafeo, &hits, "entity_id", "entity", candidates);
     }
+
+    // BM25 text search on task titles
+    if let Ok(hits) = grafeo.text_search(
+        crate::graph::db::labels::TASK,
+        "title",
+        query,
+        20,
+    ) {
+        collect_hits(grafeo, &hits, "task_id", "task", candidates);
+    }
 }
 
 /// Hybrid route: `ColBERT` query encoding + hybrid search on
@@ -311,6 +321,16 @@ fn search_hybrid(
         20,
     ) {
         collect_hits(grafeo, &hits, "entity_id", "entity", candidates);
+    }
+
+    // BM25 text search on tasks
+    if let Ok(hits) = grafeo.text_search(
+        crate::graph::db::labels::TASK,
+        "title",
+        query,
+        20,
+    ) {
+        collect_hits(grafeo, &hits, "task_id", "task", candidates);
     }
 }
 

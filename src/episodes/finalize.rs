@@ -107,13 +107,24 @@ pub async fn finalize_episode_at(
             .into_bytes(),
     );
 
+    // Derive task_id upfront so it can be set on the episode and decisions
+    let task_id = task_title.as_ref().and_then(|title| {
+        if title.is_empty() {
+            None
+        } else {
+            Some(crate::store::ids::TaskId::derive(
+                format!("{repo_path}:{title}").as_bytes(),
+            ))
+        }
+    });
+
     // ── Step 1: Persist episode shell as Pending ─────────
     let episode = Episode {
         episode_id,
         repo_id,
         start_seq: episode_seq_start,
         end_seq: episode_seq_end,
-        task_id: None,
+        task_id,
         processing_state: ProcessingState::Pending,
         finalized_ts_utc_ms: now_ms,
         retry_count: 0,
@@ -159,13 +170,10 @@ pub async fn finalize_episode_at(
     let mut created_decisions: Vec<Decision> = Vec::new();
 
     // ── Step 5b: Create/update Task record if task_title present
-    if let Some(title) = &task_title {
-        if !title.is_empty() {
-            let task_id = crate::store::ids::TaskId::derive(
-                format!("{repo_path}:{title}").as_bytes(),
-            );
+    if let Some(tid) = task_id {
+        if let Some(title) = &task_title {
             let task = crate::store::schema::Task {
-                task_id,
+                task_id: tid,
                 repo_id,
                 title: title.clone(),
                 status: crate::store::schema::TaskStatus::Open,
@@ -289,7 +297,7 @@ pub async fn finalize_episode_at(
             ),
             repo_id,
             episode_id,
-            task_id: None,
+            task_id,
             statement: ext_dec.statement.clone(),
             rationale: ext_dec.rationale.clone(),
             confidence: conf,

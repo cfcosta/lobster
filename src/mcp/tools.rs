@@ -37,6 +37,8 @@ fn load_artifact_text(
                 }
             },
         ),
+        "task" => crud::get_task(db, id)
+            .map_or_else(|_| format!("task:{id}"), |t| t.title),
         other => format!("{other}:{id}"),
     }
 }
