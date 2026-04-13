@@ -196,6 +196,9 @@ fn load_proxy_vectors(
 ///
 /// Uses `ColBERT` query encoding with Grafeo hybrid search (BM25 +
 /// vector RRF fusion) and BM25 text search on indexed properties.
+///
+/// Assumes `ColBERT` model is installed. Returns empty results on
+/// an empty graph.
 fn search_grafeo(
     grafeo: &GrafeoDB,
     query: &str,
@@ -203,14 +206,21 @@ fn search_grafeo(
 ) -> Vec<ScoredCandidate> {
     let mut candidates = Vec::new();
 
-    // Only attempt ColBERT encoding if the graph has content.
-    // Model loading is expensive (~1s) so skip on empty graphs.
-    let query_vector = if grafeo.node_count() > 0 {
-        encode_query_vector(query)
-    } else {
-        None
+    if grafeo.node_count() == 0 {
+        return candidates;
+    }
+
+    // Encode the query with ColBERT. Model must be installed.
+    let mut model = match crate::embeddings::encoder::load_model() {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(error = %e, "ColBERT model not available");
+            return candidates;
+        }
     };
-    let qv_slice = query_vector.as_deref();
+    let query_vector =
+        crate::embeddings::encoder::encode_query(&mut model, query);
+    let qv_ref = query_vector.as_ref().ok().map(Vec::as_slice);
 
     // Hybrid search (BM25 + vector RRF) on episode summaries
     if let Ok(hits) = grafeo.hybrid_search(
@@ -218,9 +228,9 @@ fn search_grafeo(
         "summary_text",
         "embedding",
         query,
-        qv_slice,
+        qv_ref,
         20,
-        None, // default RRF fusion
+        None,
     ) {
         collect_hits(
             grafeo,
@@ -245,24 +255,6 @@ fn search_grafeo(
             "decision_id",
             "decision",
             0.9,
-            &mut candidates,
-        );
-    }
-
-    // BM25 text search on episode summaries (catches cases
-    // where hybrid_search has no vector index yet)
-    if let Ok(hits) = grafeo.text_search(
-        crate::graph::db::labels::EPISODE,
-        "summary_text",
-        query,
-        20,
-    ) {
-        collect_hits(
-            grafeo,
-            &hits,
-            "episode_id",
-            "summary",
-            0.8,
             &mut candidates,
         );
     }
@@ -311,35 +303,6 @@ fn collect_hits(
             }
         }
     }
-}
-
-/// Try to encode a query string with `ColBERT` for vector search.
-///
-/// Returns the pooled proxy vector, or `None` if the model is
-/// unavailable. Loads the model once per call (acceptable for the
-/// MCP/hook paths that call this infrequently).
-fn encode_query_vector(query: &str) -> Option<Vec<f32>> {
-    let mut model = crate::embeddings::encoder::load_model().ok()?;
-    let texts = vec![query.to_string()];
-    let embeddings = model.encode(&texts, true).ok()?;
-
-    // Mean-pool the query token embeddings into a single proxy vector
-    let shape = embeddings.shape();
-    let dims = shape.dims();
-    if dims.len() < 2 {
-        return None;
-    }
-    let n_dims = *dims.last()?;
-    let flat: Vec<f32> = embeddings
-        .flatten(0, dims.len() - 2)
-        .ok()?
-        .to_vec2::<f32>()
-        .ok()?
-        .into_iter()
-        .flatten()
-        .collect();
-
-    Some(crate::embeddings::proxy::mean_pool(&flat, n_dims))
 }
 
 #[cfg(test)]

@@ -87,6 +87,24 @@ pub fn encode_text(
     })
 }
 
+/// Encode a query string into a pooled proxy vector for search.
+///
+/// Uses query-mode encoding (`is_query=true`) and mean-pools the
+/// per-token embeddings into a single dense vector.
+///
+/// # Errors
+///
+/// Returns an error if the model is not installed or encoding fails.
+pub fn encode_query(model: &mut ColBERT, query: &str) -> Result<Vec<f32>> {
+    let texts = vec![query.to_string()];
+    let embeddings = model
+        .encode(&texts, true)
+        .context("ColBERT query encode failed")?;
+
+    let proxy = mean_pool_tensor(&embeddings)?;
+    Ok(crate::embeddings::proxy::bytes_to_vector(&proxy))
+}
+
 /// Mean-pool a candle Tensor [1, tokens, dims] into a proxy vector.
 fn mean_pool_tensor(tensor: &candle_core::Tensor) -> Result<Vec<u8>> {
     let shape = tensor.shape();
