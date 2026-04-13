@@ -60,7 +60,10 @@ impl Extractor for RigExtractor {
              - Output ONLY valid JSON, no markdown fences or prose.\n\
              - Only extract what is explicitly stated. Do not invent.\n\
              - If nothing meaningful was decided, return an empty \"decisions\" array.\n\
-             - Prefer fewer, higher-quality items over exhaustive extraction.",
+             - Prefer fewer, higher-quality items over exhaustive extraction.\n\
+             - IMPORTANT: Only extract entities that belong to or are directly relevant to the repository shown above.\n\
+               Do NOT extract entities from other projects, test fixtures, or example code from unrelated domains.\n\
+               If the session references code from another repository, ignore those entities.",
             &prompt,
         )
         .await
