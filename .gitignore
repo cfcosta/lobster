@@ -1,2 +1,3 @@
 /target
-.lobster/
+/.lobster
+/result
