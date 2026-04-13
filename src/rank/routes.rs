@@ -356,6 +356,8 @@ fn expand_graph_neighbors(
 /// Collect search hits from Grafeo into scored candidates.
 ///
 /// Uses the actual score returned by Grafeo's BM25/hybrid search.
+/// Deduplicates by `RawId`, keeping the higher score when the same
+/// artifact appears from multiple search paths.
 fn collect_hits(
     grafeo: &GrafeoDB,
     hits: &[(grafeo::NodeId, f64)],
@@ -368,11 +370,21 @@ fn collect_hits(
             if let Some(id_val) = node.get_property(id_property) {
                 if let Some(id_str) = id_val.as_str() {
                     if let Ok(raw_id) = id_str.parse() {
-                        candidates.push(ScoredCandidate {
-                            id: raw_id,
-                            score: *score,
-                            artifact_type: artifact_type.into(),
-                        });
+                        // Dedup: if this ID already exists, keep
+                        // the higher score
+                        if let Some(existing) =
+                            candidates.iter_mut().find(|c| c.id == raw_id)
+                        {
+                            if *score > existing.score {
+                                existing.score = *score;
+                            }
+                        } else {
+                            candidates.push(ScoredCandidate {
+                                id: raw_id,
+                                score: *score,
+                                artifact_type: artifact_type.into(),
+                            });
+                        }
                     }
                 }
             }
@@ -451,6 +463,71 @@ mod tests {
         assert!(
             scoring::mcp_threshold(RetrievalRoute::Hybrid)
                 < scoring::auto_threshold(RetrievalRoute::Hybrid)
+        );
+    }
+
+    // -- Property: collect_hits deduplicates by ID, keeping max score --
+    #[test]
+    fn test_collect_hits_dedup() {
+        let grafeo = grafeo_db::new_in_memory();
+        let session = grafeo.session();
+
+        // Create two nodes with the same episode_id
+        let _ = session.execute(
+            "CREATE (e:Episode {episode_id: 'aaa', summary_text: 'test'})",
+        );
+        let _ = session.execute(
+            "CREATE (e:Episode {episode_id: 'aaa', summary_text: 'test again'})",
+        );
+        crate::graph::indexes::ensure_indexes(&grafeo);
+
+        // BM25 search may return both nodes for the same ID
+        let mut candidates = Vec::new();
+        if let Ok(hits) = grafeo.text_search(
+            crate::graph::db::labels::EPISODE,
+            "summary_text",
+            "test",
+            20,
+        ) {
+            collect_hits(
+                &grafeo,
+                &hits,
+                "episode_id",
+                "summary",
+                &mut candidates,
+            );
+        }
+
+        // Even if two nodes match, same episode_id should appear once
+        let unique_ids: std::collections::HashSet<_> =
+            candidates.iter().map(|c| c.id).collect();
+        assert_eq!(
+            candidates.len(),
+            unique_ids.len(),
+            "candidates should have no duplicate IDs"
+        );
+    }
+
+    // -- Property: search_grafeo returns no duplicate IDs --
+    #[hegel::test(test_cases = 20)]
+    fn prop_search_no_duplicates(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+
+        let grafeo = grafeo_db::new_in_memory();
+        let query: String = tc.draw(
+            gs::text()
+                .min_size(1)
+                .max_size(30)
+                .alphabet("abcdefghijklmnop "),
+        );
+
+        let candidates = search_grafeo(&grafeo, &query, RetrievalRoute::Hybrid);
+        let unique_ids: std::collections::HashSet<_> =
+            candidates.iter().map(|c| c.id).collect();
+        assert_eq!(
+            candidates.len(),
+            unique_ids.len(),
+            "search_grafeo must return unique IDs"
         );
     }
 }
