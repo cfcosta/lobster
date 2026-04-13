@@ -459,12 +459,16 @@ fn rebuild_grafeo(db: &dyn ReadableDatabase) -> Result<grafeo::GrafeoDB> {
                     serde_json::from_slice::<ExtractionOutput>(&art.output_json)
                 {
                     for entity_fact in &output.entities {
+                        let Some(kind) = parse_entity_kind(&entity_fact.kind)
+                        else {
+                            continue;
+                        };
                         let ent = schema::Entity {
                             entity_id: EntityId::derive(
                                 entity_fact.name.as_bytes(),
                             ),
                             repo_id: ep.repo_id,
-                            kind: parse_entity_kind(&entity_fact.kind),
+                            kind,
                             canonical_name: entity_fact.name.clone(),
                             first_seen_episode: None,
                             last_seen_ts_utc_ms: None,

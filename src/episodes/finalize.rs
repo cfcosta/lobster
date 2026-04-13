@@ -349,9 +349,16 @@ pub async fn finalize_episode_at(
         decision_nodes.insert(dec.statement.clone(), dec_node);
     }
 
-    // Project entities and persist to redb
+    // Project entities and persist to redb (skip invalid kinds)
     for entity_fact in &extraction_output.entities {
-        let ent = make_entity(repo_path, repo_id, entity_fact);
+        let Some(ent) = make_entity(repo_path, repo_id, entity_fact) else {
+            tracing::warn!(
+                kind = %entity_fact.kind,
+                name = %entity_fact.name,
+                "skipping entity with invalid kind"
+            );
+            continue;
+        };
         let _ = crud::put_entity(db, &ent);
         let ent_node = projection::project_entity(grafeo, &ent, ep_node);
         entity_nodes.insert(entity_fact.name.clone(), ent_node);
@@ -422,36 +429,39 @@ pub async fn finalize_episode_at(
 
 /// Build an `Entity` with a repo-scoped ID via `canon::entity_id`.
 ///
-/// Previously entity IDs were derived from the name alone, causing
-/// entities from different repos to collide.
+/// Returns `None` if the entity kind is not in the allowed set.
+/// Previously invalid kinds were silently defaulted to `Concept`,
+/// hiding extraction errors.
 fn make_entity(
     repo_path: &str,
     repo_id: crate::store::ids::RepoId,
     fact: &crate::extract::traits::ExtractedEntity,
-) -> crate::store::schema::Entity {
-    crate::store::schema::Entity {
+) -> Option<crate::store::schema::Entity> {
+    let kind = parse_entity_kind(&fact.kind)?;
+    Some(crate::store::schema::Entity {
         entity_id: crate::store::canon::entity_id(
             repo_path, &fact.kind, &fact.name,
         ),
         repo_id,
-        kind: parse_entity_kind(&fact.kind),
+        kind,
         canonical_name: fact.name.clone(),
         first_seen_episode: None,
         last_seen_ts_utc_ms: None,
         mention_count: 0,
-    }
+    })
 }
 
-#[allow(clippy::match_same_arms)]
 #[must_use]
-pub fn parse_entity_kind(kind: &str) -> crate::store::schema::EntityKind {
+pub fn parse_entity_kind(
+    kind: &str,
+) -> Option<crate::store::schema::EntityKind> {
     match kind {
-        "concept" => crate::store::schema::EntityKind::Concept,
-        "constraint" => crate::store::schema::EntityKind::Constraint,
-        "component" => crate::store::schema::EntityKind::Component,
-        "file-lite" => crate::store::schema::EntityKind::FileLite,
-        "repo" => crate::store::schema::EntityKind::Repo,
-        _ => crate::store::schema::EntityKind::Concept,
+        "concept" => Some(crate::store::schema::EntityKind::Concept),
+        "constraint" => Some(crate::store::schema::EntityKind::Constraint),
+        "component" => Some(crate::store::schema::EntityKind::Component),
+        "file-lite" => Some(crate::store::schema::EntityKind::FileLite),
+        "repo" => Some(crate::store::schema::EntityKind::Repo),
+        _ => None,
     }
 }
 
@@ -616,7 +626,10 @@ fn extract_file_reads(events_json: &[u8]) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{graph::db as grafeo_db, store::db};
+    use crate::{
+        graph::db as grafeo_db,
+        store::{db, ids::DecisionId},
+    };
 
     fn has_api_key() -> bool {
         std::env::var("ANTHROPIC_API_KEY").is_ok()
@@ -1053,8 +1066,8 @@ mod tests {
         let repo_id_a = crate::store::ids::RepoId::derive(repo_a.as_bytes());
         let repo_id_b = crate::store::ids::RepoId::derive(repo_b.as_bytes());
 
-        let ent_a = make_entity(&repo_a, repo_id_a, &fact);
-        let ent_b = make_entity(&repo_b, repo_id_b, &fact);
+        let ent_a = make_entity(&repo_a, repo_id_a, &fact).unwrap();
+        let ent_b = make_entity(&repo_b, repo_id_b, &fact).unwrap();
 
         if crate::store::canon::normalize_path(&repo_a)
             == crate::store::canon::normalize_path(&repo_b)
@@ -1097,9 +1110,55 @@ mod tests {
         let fact = crate::extract::traits::ExtractedEntity { kind, name };
         let repo_id = crate::store::ids::RepoId::derive(repo.as_bytes());
 
-        let ent1 = make_entity(&repo, repo_id, &fact);
-        let ent2 = make_entity(&repo, repo_id, &fact);
+        let ent1 = make_entity(&repo, repo_id, &fact).unwrap();
+        let ent2 = make_entity(&repo, repo_id, &fact).unwrap();
         assert_eq!(ent1.entity_id, ent2.entity_id);
+    }
+
+    /// Valid entity kinds are accepted, invalid ones are rejected.
+    #[hegel::test(test_cases = 200)]
+    fn prop_parse_entity_kind_valid_accepted(tc: TestCase) {
+        let valid: String = tc.draw(gs::sampled_from(vec![
+            "concept".to_string(),
+            "constraint".to_string(),
+            "component".to_string(),
+            "file-lite".to_string(),
+            "repo".to_string(),
+        ]));
+        assert!(
+            parse_entity_kind(&valid).is_some(),
+            "valid kind {valid:?} should be accepted"
+        );
+    }
+
+    /// Invalid/unknown entity kinds return None.
+    #[hegel::test(test_cases = 200)]
+    fn prop_parse_entity_kind_invalid_rejected(tc: TestCase) {
+        let invalid: String = tc.draw(
+            gs::text()
+                .min_size(1)
+                .max_size(30)
+                .alphabet("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"),
+        );
+        // None of the valid kinds are uppercase-only or contain digits
+        assert!(
+            parse_entity_kind(&invalid).is_none(),
+            "invalid kind {invalid:?} should be rejected"
+        );
+    }
+
+    /// `make_entity` returns None for invalid kinds.
+    #[test]
+    fn test_make_entity_rejects_invalid_kind() {
+        let fact = crate::extract::traits::ExtractedEntity {
+            kind: "workflow".into(), // not in valid set
+            name: "test".into(),
+        };
+        let repo_id = crate::store::ids::RepoId::derive(b"repo");
+        assert!(
+            make_entity("/repo", repo_id, &fact).is_none(),
+            "invalid entity kind must be rejected"
+        );
     }
 
     /// `extract_file_reads` returns at most `FILE_READ_MAX_FILES` entries.

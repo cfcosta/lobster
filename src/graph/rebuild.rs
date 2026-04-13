@@ -143,11 +143,15 @@ pub fn rebuild_from_redb(
                 let mut entity_nodes = std::collections::HashMap::new();
 
                 for entity_fact in &output.entities {
+                    let Some(kind) = parse_entity_kind(&entity_fact.kind)
+                    else {
+                        continue;
+                    };
                     let eid = EntityId::derive(entity_fact.name.as_bytes());
                     let ent = crate::store::schema::Entity {
                         entity_id: eid,
                         repo_id: episode.repo_id,
-                        kind: parse_entity_kind(&entity_fact.kind),
+                        kind,
                         canonical_name: entity_fact.name.clone(),
                         first_seen_episode: None,
                         last_seen_ts_utc_ms: None,
