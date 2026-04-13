@@ -473,6 +473,9 @@ mod tests {
             repo_id: RepoId::derive(b"repo"),
             kind: EntityKind::Component,
             canonical_name: "Grafeo".into(),
+            first_seen_episode: None,
+            last_seen_ts_utc_ms: None,
+            mention_count: 0,
         };
         put_entity(&db, &entity).expect("put");
         let loaded = get_entity(&db, &entity.entity_id.raw()).expect("get");

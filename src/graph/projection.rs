@@ -226,6 +226,9 @@ mod tests {
             repo_id: RepoId::derive(b"repo"),
             kind: EntityKind::Component,
             canonical_name: "redb".into(),
+            first_seen_episode: None,
+            last_seen_ts_utc_ms: None,
+            mention_count: 0,
         };
 
         let ep_node = project_episode(&grafeo, &ep);

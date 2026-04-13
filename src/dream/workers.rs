@@ -254,6 +254,9 @@ pub fn scan_workflow_patterns(
                     repo_id,
                     kind: EntityKind::Workflow,
                     canonical_name: label,
+                    first_seen_episode: None,
+                    last_seen_ts_utc_ms: None,
+                    mention_count: 0,
                 };
                 let _ = crud::put_entity(db, &entity);
 
@@ -370,6 +373,9 @@ mod tests {
             repo_id: RepoId::derive(b"repo"),
             kind: EntityKind::Component,
             canonical_name: "Grafeo".into(),
+            first_seen_episode: None,
+            last_seen_ts_utc_ms: None,
+            mention_count: 0,
         };
         crud::put_entity(&database, &entity).unwrap();
 
@@ -387,12 +393,18 @@ mod tests {
             repo_id: RepoId::derive(b"repo"),
             kind: EntityKind::Component,
             canonical_name: "Grafeo".into(),
+            first_seen_episode: None,
+            last_seen_ts_utc_ms: None,
+            mention_count: 0,
         };
         let e2 = Entity {
             entity_id: EntityId::derive(b"e2"),
             repo_id: RepoId::derive(b"repo"),
             kind: EntityKind::Component,
             canonical_name: "grafeo".into(), // different case
+            first_seen_episode: None,
+            last_seen_ts_utc_ms: None,
+            mention_count: 0,
         };
         crud::put_entity(&database, &e1).unwrap();
         crud::put_entity(&database, &e2).unwrap();

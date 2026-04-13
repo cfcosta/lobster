@@ -466,6 +466,9 @@ fn rebuild_grafeo(db: &dyn ReadableDatabase) -> Result<grafeo::GrafeoDB> {
                             repo_id: ep.repo_id,
                             kind: parse_entity_kind(&entity_fact.kind),
                             canonical_name: entity_fact.name.clone(),
+                            first_seen_episode: None,
+                            last_seen_ts_utc_ms: None,
+                            mention_count: 0,
                         };
                         projection::project_entity(&grafeo, &ent, ep_node);
                     }

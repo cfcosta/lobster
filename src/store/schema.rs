@@ -162,6 +162,15 @@ pub struct Entity {
     pub repo_id: RepoId,
     pub kind: EntityKind,
     pub canonical_name: String,
+    /// Episode where this entity was first observed.
+    #[serde(default)]
+    pub first_seen_episode: Option<EpisodeId>,
+    /// Timestamp of the most recent episode mentioning this entity.
+    #[serde(default)]
+    pub last_seen_ts_utc_ms: Option<i64>,
+    /// Number of episodes that mention this entity.
+    #[serde(default)]
+    pub mention_count: u32,
 }
 
 // ── SummaryArtifact (d49.7) ──────────────────────────────────
@@ -414,8 +423,7 @@ mod tests {
             tc.draw(gs::integers::<usize>().min_value(0).max_value(5));
         let mut premises = Vec::with_capacity(n_premises);
         for _ in 0..n_premises {
-            premises
-                .push(tc.draw(gs::text().min_size(1).max_size(100)));
+            premises.push(tc.draw(gs::text().min_size(1).max_size(100)));
         }
         decision.premises = premises;
 
@@ -470,6 +478,70 @@ mod tests {
             let parsed: ProcessingState = serde_json::from_str(&json).unwrap();
             assert_eq!(*s, parsed);
         }
+    }
+
+    // -- Property: Entity with evolution fields round-trips --
+    #[hegel::test(test_cases = 100)]
+    fn prop_entity_evolution_roundtrip(tc: TestCase) {
+        let id_input: Vec<u8> =
+            tc.draw(gs::vecs(gs::integers::<u8>()).min_size(1).max_size(16));
+        let repo_input: Vec<u8> =
+            tc.draw(gs::vecs(gs::integers::<u8>()).min_size(1).max_size(16));
+
+        let entity = Entity {
+            entity_id: EntityId::derive(&id_input),
+            repo_id: RepoId::derive(&repo_input),
+            kind: tc.draw(gs::sampled_from(vec![
+                EntityKind::Concept,
+                EntityKind::Component,
+                EntityKind::Workflow,
+            ])),
+            canonical_name: tc.draw(gs::text().min_size(1).max_size(50)),
+            first_seen_episode: if tc.draw(gs::booleans()) {
+                Some(EpisodeId::derive(&id_input))
+            } else {
+                None
+            },
+            last_seen_ts_utc_ms: if tc.draw(gs::booleans()) {
+                Some(tc.draw(
+                    gs::integers::<i64>().min_value(0).max_value(i64::MAX / 2),
+                ))
+            } else {
+                None
+            },
+            mention_count: tc
+                .draw(gs::integers::<u32>().min_value(0).max_value(1000)),
+        };
+
+        let json = serde_json::to_string(&entity).unwrap();
+        let parsed: Entity = serde_json::from_str(&json).unwrap();
+        assert_eq!(entity, parsed);
+    }
+
+    // -- Property: Entity backward compat (missing evolution fields) --
+    #[test]
+    fn test_entity_backward_compat() {
+        let entity = Entity {
+            entity_id: EntityId::derive(b"bc"),
+            repo_id: RepoId::derive(b"repo"),
+            kind: EntityKind::Component,
+            canonical_name: "test".into(),
+            first_seen_episode: Some(EpisodeId::derive(b"ep1")),
+            last_seen_ts_utc_ms: Some(1000),
+            mention_count: 5,
+        };
+        let mut json_val: serde_json::Value =
+            serde_json::to_value(&entity).unwrap();
+        let obj = json_val.as_object_mut().unwrap();
+        obj.remove("first_seen_episode");
+        obj.remove("last_seen_ts_utc_ms");
+        obj.remove("mention_count");
+        let json = serde_json::to_string(&json_val).unwrap();
+
+        let parsed: Entity = serde_json::from_str(&json).unwrap();
+        assert!(parsed.first_seen_episode.is_none());
+        assert!(parsed.last_seen_ts_utc_ms.is_none());
+        assert_eq!(parsed.mention_count, 0);
     }
 
     #[test]

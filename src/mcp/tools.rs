@@ -453,6 +453,9 @@ mod tests {
             repo_id: RepoId::derive(b"repo"),
             kind: EntityKind::Workflow,
             canonical_name: "FileEdit→TestRun→TestResult".into(),
+            first_seen_episode: None,
+            last_seen_ts_utc_ms: None,
+            mention_count: 0,
         };
         crud::put_entity(&database, &entity).unwrap();
 
