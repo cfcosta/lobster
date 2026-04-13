@@ -2,6 +2,7 @@
 
 pub mod consolidation;
 pub mod patterns;
+pub mod profile;
 pub mod scheduler;
 pub mod supersession;
 pub mod workers;
