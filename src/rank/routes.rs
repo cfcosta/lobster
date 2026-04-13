@@ -58,11 +58,20 @@ pub fn execute_query_with_context(
     is_mcp: bool,
     current_task_id: Option<&crate::store::ids::TaskId>,
 ) -> Vec<RetrievalResult> {
-    let route = classify_query(query);
+    let classified_route = classify_query(query);
 
-    if route == RetrievalRoute::Abstain {
+    if classified_route == RetrievalRoute::Abstain {
         return vec![];
     }
+
+    // Hooks run as a separate short-lived process and must not load
+    // the ColBERT model (spec: MCP process owns the model pool).
+    // Force Exact (BM25-only) route for hooks to avoid model loading.
+    let route = if is_mcp {
+        classified_route
+    } else {
+        RetrievalRoute::Exact
+    };
 
     let threshold = if is_mcp {
         scoring::mcp_threshold(route)
@@ -80,13 +89,14 @@ pub fn execute_query_with_context(
     let mut candidates = search_grafeo(grafeo, query, route);
 
     // Rerank candidates with ColBERT query→candidate similarity.
-    // This replaces the initial Grafeo BM25 score with a real
-    // semantic score from the model.
-    for candidate in &mut candidates {
-        let reranked =
-            crate::rank::rerank::rerank_score(db, query, &candidate.id);
-        if reranked > 0.0 {
-            candidate.score = reranked;
+    // Only for MCP path — hooks use BM25 scores directly.
+    if is_mcp {
+        for candidate in &mut candidates {
+            let reranked =
+                crate::rank::rerank::rerank_score(db, query, &candidate.id);
+            if reranked > 0.0 {
+                candidate.score = reranked;
+            }
         }
     }
 
