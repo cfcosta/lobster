@@ -42,12 +42,12 @@ pub struct DreamCycleResult {
 /// Currently implements:
 /// - Retry `RetryQueued` episodes
 ///
-/// Future workers:
-/// - Entity merge proposals
-/// - Summary pyramid compression
-/// - Task timeline maintenance
-/// - Graph link backfill
-/// - Statistics recalculation
+/// Additional workers (run from the MCP server loop):
+/// - Workflow pattern mining (`dream::workers::scan_workflow_patterns`)
+/// - Decision supersession (`dream::supersession::scan_superseded_decisions`)
+/// - Summary consolidation (`dream::consolidation::scan_consolidation_candidates`)
+/// - Entity dedup (`dream::workers::find_duplicate_entities`)
+/// - Stale task scanning (`dream::workers::scan_stale_tasks`)
 #[must_use]
 pub fn run_cycle(db: &Database, config: &DreamConfig) -> DreamCycleResult {
     let start = Instant::now();

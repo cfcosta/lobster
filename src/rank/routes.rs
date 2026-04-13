@@ -64,11 +64,6 @@ pub fn execute_query_with_context(
         return vec![];
     }
 
-    // For now, search is simulated — Grafeo text/vector search
-    // will be wired when indexes are created. The pipeline
-    // structure is what matters: classify → search → score →
-    // MMR → ready-set → threshold → return.
-
     let threshold = if is_mcp {
         scoring::mcp_threshold(route)
     } else {
@@ -82,9 +77,6 @@ pub fn execute_query_with_context(
         scoring::auto_surface_budget(route)
     };
 
-    // Search Grafeo using GQL text matching on decision statements
-    // and entity names. This is a basic implementation that will be
-    // replaced with HNSW vector search when embeddings are active.
     let mut candidates = search_grafeo(grafeo, query, route);
 
     // Apply stable tie-breakers before MMR per spec
