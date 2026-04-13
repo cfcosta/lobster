@@ -114,7 +114,7 @@ pub struct WorkflowMiningResult {
 #[allow(clippy::too_many_lines)]
 pub fn scan_workflow_patterns(
     db: &Database,
-    grafeo: &GrafeoDB,
+    _grafeo: &GrafeoDB,
     config: &super::patterns::PatternConfig,
 ) -> WorkflowMiningResult {
     use crate::{
@@ -122,14 +122,8 @@ pub fn scan_workflow_patterns(
         episodes::sequences::{extract_event_sequence, sequence_label},
         store::{
             crud,
-            ids::{EntityId, RepoId, WorkflowId},
-            schema::{
-                Entity,
-                EntityKind,
-                Episode,
-                ProcessingState,
-                ToolSequence,
-            },
+            ids::{RepoId, WorkflowId},
+            schema::{Episode, ProcessingState, ToolSequence},
         },
     };
 
@@ -246,77 +240,17 @@ pub fn scan_workflow_patterns(
             };
 
             if crud::put_tool_sequence(db, &ts).is_ok() {
-                // Also create a Workflow entity
-                let entity = Entity {
-                    entity_id: EntityId::derive(
-                        &workflow_id.raw().as_bytes()[..],
-                    ),
-                    repo_id,
-                    kind: EntityKind::Workflow,
-                    canonical_name: label,
-                    first_seen_episode: None,
-                    last_seen_ts_utc_ms: None,
-                    mention_count: 0,
-                };
-                let _ = crud::put_entity(db, &entity);
-
-                // 5. Project into Grafeo
-                project_workflow_to_grafeo(
-                    grafeo,
-                    &ts,
-                    &entity,
-                    &source_episodes,
-                );
-
+                // ToolSequence artifacts are kept for internal
+                // pattern analysis, but we no longer promote them
+                // into Entity records or project them into Grafeo.
+                // The "ToolUse→Prompt→..." labels were noise in
+                // retrieval and polluted the entity namespace.
                 result.workflows_created += 1;
             }
         }
     }
 
     result
-}
-
-/// Project a workflow entity and its episode links into Grafeo.
-fn project_workflow_to_grafeo(
-    grafeo: &GrafeoDB,
-    ts: &crate::store::schema::ToolSequence,
-    entity: &Entity,
-    source_episodes: &[crate::store::ids::EpisodeId],
-) {
-    use crate::graph::db::labels;
-
-    // Create the workflow node
-    let session = grafeo.session();
-    let pattern_str = ts
-        .pattern
-        .iter()
-        .map(|k| format!("{k:?}"))
-        .collect::<Vec<_>>()
-        .join(",");
-    let query = format!(
-        "CREATE (w:{} {{entity_id: '{}', canonical_name: '{}', \
-         kind: 'Workflow', pattern: '{}', frequency: {}}})",
-        labels::ENTITY,
-        entity.entity_id,
-        entity.canonical_name,
-        pattern_str,
-        ts.frequency
-    );
-    let _ = session.execute(&query);
-
-    // Link to source episodes
-    for ep_id in source_episodes {
-        let edge_query = format!(
-            "MATCH (w:{} {{entity_id: '{}'}}), \
-             (ep:{} {{episode_id: '{}'}}) \
-             CREATE (w)-[:OBSERVED_IN]->(ep)",
-            labels::ENTITY,
-            entity.entity_id,
-            labels::EPISODE,
-            ep_id
-        );
-        let _ = session.execute(&edge_query);
-    }
 }
 
 #[cfg(test)]
@@ -591,5 +525,64 @@ mod tests {
                 min_freq
             );
         }
+    }
+
+    /// Workflow mining must NOT create Entity records or Grafeo nodes.
+    /// `ToolSequence` artifacts are internal; promoting them to entities
+    /// polluted retrieval with noise like "ToolUse→Prompt→ToolUse".
+    #[hegel::test(test_cases = 20)]
+    fn prop_workflow_mining_no_entities(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+
+        let database = db::open_in_memory().unwrap();
+        let grafeo = grafeo_db::new_in_memory();
+
+        // Use a fixed shared pattern to guarantee detection
+        let pattern = [
+            EventKind::FileEdit,
+            EventKind::TestRun,
+            EventKind::TestResult,
+        ];
+        let n_eps: usize =
+            tc.draw(gs::integers::<usize>().min_value(2).max_value(5));
+        for i in 0..n_eps {
+            #[allow(clippy::cast_possible_truncation)]
+            setup_episode_with_events(
+                &database,
+                &(i as u32).to_le_bytes(),
+                (i * 1000) as u64,
+                &pattern,
+            );
+        }
+
+        let config = PatternConfig {
+            min_frequency: 2,
+            ..PatternConfig::default()
+        };
+
+        let entities_before = crud::count_entities(&database);
+        let grafeo_nodes_before = grafeo.node_count();
+
+        let result = scan_workflow_patterns(&database, &grafeo, &config);
+
+        let entities_after = crud::count_entities(&database);
+        let grafeo_nodes_after = grafeo.node_count();
+
+        // Workflows were detected...
+        if n_eps >= 2 {
+            assert!(
+                result.workflows_created > 0 || result.workflows_updated > 0,
+                "should detect patterns in {n_eps} episodes"
+            );
+        }
+        // ...but no entities or graph nodes were created
+        assert_eq!(
+            entities_before, entities_after,
+            "workflow mining must not create Entity records"
+        );
+        assert_eq!(
+            grafeo_nodes_before, grafeo_nodes_after,
+            "workflow mining must not project into Grafeo"
+        );
     }
 }

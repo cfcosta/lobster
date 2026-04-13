@@ -177,6 +177,21 @@ pub fn get_entity(db: &Database, id: &RawId) -> Result<Entity, StoreError> {
     get_by_id(db, tables::ENTITIES, id)
 }
 
+/// Count all entities in the store.
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
+pub fn count_entities(db: &Database) -> usize {
+    use redb::{ReadableDatabase, ReadableTableMetadata};
+
+    let Ok(read_txn) = db.begin_read() else {
+        return 0;
+    };
+    let Ok(table) = read_txn.open_table(tables::ENTITIES) else {
+        return 0;
+    };
+    table.len().unwrap_or(0) as usize
+}
+
 // ── Summary Artifact ─────────────────────────────────────────
 
 pub fn put_summary_artifact(
