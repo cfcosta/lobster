@@ -99,11 +99,21 @@ impl LobsterServer {
     }
 
     #[tool(
-        description = "Processing state diagnostics: episode counts, artifacts, pending/failed status."
+        description = "Repo identity profile: stable conventions and user preferences detected from the episode stream."
+    )]
+    fn memory_profile(&self) -> String {
+        let result = tools::memory_profile(&self.db);
+        serde_json::to_string(&result).unwrap_or_default()
+    }
+
+    #[tool(
+        description = "Processing state diagnostics: episode counts, artifacts, pending/failed status, profile facts."
     )]
     fn memory_status(&self) -> String {
         let report = crate::app::status::scan(&self.db);
         let workflows = crate::store::crud::list_tool_sequences(&self.db);
+        let profile_facts = tools::memory_profile(&self.db).conventions.len()
+            + tools::memory_profile(&self.db).preferences.len();
         serde_json::to_string(&serde_json::json!({
             "episodes_total": report.total_episodes(),
             "ready": report.ready,
@@ -113,6 +123,7 @@ impl LobsterServer {
             "summary_artifacts": report.summary_artifacts,
             "extraction_artifacts": report.extraction_artifacts,
             "workflows": workflows.len(),
+            "profile_facts": profile_facts,
         }))
         .unwrap_or_default()
     }
@@ -200,7 +211,7 @@ mod tests {
         // List tools
         let tools = client.list_all_tools().await.unwrap();
 
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 7);
 
         let names: Vec<String> =
             tools.iter().map(|t| t.name.to_string()).collect();
@@ -211,6 +222,7 @@ mod tests {
         assert!(has("memory_recent"));
         assert!(has("memory_decisions"));
         assert!(has("memory_neighbors"));
+        assert!(has("memory_profile"));
 
         // Call a tool
         let result = client

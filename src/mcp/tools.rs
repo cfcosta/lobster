@@ -464,6 +464,98 @@ pub fn memory_neighbors(
     }
 }
 
+// ── memory_profile ──────────────────────────────────────────
+
+/// Result of `memory_profile`: the repo's identity profile.
+///
+/// Returns all conventions and preferences, or empty vecs if
+/// no profile exists.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProfileResult {
+    pub conventions: Vec<ProfileFactEntry>,
+    pub preferences: Vec<ProfileFactEntry>,
+    pub updated_ts_utc_ms: i64,
+}
+
+/// A single profile fact for MCP output.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProfileFactEntry {
+    pub statement: String,
+    pub confidence: String,
+    pub support_count: u32,
+    pub first_seen_ms: i64,
+    pub last_confirmed_ms: i64,
+}
+
+/// Return the repo identity profile.
+///
+/// Scans all repo profiles stored in the database and returns
+/// the first one found (single-user per-repo model).
+#[must_use]
+pub fn memory_profile(db: &LobsterDb) -> ProfileResult {
+    // Scan all repo profiles and return the first one
+    let rtxn = match db.env.read_txn() {
+        Ok(t) => t,
+        Err(_) => {
+            return ProfileResult {
+                conventions: vec![],
+                preferences: vec![],
+                updated_ts_utc_ms: 0,
+            };
+        }
+    };
+
+    let iter = match db.repo_profiles.iter(&rtxn) {
+        Ok(i) => i,
+        Err(_) => {
+            return ProfileResult {
+                conventions: vec![],
+                preferences: vec![],
+                updated_ts_utc_ms: 0,
+            };
+        }
+    };
+
+    for entry in iter.flatten() {
+        let (_, value) = entry;
+        if let Ok(profile) =
+            serde_json::from_slice::<crate::store::schema::RepoProfile>(value)
+        {
+            return ProfileResult {
+                conventions: profile
+                    .conventions
+                    .iter()
+                    .map(|f| ProfileFactEntry {
+                        statement: f.statement.clone(),
+                        confidence: format!("{:?}", f.confidence),
+                        support_count: f.support_count,
+                        first_seen_ms: f.first_seen_ts_utc_ms,
+                        last_confirmed_ms: f.last_confirmed_ts_utc_ms,
+                    })
+                    .collect(),
+                preferences: profile
+                    .preferences
+                    .iter()
+                    .map(|f| ProfileFactEntry {
+                        statement: f.statement.clone(),
+                        confidence: format!("{:?}", f.confidence),
+                        support_count: f.support_count,
+                        first_seen_ms: f.first_seen_ts_utc_ms,
+                        last_confirmed_ms: f.last_confirmed_ts_utc_ms,
+                    })
+                    .collect(),
+                updated_ts_utc_ms: profile.updated_ts_utc_ms,
+            };
+        }
+    }
+
+    ProfileResult {
+        conventions: vec![],
+        preferences: vec![],
+        updated_ts_utc_ms: 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -748,5 +840,70 @@ mod tests {
         let json = serde_json::to_string(&item).unwrap();
         assert!(json.contains("Workflow"));
         assert!(json.contains("5 times"));
+    }
+
+    // ── memory_profile tests ────────────────────────────────
+
+    #[test]
+    fn test_memory_profile_empty_db() {
+        let (database, _dir) = db::open_in_memory().unwrap();
+        let result = memory_profile(&database);
+        assert!(result.conventions.is_empty());
+        assert!(result.preferences.is_empty());
+        assert_eq!(result.updated_ts_utc_ms, 0);
+    }
+
+    #[test]
+    fn test_memory_profile_with_data() {
+        use crate::store::{
+            crud,
+            ids::{EpisodeId, RepoId},
+            schema::{Confidence, EvidenceRef, ProfileFact, RepoProfile},
+        };
+
+        let (database, _dir) = db::open_in_memory().unwrap();
+
+        let profile = RepoProfile {
+            repo_id: RepoId::derive(b"repo"),
+            conventions: vec![ProfileFact {
+                statement: "uses nix flakes".into(),
+                evidence: vec![EvidenceRef {
+                    episode_id: EpisodeId::derive(b"ep1"),
+                    span_summary: "detected".into(),
+                }],
+                first_seen_ts_utc_ms: 1000,
+                last_confirmed_ts_utc_ms: 2000,
+                support_count: 3,
+                confidence: Confidence::Medium,
+            }],
+            preferences: vec![],
+            updated_ts_utc_ms: 5000,
+            revision: "v1".into(),
+        };
+        crud::put_repo_profile(&database, &profile).unwrap();
+
+        let result = memory_profile(&database);
+        assert_eq!(result.conventions.len(), 1);
+        assert_eq!(result.conventions[0].statement, "uses nix flakes");
+        assert_eq!(result.conventions[0].support_count, 3);
+        assert_eq!(result.updated_ts_utc_ms, 5000);
+    }
+
+    #[test]
+    fn test_memory_profile_serializes_to_json() {
+        let result = ProfileResult {
+            conventions: vec![ProfileFactEntry {
+                statement: "Rust project".into(),
+                confidence: "High".into(),
+                support_count: 5,
+                first_seen_ms: 1000,
+                last_confirmed_ms: 2000,
+            }],
+            preferences: vec![],
+            updated_ts_utc_ms: 3000,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("Rust project"));
+        assert!(json.contains("\"support_count\":5"));
     }
 }
