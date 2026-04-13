@@ -21,7 +21,7 @@ use crate::{
     graph::projection,
     store::{
         crud,
-        ids::{DecisionId, EpisodeId, RepoId},
+        ids::{EpisodeId, RepoId},
         schema::{
             Confidence,
             Decision,
@@ -281,6 +281,9 @@ pub async fn finalize_episode_at(
     }
 
     // ── Step 8b: Create decisions from extraction output ──
+    // Use canon::decision_id for repo-scoped, normalized dedup.
+    // Decisions with the same normalized statement within the same
+    // repo are considered duplicates and skipped.
     for ext_dec in &extraction_output.decisions {
         let conf = match ext_dec.confidence.as_str() {
             "high" => Confidence::High,
@@ -291,10 +294,14 @@ pub async fn finalize_episode_at(
         if conf == Confidence::Low {
             continue;
         }
+        let dec_id =
+            crate::store::canon::decision_id(repo_path, &ext_dec.statement);
+        // Skip if this decision already exists (dedup by normalized statement)
+        if crud::get_decision(db, &dec_id.raw()).is_ok() {
+            continue;
+        }
         let decision = Decision {
-            decision_id: DecisionId::derive(
-                format!("{episode_id}:{}", ext_dec.statement).as_bytes(),
-            ),
+            decision_id: dec_id,
             repo_id,
             episode_id,
             task_id,
@@ -774,6 +781,106 @@ mod tests {
         assert_eq!(loaded.statement, statement);
         assert_eq!(loaded.confidence, Confidence::High);
         assert_eq!(loaded.evidence.len(), 1);
+    }
+
+    /// Decisions with the same normalized statement in the same repo
+    /// must produce the same `DecisionId` and thus deduplicate.
+    #[hegel::test(test_cases = 200)]
+    fn prop_decision_dedup_by_normalized_statement(tc: TestCase) {
+        let repo: String = tc.draw(
+            gs::text()
+                .min_size(1)
+                .max_size(50)
+                .alphabet("abcdefghijklmnopqrstuvwxyz/"),
+        );
+        let statement: String = tc.draw(
+            gs::text()
+                .min_size(1)
+                .max_size(100)
+                .alphabet("abcdefghijklmnopqrstuvwxyz "),
+        );
+
+        // Same statement with extra whitespace/casing should dedup
+        let padded = format!("  {}  ", statement.to_uppercase());
+        let id1 = crate::store::canon::decision_id(&repo, &statement);
+        let id2 = crate::store::canon::decision_id(&repo, &padded);
+        assert_eq!(
+            id1, id2,
+            "whitespace/case-variant statements must produce same DecisionId"
+        );
+    }
+
+    /// Different statements in the same repo must NOT collide.
+    #[hegel::test(test_cases = 200)]
+    fn prop_different_decisions_no_collision(tc: TestCase) {
+        let repo: String = tc.draw(
+            gs::text()
+                .min_size(1)
+                .max_size(50)
+                .alphabet("abcdefghijklmnopqrstuvwxyz/"),
+        );
+        let stmt_a: String = tc.draw(
+            gs::text()
+                .min_size(1)
+                .max_size(50)
+                .alphabet("abcdefghijklmnopqrstuvwxyz"),
+        );
+        let stmt_b: String = tc.draw(
+            gs::text()
+                .min_size(1)
+                .max_size(50)
+                .alphabet("abcdefghijklmnopqrstuvwxyz"),
+        );
+
+        let norm_a = crate::store::canon::normalize(&stmt_a);
+        let norm_b = crate::store::canon::normalize(&stmt_b);
+        if norm_a != norm_b {
+            let id_a = crate::store::canon::decision_id(&repo, &stmt_a);
+            let id_b = crate::store::canon::decision_id(&repo, &stmt_b);
+            assert_ne!(
+                id_a, id_b,
+                "different normalized statements must produce different IDs"
+            );
+        }
+    }
+
+    /// Decision dedup works at the CRUD level: inserting a decision,
+    /// then attempting to skip it when it already exists.
+    #[test]
+    fn test_decision_dedup_skips_existing() {
+        let database = db::open_in_memory().unwrap();
+        let repo_path = "/test/repo";
+        let statement = "Use redb for storage";
+
+        let dec_id = crate::store::canon::decision_id(repo_path, statement);
+        let repo_id = RepoId::derive(repo_path.as_bytes());
+        let episode_id = EpisodeId::derive(b"ep-1");
+
+        let decision = Decision {
+            decision_id: dec_id,
+            repo_id,
+            episode_id,
+            task_id: None,
+            statement: statement.into(),
+            rationale: "ACID".into(),
+            confidence: Confidence::High,
+            valid_from_ts_utc_ms: 1000,
+            valid_to_ts_utc_ms: None,
+            evidence: vec![],
+            premises: vec![],
+        };
+        crud::put_decision(&database, &decision).unwrap();
+
+        // Same statement (after normalization) should be found
+        let same_id = crate::store::canon::decision_id(
+            repo_path,
+            "  USE REDB FOR STORAGE  ",
+        );
+        assert_eq!(dec_id, same_id);
+        assert!(
+            crud::get_decision(&database, &same_id.raw()).is_ok(),
+            "dedup lookup must find the existing decision"
+        );
     }
 
     #[tokio::test]
