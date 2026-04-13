@@ -298,6 +298,79 @@ pub struct ToolSequence {
     pub detected_ts_utc_ms: i64,
 }
 
+// ── RepoProfile (identity memory) ──────────────────────────
+
+/// A single stable fact about the repo or user, derived from
+/// evidence in the episode stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileFact {
+    /// The fact statement (e.g., "uses nix flakes for builds").
+    pub statement: String,
+    /// How this fact was derived.
+    pub evidence: Vec<EvidenceRef>,
+    /// When this fact was first observed.
+    pub first_seen_ts_utc_ms: i64,
+    /// When this fact was last confirmed/reinforced.
+    pub last_confirmed_ts_utc_ms: i64,
+    /// Number of episodes that support this fact.
+    pub support_count: u32,
+    /// Confidence derived from support count and recency.
+    pub confidence: Confidence,
+}
+
+/// Category of a profile fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ProfileFactKind {
+    /// Repo-level convention (build system, language, framework).
+    Convention,
+    /// User behavioral preference (testing style, response style).
+    Preference,
+}
+
+/// Per-repo identity profile: stable conventions and user
+/// preferences that shape how all other memories are interpreted.
+///
+/// Inspired by Hermes's `MEMORY.md` + `USER.md` split, but in a
+/// single record since Lobster is single-user per-repo. Facts are
+/// evidence-backed and derived from the episode stream, not
+/// self-reported by the LLM.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoProfile {
+    pub repo_id: RepoId,
+    /// Stable conventions observed in this repo.
+    pub conventions: Vec<ProfileFact>,
+    /// User behavioral preferences observed across episodes.
+    pub preferences: Vec<ProfileFact>,
+    /// Last time the profile was updated by the dreaming cycle.
+    pub updated_ts_utc_ms: i64,
+    /// Profile revision for deterministic rebuild tracking.
+    pub revision: String,
+}
+
+/// Maximum number of profile facts (conventions + preferences
+/// combined). Keeps injection tiny and cache-friendly.
+pub const MAX_PROFILE_FACTS: usize = 20;
+
+impl RepoProfile {
+    /// Create an empty profile for a repo.
+    #[must_use]
+    pub fn empty(repo_id: RepoId) -> Self {
+        Self {
+            repo_id,
+            conventions: Vec::new(),
+            preferences: Vec::new(),
+            updated_ts_utc_ms: 0,
+            revision: String::new(),
+        }
+    }
+
+    /// Total number of facts in the profile.
+    #[must_use]
+    pub fn fact_count(&self) -> usize {
+        self.conventions.len() + self.preferences.len()
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -833,5 +906,146 @@ mod tests {
         let parsed: crate::store::ids::WorkflowId =
             s.parse().expect("valid hex");
         assert_eq!(id, parsed);
+    }
+
+    // ── ProfileFact / RepoProfile generators ────────────────
+
+    #[hegel::composite]
+    fn gen_profile_fact(tc: hegel::TestCase) -> ProfileFact {
+        let n_evidence: usize =
+            tc.draw(gs::integers::<usize>().min_value(1).max_value(3));
+        let mut evidence = Vec::with_capacity(n_evidence);
+        for _ in 0..n_evidence {
+            evidence.push(tc.draw(gen_evidence_ref()));
+        }
+        let first: i64 = tc.draw(
+            gs::integers::<i64>()
+                .min_value(1000)
+                .max_value(i64::MAX / 2),
+        );
+        let last: i64 = tc.draw(
+            gs::integers::<i64>()
+                .min_value(first)
+                .max_value(first.saturating_add(1_000_000_000)),
+        );
+        ProfileFact {
+            statement: tc.draw(gs::text().min_size(1).max_size(200)),
+            evidence,
+            first_seen_ts_utc_ms: first,
+            last_confirmed_ts_utc_ms: last,
+            support_count: tc
+                .draw(gs::integers::<u32>().min_value(1).max_value(100)),
+            confidence: tc.draw(gs::sampled_from(vec![
+                Confidence::Low,
+                Confidence::Medium,
+                Confidence::High,
+            ])),
+        }
+    }
+
+    #[hegel::composite]
+    fn gen_repo_profile(tc: hegel::TestCase) -> RepoProfile {
+        let repo_input: Vec<u8> =
+            tc.draw(gs::vecs(gs::integers::<u8>()).min_size(1).max_size(16));
+        let n_conv: usize =
+            tc.draw(gs::integers::<usize>().min_value(0).max_value(5));
+        let n_pref: usize =
+            tc.draw(gs::integers::<usize>().min_value(0).max_value(5));
+        let mut conventions = Vec::with_capacity(n_conv);
+        for _ in 0..n_conv {
+            conventions.push(tc.draw(gen_profile_fact()));
+        }
+        let mut preferences = Vec::with_capacity(n_pref);
+        for _ in 0..n_pref {
+            preferences.push(tc.draw(gen_profile_fact()));
+        }
+        RepoProfile {
+            repo_id: RepoId::derive(&repo_input),
+            conventions,
+            preferences,
+            updated_ts_utc_ms: tc.draw(
+                gs::integers::<i64>().min_value(0).max_value(i64::MAX / 2),
+            ),
+            revision: tc.draw(gs::text().min_size(0).max_size(20)),
+        }
+    }
+
+    // -- Property: ProfileFact serde round-trip --
+    #[hegel::test(test_cases = 200)]
+    fn prop_profile_fact_serde_roundtrip(tc: TestCase) {
+        let fact = tc.draw(gen_profile_fact());
+        let json = serde_json::to_string(&fact).unwrap();
+        let parsed: ProfileFact = serde_json::from_str(&json).unwrap();
+        assert_eq!(fact, parsed);
+    }
+
+    // -- Property: RepoProfile serde round-trip --
+    #[hegel::test(test_cases = 200)]
+    fn prop_repo_profile_serde_roundtrip(tc: TestCase) {
+        let profile = tc.draw(gen_repo_profile());
+        let json = serde_json::to_string(&profile).unwrap();
+        let parsed: RepoProfile = serde_json::from_str(&json).unwrap();
+        assert_eq!(profile, parsed);
+    }
+
+    // -- Property: ProfileFact has evidence --
+    #[hegel::test(test_cases = 200)]
+    fn prop_profile_fact_has_evidence(tc: TestCase) {
+        let fact = tc.draw(gen_profile_fact());
+        assert!(
+            !fact.evidence.is_empty(),
+            "profile facts must have evidence"
+        );
+    }
+
+    // -- Property: ProfileFact timestamps are ordered --
+    #[hegel::test(test_cases = 200)]
+    fn prop_profile_fact_timestamps_ordered(tc: TestCase) {
+        let fact = tc.draw(gen_profile_fact());
+        assert!(
+            fact.first_seen_ts_utc_ms <= fact.last_confirmed_ts_utc_ms,
+            "first_seen must not exceed last_confirmed"
+        );
+    }
+
+    // -- Property: RepoProfile fact_count matches --
+    #[hegel::test(test_cases = 200)]
+    fn prop_repo_profile_fact_count(tc: TestCase) {
+        let profile = tc.draw(gen_repo_profile());
+        assert_eq!(
+            profile.fact_count(),
+            profile.conventions.len() + profile.preferences.len()
+        );
+    }
+
+    // -- Property: ProfileFactKind serde round-trip --
+    #[test]
+    fn test_profile_fact_kind_variants() {
+        let kinds = [ProfileFactKind::Convention, ProfileFactKind::Preference];
+        for k in &kinds {
+            let json = serde_json::to_string(k).unwrap();
+            let parsed: ProfileFactKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(*k, parsed);
+        }
+    }
+
+    // -- Unit: empty profile --
+    #[test]
+    fn test_empty_profile() {
+        let profile = RepoProfile::empty(RepoId::derive(b"repo"));
+        assert_eq!(profile.fact_count(), 0);
+        assert!(profile.conventions.is_empty());
+        assert!(profile.preferences.is_empty());
+        assert_eq!(profile.updated_ts_utc_ms, 0);
+    }
+
+    // -- Unit: backward compat -- round-trip empty profile --
+    #[test]
+    fn test_repo_profile_empty_roundtrip() {
+        let profile = RepoProfile::empty(RepoId::derive(b"repo"));
+        let json = serde_json::to_string(&profile).unwrap();
+        let parsed: RepoProfile = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.fact_count(), 0);
+        assert_eq!(profile, parsed);
     }
 }
