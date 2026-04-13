@@ -40,9 +40,7 @@ pub fn normalize_path(path: &str) -> String {
     let cleaned = cleaned.trim().to_string();
     let normalized: String = cleaned.replace('\\', "/");
     let collapsed = collapse_slashes(&normalized);
-    let stripped = collapsed
-        .strip_suffix('/')
-        .unwrap_or(&collapsed);
+    let stripped = collapsed.strip_suffix('/').unwrap_or(&collapsed);
     // Trim again after slash removal for idempotency when input
     // has trailing "space + /"
     stripped.trim_end().to_string()
@@ -240,15 +238,9 @@ mod tests {
             normalize_path("/home/user/my project/src"),
             "/home/user/my project/src"
         );
-        assert_eq!(
-            normalize_path("Program Files/app"),
-            "Program Files/app"
-        );
+        assert_eq!(normalize_path("Program Files/app"), "Program Files/app");
         // But leading/trailing whitespace is trimmed
-        assert_eq!(
-            normalize_path("  /home/user/repo  "),
-            "/home/user/repo"
-        );
+        assert_eq!(normalize_path("  /home/user/repo  "), "/home/user/repo");
     }
 
     #[test]

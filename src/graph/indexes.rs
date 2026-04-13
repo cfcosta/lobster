@@ -25,10 +25,10 @@ pub fn ensure_indexes(grafeo: &GrafeoDB) {
     let _ = grafeo.create_vector_index(
         labels::EPISODE,
         "embedding",
-        None,               // auto-detect dimensions from data
-        Some("cosine"),     // cosine similarity
-        None,               // default M
-        None,               // default ef_construction
+        None,           // auto-detect dimensions from data
+        Some("cosine"), // cosine similarity
+        None,           // default M
+        None,           // default ef_construction
     );
 
     // Property indexes for fast filtering
@@ -66,13 +66,8 @@ mod tests {
         let grafeo = db::new_in_memory();
 
         // Create an episode with an embedding
-        let node = db::create_episode_node(
-            &grafeo,
-            "ep-vec",
-            "repo",
-            "Ready",
-            1000,
-        );
+        let node =
+            db::create_episode_node(&grafeo, "ep-vec", "repo", "Ready", 1000);
         db::set_episode_summary(&grafeo, node, "test summary");
         db::set_node_embedding(&grafeo, node, &[0.1, 0.2, 0.3, 0.4]);
 

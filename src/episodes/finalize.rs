@@ -436,8 +436,7 @@ fn extract_decisions_json(events_json: &[u8]) -> Vec<u8> {
             .and_then(|v| v.get("prompt"))
             .and_then(|v| v.as_str())
         {
-            let signals =
-                crate::episodes::decisions::detect_signals(prompt);
+            let signals = crate::episodes::decisions::detect_signals(prompt);
             if !signals.is_empty() {
                 decisions.push(serde_json::json!({
                     "source": "user_prompt",

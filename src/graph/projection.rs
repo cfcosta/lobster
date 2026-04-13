@@ -36,13 +36,14 @@ pub fn project_decision(
         &format!("{:?}", decision.confidence),
     );
 
-    db::create_temporal_edge(
+    db::create_temporal_edge_with_evidence(
         grafeo,
         episode_node,
         node,
         edges::PRODUCED_DECISION,
         decision.valid_from_ts_utc_ms,
         decision.valid_to_ts_utc_ms,
+        Some(&decision.episode_id.to_string()),
     );
 
     node
@@ -61,13 +62,14 @@ pub fn project_task(
         &format!("{:?}", task.status),
     );
 
-    db::create_temporal_edge(
+    db::create_temporal_edge_with_evidence(
         grafeo,
         episode_node,
         node,
         edges::PRODUCED_TASK,
-        0, // task creation time not tracked separately
+        chrono::Utc::now().timestamp_millis(),
         None,
+        Some(&task.opened_in.to_string()),
     );
 
     node
@@ -86,13 +88,20 @@ pub fn project_entity(
         &entity.canonical_name,
     );
 
-    db::create_temporal_edge(
+    let evidence_ep =
+        entity.first_seen_episode.as_ref().map(ToString::to_string);
+    let ts = entity
+        .last_seen_ts_utc_ms
+        .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+
+    db::create_temporal_edge_with_evidence(
         grafeo,
         episode_node,
         node,
         edges::MENTIONED_ENTITY,
-        0,
+        ts,
         None,
+        evidence_ep.as_deref(),
     );
 
     node
@@ -105,13 +114,15 @@ pub fn link_decision_entity(
     entity_node: grafeo::NodeId,
     valid_from_ms: i64,
 ) {
-    db::create_temporal_edge(
+    // Semantic edges inherit temporal validity from their decision
+    db::create_temporal_edge_with_evidence(
         grafeo,
         decision_node,
         entity_node,
         edges::DECISION_ENTITY,
         valid_from_ms,
         None,
+        None, // evidence is implicit from the decision node
     );
 }
 
@@ -122,13 +133,14 @@ pub fn link_task_decision(
     decision_node: grafeo::NodeId,
     valid_from_ms: i64,
 ) {
-    db::create_temporal_edge(
+    db::create_temporal_edge_with_evidence(
         grafeo,
         task_node,
         decision_node,
         edges::TASK_DECISION,
         valid_from_ms,
         None,
+        None, // evidence is implicit from the task/decision nodes
     );
 }
 

@@ -259,12 +259,9 @@ fn search_exact(
     }
 
     // BM25 text search on task titles
-    if let Ok(hits) = grafeo.text_search(
-        crate::graph::db::labels::TASK,
-        "title",
-        query,
-        20,
-    ) {
+    if let Ok(hits) =
+        grafeo.text_search(crate::graph::db::labels::TASK, "title", query, 20)
+    {
         collect_hits(grafeo, &hits, "task_id", "task", candidates);
     }
 }
@@ -324,12 +321,9 @@ fn search_hybrid(
     }
 
     // BM25 text search on tasks
-    if let Ok(hits) = grafeo.text_search(
-        crate::graph::db::labels::TASK,
-        "title",
-        query,
-        20,
-    ) {
+    if let Ok(hits) =
+        grafeo.text_search(crate::graph::db::labels::TASK, "title", query, 20)
+    {
         collect_hits(grafeo, &hits, "task_id", "task", candidates);
     }
 }
