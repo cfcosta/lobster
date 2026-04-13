@@ -162,16 +162,20 @@ fn try_hook_recall(
         "hook recall: result"
     );
 
-    // Load core memory (always-injected, query-independent),
-    // deduplicating against recall results to avoid repeating
-    // decisions that were already surfaced by query matching.
+    // Load repo profile (identity context) and core decisions,
+    // deduplicating decisions against recall results.
+    let repo_profile = event.working_directory().and_then(|dir| {
+        lobster::hooks::core_memory::load_repo_profile(&db, &dir)
+    });
     let core_items = lobster::hooks::core_memory::load_core_memory(&db);
     let deduped_core = lobster::hooks::core_memory::dedup_against_recall(
         &core_items,
         &payload,
     );
-    let core_text =
-        lobster::hooks::core_memory::format_core_memory(&deduped_core);
+    let core_text = lobster::hooks::core_memory::format_full_core_block(
+        repo_profile.as_ref(),
+        &deduped_core,
+    );
 
     match tier {
         OutputTier::Silent if core_text.is_empty() => HookOutput::empty(),

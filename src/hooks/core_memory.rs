@@ -1,14 +1,13 @@
-//! Core memory: always-injected high-value decisions.
+//! Core memory: always-injected identity and high-value decisions.
 //!
-//! Injects the top-N highest-confidence decisions on every
-//! `UserPromptSubmit` regardless of query match. These are the
-//! durable facts that should always be in context, inspired by
-//! `ChatGPT`'s always-injected user facts and Hermes's frozen
-//! `MEMORY.md` prompt block.
+//! Injects the repo profile (conventions + preferences) and the
+//! top-N highest-confidence decisions on every `UserPromptSubmit`
+//! regardless of query match. Inspired by Hermes's `MEMORY.md` +
+//! `USER.md` frozen snapshot pattern.
 
 use crate::store::{
     db::LobsterDb,
-    schema::{Confidence, Decision},
+    schema::{Confidence, Decision, RepoProfile},
 };
 
 /// Maximum number of core memory items to inject.
@@ -112,6 +111,69 @@ pub fn format_core_memory(items: &[CoreMemoryItem]) -> String {
         ));
     }
     lines.join("\n")
+}
+
+/// Load the repo profile for a given repo path.
+///
+/// Returns `None` if no profile exists or the DB is unavailable.
+#[must_use]
+pub fn load_repo_profile(
+    db: &LobsterDb,
+    repo_path: &str,
+) -> Option<RepoProfile> {
+    let repo_id = crate::store::ids::RepoId::derive(repo_path.as_bytes());
+    crate::store::crud::get_repo_profile(db, &repo_id.raw()).ok()
+}
+
+/// Format a repo profile as a prefix string for hook output.
+///
+/// Produces a compact block like:
+/// ```text
+/// [Repo Profile]
+/// • uses nix flakes for builds
+/// • Rust project using Cargo
+/// • uses jujutsu (jj) for version control
+/// ```
+///
+/// Returns empty string if the profile has no facts.
+#[must_use]
+pub fn format_repo_profile(profile: &RepoProfile) -> String {
+    if profile.conventions.is_empty() && profile.preferences.is_empty() {
+        return String::new();
+    }
+
+    let mut lines = Vec::new();
+    lines.push("[Repo Profile]".to_string());
+
+    for fact in &profile.conventions {
+        lines.push(format!("• {}", fact.statement));
+    }
+    for fact in &profile.preferences {
+        lines.push(format!("• {}", fact.statement));
+    }
+
+    lines.join("\n")
+}
+
+/// Assemble the full always-injected memory block.
+///
+/// Combines the repo profile and core decisions into a single
+/// string. The profile comes first (identity context), followed
+/// by decisions (architectural choices).
+#[must_use]
+pub fn format_full_core_block(
+    profile: Option<&RepoProfile>,
+    decisions: &[CoreMemoryItem],
+) -> String {
+    let profile_text = profile.map_or_else(String::new, format_repo_profile);
+    let decision_text = format_core_memory(decisions);
+
+    match (profile_text.is_empty(), decision_text.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => decision_text,
+        (false, true) => profile_text,
+        (false, false) => format!("{profile_text}\n\n{decision_text}"),
+    }
 }
 
 /// Filter core memory items that already appear in recall results.
@@ -443,5 +505,172 @@ mod tests {
 
         let deduped = dedup_against_recall(&core_items, &recall);
         assert_eq!(deduped.len(), 2);
+    }
+
+    // ── Repo Profile formatting tests ───────────────────────
+
+    fn make_profile(
+        n_conv: usize,
+        n_pref: usize,
+    ) -> crate::store::schema::RepoProfile {
+        use crate::store::{
+            ids::RepoId,
+            schema::{EvidenceRef, ProfileFact},
+        };
+
+        let mut conventions = Vec::new();
+        for i in 0..n_conv {
+            conventions.push(ProfileFact {
+                statement: format!("convention-{i}"),
+                evidence: vec![EvidenceRef {
+                    episode_id: crate::store::ids::EpisodeId::derive(
+                        format!("ep-{i}").as_bytes(),
+                    ),
+                    span_summary: "test".into(),
+                }],
+                first_seen_ts_utc_ms: 1000,
+                last_confirmed_ts_utc_ms: 1000,
+                support_count: 2,
+                confidence: Confidence::Medium,
+            });
+        }
+        let mut preferences = Vec::new();
+        for i in 0..n_pref {
+            preferences.push(ProfileFact {
+                statement: format!("preference-{i}"),
+                evidence: vec![EvidenceRef {
+                    episode_id: crate::store::ids::EpisodeId::derive(
+                        format!("pep-{i}").as_bytes(),
+                    ),
+                    span_summary: "test".into(),
+                }],
+                first_seen_ts_utc_ms: 1000,
+                last_confirmed_ts_utc_ms: 1000,
+                support_count: 3,
+                confidence: Confidence::High,
+            });
+        }
+
+        crate::store::schema::RepoProfile {
+            repo_id: RepoId::derive(b"repo"),
+            conventions,
+            preferences,
+            updated_ts_utc_ms: 1000,
+            revision: "v1".into(),
+        }
+    }
+
+    // -- Unit: format_repo_profile empty --
+    #[test]
+    fn test_format_repo_profile_empty() {
+        let profile = make_profile(0, 0);
+        assert!(format_repo_profile(&profile).is_empty());
+    }
+
+    // -- Unit: format_repo_profile with conventions --
+    #[test]
+    fn test_format_repo_profile_with_conventions() {
+        let profile = make_profile(2, 0);
+        let output = format_repo_profile(&profile);
+        assert!(output.contains("[Repo Profile]"));
+        assert!(output.contains("• convention-0"));
+        assert!(output.contains("• convention-1"));
+    }
+
+    // -- Unit: format_repo_profile with both --
+    #[test]
+    fn test_format_repo_profile_with_both() {
+        let profile = make_profile(1, 1);
+        let output = format_repo_profile(&profile);
+        assert!(output.contains("convention-0"));
+        assert!(output.contains("preference-0"));
+    }
+
+    // -- Unit: full core block with profile + decisions --
+    #[test]
+    fn test_full_core_block_both() {
+        let profile = make_profile(1, 0);
+        let decisions = vec![CoreMemoryItem {
+            statement: "Use LMDB".into(),
+            confidence: Confidence::High,
+            valid_from_ts_utc_ms: 1000,
+        }];
+
+        let output = format_full_core_block(Some(&profile), &decisions);
+        assert!(output.contains("[Repo Profile]"));
+        assert!(output.contains("[Core Memory]"));
+        // Profile should come before decisions
+        let profile_pos = output.find("[Repo Profile]").unwrap();
+        let decision_pos = output.find("[Core Memory]").unwrap();
+        assert!(
+            profile_pos < decision_pos,
+            "profile must appear before decisions"
+        );
+    }
+
+    // -- Unit: full core block with only profile --
+    #[test]
+    fn test_full_core_block_profile_only() {
+        let profile = make_profile(1, 0);
+        let output = format_full_core_block(Some(&profile), &[]);
+        assert!(output.contains("[Repo Profile]"));
+        assert!(!output.contains("[Core Memory]"));
+    }
+
+    // -- Unit: full core block with only decisions --
+    #[test]
+    fn test_full_core_block_decisions_only() {
+        let decisions = vec![CoreMemoryItem {
+            statement: "Use LMDB".into(),
+            confidence: Confidence::High,
+            valid_from_ts_utc_ms: 1000,
+        }];
+        let output = format_full_core_block(None, &decisions);
+        assert!(output.contains("[Core Memory]"));
+        assert!(!output.contains("[Repo Profile]"));
+    }
+
+    // -- Unit: full core block empty --
+    #[test]
+    fn test_full_core_block_empty() {
+        let output = format_full_core_block(None, &[]);
+        assert!(output.is_empty());
+    }
+
+    // -- Property: profile block never empty when facts exist --
+    #[hegel::test(test_cases = 30)]
+    fn prop_profile_format_nonempty_when_facts_exist(tc: hegel::TestCase) {
+        let n_conv: usize =
+            tc.draw(gs::integers::<usize>().min_value(1).max_value(5));
+        let n_pref: usize =
+            tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
+        let profile = make_profile(n_conv, n_pref);
+        let output = format_repo_profile(&profile);
+        assert!(!output.is_empty(), "profile with facts must produce output");
+        assert!(output.contains("[Repo Profile]"));
+    }
+
+    // -- Property: full block ordering is always profile-first --
+    #[hegel::test(test_cases = 30)]
+    fn prop_full_block_profile_before_decisions(tc: hegel::TestCase) {
+        let n_conv: usize =
+            tc.draw(gs::integers::<usize>().min_value(1).max_value(3));
+        let n_dec: usize =
+            tc.draw(gs::integers::<usize>().min_value(1).max_value(3));
+
+        let profile = make_profile(n_conv, 0);
+        let mut decisions = Vec::new();
+        for i in 0..n_dec {
+            decisions.push(CoreMemoryItem {
+                statement: format!("decision-{i}"),
+                confidence: Confidence::High,
+                valid_from_ts_utc_ms: 1000,
+            });
+        }
+
+        let output = format_full_core_block(Some(&profile), &decisions);
+        let p = output.find("[Repo Profile]").unwrap();
+        let d = output.find("[Core Memory]").unwrap();
+        assert!(p < d, "profile must come before decisions");
     }
 }
