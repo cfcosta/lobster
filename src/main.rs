@@ -166,10 +166,10 @@ fn try_hook_recall(
     // deduplicating against recall results to avoid repeating
     // decisions that were already surfaced by query matching.
     let core_items = lobster::hooks::core_memory::load_core_memory(&db);
-    let deduped_core =
-        lobster::hooks::core_memory::dedup_against_recall(
-            &core_items, &payload,
-        );
+    let deduped_core = lobster::hooks::core_memory::dedup_against_recall(
+        &core_items,
+        &payload,
+    );
     let core_text =
         lobster::hooks::core_memory::format_core_memory(&deduped_core);
 
