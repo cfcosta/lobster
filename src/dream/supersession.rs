@@ -70,8 +70,12 @@ pub fn word_overlap(a: &str, b: &str) -> f64 {
 /// Scan all decisions and mark older ones as superseded when a newer
 /// decision covers the same topic.
 ///
+/// Uses `ColBERT` `MaxSim` for semantic comparison when `use_maxsim`
+/// is true and the model is available. Falls back to Jaccard
+/// word-overlap otherwise.
+///
 /// Two decisions are candidates for supersession when:
-/// 1. They are about the same topic (word overlap >= threshold)
+/// 1. They are about the same topic (similarity >= threshold)
 /// 2. The older one does not already have `valid_to` set
 /// 3. The newer one has a later `valid_from` timestamp
 ///
@@ -81,6 +85,15 @@ pub fn word_overlap(a: &str, b: &str) -> f64 {
 pub fn scan_superseded_decisions(
     db: &Database,
     config: &SupersessionConfig,
+) -> SupersessionResult {
+    scan_superseded_decisions_inner(db, config, true)
+}
+
+/// Inner implementation with `MaxSim` toggle for testing.
+fn scan_superseded_decisions_inner(
+    db: &Database,
+    config: &SupersessionConfig,
+    use_maxsim: bool,
 ) -> SupersessionResult {
     use redb::ReadableTable;
 
@@ -116,6 +129,21 @@ pub fn scan_superseded_decisions(
     // Sort by valid_from ascending (oldest first)
     decisions.sort_by_key(|d| d.valid_from_ts_utc_ms);
 
+    // Build similarity lookup: try MaxSim first, fall back to word_overlap
+    let statements: Vec<String> =
+        decisions.iter().map(|d| d.statement.clone()).collect();
+    let maxsim_matrix = if use_maxsim {
+        crate::embeddings::maxsim::try_pairwise_maxsim(&statements)
+    } else {
+        None
+    };
+
+    if maxsim_matrix.is_some() {
+        tracing::debug!("supersession: using ColBERT MaxSim");
+    } else {
+        tracing::debug!("supersession: falling back to word overlap");
+    }
+
     // For each pair (older, newer), check if newer supersedes older
     let mut to_supersede: Vec<(usize, i64)> = Vec::new();
 
@@ -126,8 +154,24 @@ pub fn scan_superseded_decisions(
         }
 
         for j in (i + 1)..decisions.len() {
-            let similarity =
-                word_overlap(&decisions[i].statement, &decisions[j].statement);
+            let similarity = maxsim_matrix.as_ref().map_or_else(
+                || {
+                    word_overlap(
+                        &decisions[i].statement,
+                        &decisions[j].statement,
+                    )
+                },
+                |sim| {
+                    // Normalize MaxSim scores to [0, 1] range for
+                    // threshold comparison. Self-sim is the max.
+                    let self_sim = sim.get(i, i);
+                    if self_sim > 0.0 {
+                        f64::from(sim.get(i, j)) / f64::from(self_sim)
+                    } else {
+                        0.0
+                    }
+                },
+            );
 
             if similarity >= config.topic_similarity_threshold {
                 // Newer decision supersedes older one
@@ -250,7 +294,7 @@ mod tests {
             topic_similarity_threshold: 0.3,
             ..SupersessionConfig::default()
         };
-        let result = scan_superseded_decisions(&database, &config);
+        let result = scan_superseded_decisions_inner(&database, &config, false);
 
         assert_eq!(result.decisions_scanned, 2);
         assert_eq!(result.decisions_superseded, 1);
@@ -277,7 +321,7 @@ mod tests {
         crud::put_decision(&database, &d2).unwrap();
 
         let config = SupersessionConfig::default();
-        let result = scan_superseded_decisions(&database, &config);
+        let result = scan_superseded_decisions_inner(&database, &config, false);
 
         assert_eq!(result.decisions_superseded, 0);
     }
@@ -303,7 +347,7 @@ mod tests {
             topic_similarity_threshold: 0.3,
             ..SupersessionConfig::default()
         };
-        let result = scan_superseded_decisions(&database, &config);
+        let result = scan_superseded_decisions_inner(&database, &config, false);
         assert_eq!(result.decisions_superseded, 0);
     }
 
@@ -311,9 +355,10 @@ mod tests {
     #[test]
     fn test_empty_db() {
         let database = db::open_in_memory().unwrap();
-        let result = scan_superseded_decisions(
+        let result = scan_superseded_decisions_inner(
             &database,
             &SupersessionConfig::default(),
+            false,
         );
         assert_eq!(result.decisions_scanned, 0);
         assert_eq!(result.decisions_superseded, 0);
@@ -353,8 +398,8 @@ mod tests {
             ..SupersessionConfig::default()
         };
 
-        let r1 = scan_superseded_decisions(&database, &config);
-        let r2 = scan_superseded_decisions(&database, &config);
+        let r1 = scan_superseded_decisions_inner(&database, &config, false);
+        let r2 = scan_superseded_decisions_inner(&database, &config, false);
 
         // Second run should find nothing new
         assert_eq!(
@@ -390,13 +435,78 @@ mod tests {
             topic_similarity_threshold: 0.3,
             ..SupersessionConfig::default()
         };
-        let result = scan_superseded_decisions(&database, &config);
+        let result = scan_superseded_decisions_inner(&database, &config, false);
 
         assert!(
             result.decisions_superseded < n,
             "can't supersede all decisions: {} >= {}",
             result.decisions_superseded,
             n
+        );
+    }
+
+    // -- Integration: MaxSim supersession with real model --
+    // Skipped if model is not installed.
+    #[test]
+    fn test_maxsim_supersession() {
+        if crate::embeddings::encoder::load_model().is_err() {
+            eprintln!("skipping test_maxsim_supersession: model not installed");
+            return;
+        }
+
+        let database = db::open_in_memory().unwrap();
+
+        let old = make_decision(
+            b"old",
+            "Use SQLite for storage because it is widely available",
+            "Widespread adoption",
+            1000,
+        );
+        let new = make_decision(
+            b"new",
+            "Use redb for storage because it has better Rust integration",
+            "Native Rust, ACID",
+            2000,
+        );
+        let unrelated = make_decision(
+            b"unrel",
+            "Deploy to production every Friday afternoon",
+            "We love risk",
+            3000,
+        );
+        crud::put_decision(&database, &old).unwrap();
+        crud::put_decision(&database, &new).unwrap();
+        crud::put_decision(&database, &unrelated).unwrap();
+
+        let config = SupersessionConfig {
+            topic_similarity_threshold: 0.5,
+            ..SupersessionConfig::default()
+        };
+        // use_maxsim = true for this integration test
+        let result = scan_superseded_decisions_inner(&database, &config, true);
+
+        assert_eq!(result.decisions_scanned, 3);
+        // The old storage decision should be superseded by the new one
+        assert!(
+            result.decisions_superseded >= 1,
+            "MaxSim should detect storage topic overlap"
+        );
+
+        // Verify the old decision got valid_to set
+        let loaded =
+            crud::get_decision(&database, &old.decision_id.raw()).unwrap();
+        assert!(
+            loaded.valid_to_ts_utc_ms.is_some(),
+            "old storage decision should be superseded"
+        );
+
+        // The unrelated decision should NOT be superseded
+        let unrel_loaded =
+            crud::get_decision(&database, &unrelated.decision_id.raw())
+                .unwrap();
+        assert!(
+            unrel_loaded.valid_to_ts_utc_ms.is_none(),
+            "unrelated decision should not be superseded"
         );
     }
 }
