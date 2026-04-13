@@ -162,10 +162,26 @@ fn try_hook_recall(
         "hook recall: result"
     );
 
+    // Load core memory (always-injected, query-independent)
+    let core_items = lobster::hooks::core_memory::load_core_memory(&db);
+    let core_text =
+        lobster::hooks::core_memory::format_core_memory(&core_items);
+
     match tier {
-        OutputTier::Silent => HookOutput::empty(),
+        OutputTier::Silent if core_text.is_empty() => HookOutput::empty(),
+        OutputTier::Silent => {
+            // Even with no query-matched recall, inject core memory
+            HookOutput::with_message(core_text)
+        }
         OutputTier::Hint | OutputTier::Structured => {
-            let message = format_hint(&payload);
+            let recall_text = format_hint(&payload);
+            let message = if core_text.is_empty() {
+                recall_text
+            } else if recall_text.is_empty() {
+                core_text
+            } else {
+                format!("{core_text}\n\n{recall_text}")
+            };
             if message.is_empty() {
                 HookOutput::empty()
             } else {
