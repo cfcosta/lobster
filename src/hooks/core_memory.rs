@@ -151,6 +151,7 @@ mod tests {
                 episode_id: EpisodeId::derive(suffix),
                 span_summary: "test".into(),
             }],
+            premises: vec![],
         }
     }
 

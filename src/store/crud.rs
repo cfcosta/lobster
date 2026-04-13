@@ -438,6 +438,7 @@ mod tests {
                 episode_id: EpisodeId::derive(b"ep"),
                 span_summary: "discussed storage options".into(),
             }],
+            premises: vec![],
         };
         put_decision(&db, &dec).expect("put");
         let loaded = get_decision(&db, &dec.decision_id.raw()).expect("get");

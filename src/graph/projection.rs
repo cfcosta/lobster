@@ -175,6 +175,7 @@ mod tests {
                 episode_id: EpisodeId::derive(b"ep-1"),
                 span_summary: "discussed options".into(),
             }],
+            premises: vec![],
         }
     }
 

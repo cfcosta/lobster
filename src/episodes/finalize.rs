@@ -296,6 +296,7 @@ pub async fn finalize_episode_at(
                 episode_id,
                 span_summary: summary.summary_text.chars().take(200).collect(),
             }],
+            premises: vec![],
         };
         if let Err(e) = crud::put_decision(db, &decision) {
             return FinalizeResult::Failed(format!(
@@ -614,6 +615,7 @@ mod tests {
                 span_summary: "I chose redb for storage because it is ACID."
                     .to_string(),
             }],
+            premises: vec![],
         };
 
         crud::put_decision(&database, &decision).unwrap();

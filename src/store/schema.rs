@@ -109,6 +109,14 @@ pub struct Decision {
     pub valid_from_ts_utc_ms: i64,
     pub valid_to_ts_utc_ms: Option<i64>,
     pub evidence: Vec<EvidenceRef>,
+    /// Structured premises supporting the decision (optional).
+    ///
+    /// When present, the rationale becomes a conclusion derived from
+    /// these premises. Future retrieval can evaluate whether the
+    /// reasoning still holds by checking if premises are contradicted
+    /// by later episodes.
+    #[serde(default)]
+    pub premises: Vec<String>,
 }
 
 // ── TaskStatus + Task (d49.5) ────────────────────────────────
@@ -337,6 +345,7 @@ mod tests {
             ),
             valid_to_ts_utc_ms: None,
             evidence,
+            premises: vec![],
         }
     }
 
@@ -394,6 +403,55 @@ mod tests {
         assert!(
             !decision.evidence.is_empty(),
             "promoted decisions must have evidence"
+        );
+    }
+
+    // -- Property: Decision with premises round-trips --
+    #[hegel::test(test_cases = 100)]
+    fn prop_decision_with_premises_roundtrip(tc: TestCase) {
+        let mut decision = tc.draw(gen_decision());
+        let n_premises: usize =
+            tc.draw(gs::integers::<usize>().min_value(0).max_value(5));
+        let mut premises = Vec::with_capacity(n_premises);
+        for _ in 0..n_premises {
+            premises
+                .push(tc.draw(gs::text().min_size(1).max_size(100)));
+        }
+        decision.premises = premises;
+
+        let json = serde_json::to_string(&decision).unwrap();
+        let parsed: Decision = serde_json::from_str(&json).unwrap();
+        assert_eq!(decision, parsed);
+    }
+
+    // -- Property: Decision without premises deserializes with empty vec --
+    #[test]
+    fn test_decision_backward_compat() {
+        // Serialize a decision, strip the premises field, then
+        // deserialize to verify backward compatibility
+        let dec = Decision {
+            decision_id: DecisionId::derive(b"bc"),
+            repo_id: RepoId::derive(b"repo"),
+            episode_id: EpisodeId::derive(b"ep"),
+            task_id: None,
+            statement: "test".into(),
+            rationale: "reason".into(),
+            confidence: Confidence::High,
+            valid_from_ts_utc_ms: 1000,
+            valid_to_ts_utc_ms: None,
+            evidence: vec![],
+            premises: vec!["premise 1".into()],
+        };
+        let mut json_val: serde_json::Value =
+            serde_json::to_value(&dec).unwrap();
+        // Remove premises to simulate old serialization format
+        json_val.as_object_mut().unwrap().remove("premises");
+        let json = serde_json::to_string(&json_val).unwrap();
+
+        let parsed: Decision = serde_json::from_str(&json).unwrap();
+        assert!(
+            parsed.premises.is_empty(),
+            "missing premises field should default to empty vec"
         );
     }
 
