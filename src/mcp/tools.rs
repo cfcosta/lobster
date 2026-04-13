@@ -43,6 +43,43 @@ fn load_artifact_text(
     }
 }
 
+/// Load `repo_id` and `task_id` for an artifact from redb.
+fn load_artifact_metadata(
+    db: &Database,
+    artifact_type: &str,
+    id: &crate::store::ids::RawId,
+) -> (Option<String>, Option<String>) {
+    match artifact_type {
+        "decision" => crud::get_decision(db, id).map_or_else(
+            |_| (None, None),
+            |d| {
+                (
+                    Some(d.repo_id.to_string()),
+                    d.task_id.map(|t| t.to_string()),
+                )
+            },
+        ),
+        "summary" | "episode" => crud::get_episode(db, id).map_or_else(
+            |_| (None, None),
+            |ep| {
+                (
+                    Some(ep.repo_id.to_string()),
+                    ep.task_id.map(|t| t.to_string()),
+                )
+            },
+        ),
+        "entity" => crud::get_entity(db, id).map_or_else(
+            |_| (None, None),
+            |e| (Some(e.repo_id.to_string()), None),
+        ),
+        "task" => crud::get_task(db, id).map_or_else(
+            |_| (None, None),
+            |t| (Some(t.repo_id.to_string()), Some(t.task_id.to_string())),
+        ),
+        _ => (None, None),
+    }
+}
+
 /// Result of a `memory_context` tool call.
 #[derive(Debug, Clone, Serialize)]
 pub struct ContextBundle {
@@ -91,11 +128,13 @@ pub fn memory_context(
         .map(|r| {
             let content =
                 load_artifact_text(db, &r.artifact_type, &r.episode_id);
+            let (repo_id, task_id) =
+                load_artifact_metadata(db, &r.artifact_type, &r.episode_id);
             ContextItem {
                 artifact_type: r.artifact_type,
                 snippet: None,
-                repo_id: None,
-                task_id: None,
+                repo_id,
+                task_id,
                 confidence: None,
                 provenance: Some(r.episode_id.to_string()),
                 graph_context: None,
@@ -271,11 +310,13 @@ pub fn memory_search(
                 _ => (None, None),
             };
             let content = load_artifact_text(db, &r.artifact_type, &r.episode_id);
+            let (repo_id, task_id) =
+                load_artifact_metadata(db, &r.artifact_type, &r.episode_id);
             ContextItem {
                 artifact_type: r.artifact_type,
                 snippet,
-                repo_id: None,
-                task_id: None,
+                repo_id,
+                task_id,
                 confidence,
                 provenance: Some(r.episode_id.to_string()),
                 graph_context: None,
@@ -309,13 +350,17 @@ pub struct DecisionsResult {
     pub decisions: Vec<DecisionTimelineEntry>,
 }
 
-/// Return decision timeline for a repo.
+/// Return decision timeline, optionally filtered by repo.
 #[must_use]
-pub fn memory_decisions(db: &Database) -> DecisionsResult {
+pub fn memory_decisions(
+    db: &Database,
+    repo_id: Option<&str>,
+) -> DecisionsResult {
     use redb::{ReadableDatabase, ReadableTable};
 
-    use crate::store::tables;
+    use crate::store::{ids::RepoId, tables};
 
+    let repo_filter = repo_id.map(|r| RepoId::derive(r.as_bytes()));
     let mut decisions = Vec::new();
 
     if let Ok(read_txn) = db.begin_read() {
@@ -327,6 +372,12 @@ pub fn memory_decisions(db: &Database) -> DecisionsResult {
                         crate::store::schema::Decision,
                     >(value.value())
                     {
+                        // Filter by repo if provided
+                        if let Some(ref filter_id) = repo_filter {
+                            if dec.repo_id != *filter_id {
+                                continue;
+                            }
+                        }
                         decisions.push(DecisionTimelineEntry {
                             decision_id: dec.decision_id.to_string(),
                             statement: dec.statement,

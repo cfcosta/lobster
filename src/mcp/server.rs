@@ -86,7 +86,7 @@ impl LobsterServer {
 
     #[tool(description = "Return decision timeline with rationale.")]
     fn memory_decisions(&self) -> String {
-        let result = tools::memory_decisions(&self.db);
+        let result = tools::memory_decisions(&self.db, None);
         serde_json::to_string(&result).unwrap_or_default()
     }
 
