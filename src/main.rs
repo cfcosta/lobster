@@ -235,28 +235,9 @@ async fn cmd_mcp(storage_dir: &std::path::Path) -> Result<()> {
     let ingest_db = db.clone();
     let ingest_grafeo = grafeo.clone();
     let _ingestion = tokio::spawn(async move {
-        let watch_result =
-            lobster::store::watcher::watch_staging(&storage_dir_owned);
-        let (mut rx, _guard) = match watch_result {
-            Ok(pair) => pair,
-            Err(e) => {
-                tracing::error!(
-                    error = %e,
-                    "failed to start staging watcher, \
-                     falling back to polling"
-                );
-                // Fall back to polling every 2 seconds
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    lobster::store::ingest::ingest_staged(
-                        &storage_dir_owned,
-                        &ingest_db,
-                        &ingest_grafeo,
-                    )
-                    .await;
-                }
-            }
-        };
+        let (mut rx, _guard) =
+            lobster::store::watcher::watch_staging(&storage_dir_owned)
+                .expect("failed to start staging watcher");
 
         tracing::info!("staging watcher started");
 
