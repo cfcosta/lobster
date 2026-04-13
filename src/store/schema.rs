@@ -260,8 +260,8 @@ impl RecallEngagement {
             0.0
         } else {
             #[allow(clippy::cast_precision_loss)]
-            let ratio =
-                f64::from(self.engagement_count) / f64::from(self.surface_count);
+            let ratio = f64::from(self.engagement_count)
+                / f64::from(self.surface_count);
             ratio
         }
     }
