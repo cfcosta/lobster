@@ -119,6 +119,34 @@ pub fn format_core_memory(items: &[CoreMemoryItem]) -> String {
     lines.join("\n")
 }
 
+/// Filter core memory items that already appear in recall results.
+///
+/// Removes items whose statement matches a decision in the recall
+/// payload to avoid showing the same decision twice.
+#[must_use]
+pub fn dedup_against_recall(
+    core_items: &[CoreMemoryItem],
+    recall: &crate::hooks::recall::RecallPayload,
+) -> Vec<CoreMemoryItem> {
+    use crate::hooks::recall::RecallItem;
+
+    // Collect all decision statements from recall
+    let recall_statements: std::collections::HashSet<&str> = recall
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            RecallItem::Decision(d) => Some(d.statement.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    core_items
+        .iter()
+        .filter(|item| !recall_statements.contains(item.statement.as_str()))
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use hegel::{TestCase, generators as gs};
@@ -330,5 +358,95 @@ mod tests {
     #[test]
     fn test_format_empty() {
         assert!(format_core_memory(&[]).is_empty());
+    }
+
+    // -- Unit: dedup removes items present in recall --
+    #[test]
+    fn test_dedup_against_recall() {
+        use crate::{
+            hooks::recall::{RecallItem, RecallPayload},
+            rank::evidence::DecisionEvidence,
+        };
+
+        let core_items = vec![
+            CoreMemoryItem {
+                statement: "Use redb for storage".into(),
+                confidence: Confidence::High,
+                valid_from_ts_utc_ms: 1000,
+            },
+            CoreMemoryItem {
+                statement: "Deploy on Fridays".into(),
+                confidence: Confidence::Medium,
+                valid_from_ts_utc_ms: 2000,
+            },
+        ];
+
+        // Recall contains "Use redb for storage" as a decision
+        let recall = RecallPayload {
+            items: vec![RecallItem::Decision(DecisionEvidence {
+                statement: "Use redb for storage".into(),
+                rationale: "ACID".into(),
+                confidence: "High".into(),
+                evidence: vec![],
+                task_context: None,
+            })],
+            truncated: None,
+            latency_ms: 10,
+        };
+
+        let deduped = dedup_against_recall(&core_items, &recall);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].statement, "Deploy on Fridays");
+    }
+
+    // -- Unit: dedup keeps all when no overlap --
+    #[test]
+    fn test_dedup_no_overlap() {
+        use crate::hooks::recall::{RecallItem, RecallPayload};
+
+        let core_items = vec![CoreMemoryItem {
+            statement: "Use redb".into(),
+            confidence: Confidence::High,
+            valid_from_ts_utc_ms: 1000,
+        }];
+
+        let recall = RecallPayload {
+            items: vec![RecallItem::Hint {
+                text: "something else".into(),
+            }],
+            truncated: None,
+            latency_ms: 5,
+        };
+
+        let deduped = dedup_against_recall(&core_items, &recall);
+        assert_eq!(deduped.len(), 1);
+    }
+
+    // -- Unit: dedup with empty recall returns all --
+    #[test]
+    fn test_dedup_empty_recall() {
+        use crate::hooks::recall::RecallPayload;
+
+        let core_items = vec![
+            CoreMemoryItem {
+                statement: "A".into(),
+                confidence: Confidence::High,
+                valid_from_ts_utc_ms: 1000,
+            },
+            CoreMemoryItem {
+                statement: "B".into(),
+                confidence: Confidence::Low,
+                valid_from_ts_utc_ms: 2000,
+            },
+        ];
+
+        let recall = RecallPayload {
+            items: vec![],
+            truncated: None,
+            latency_ms: 0,
+        };
+
+        let deduped = dedup_against_recall(&core_items, &recall);
+        assert_eq!(deduped.len(), 2);
     }
 }
