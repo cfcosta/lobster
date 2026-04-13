@@ -19,6 +19,17 @@ pub fn ensure_indexes(grafeo: &GrafeoDB) {
     let _ = grafeo.create_text_index(labels::DECISION, "statement");
     let _ = grafeo.create_text_index(labels::DECISION, "rationale");
     let _ = grafeo.create_text_index(labels::ENTITY, "canonical_name");
+    let _ = grafeo.create_text_index(labels::TASK, "title");
+
+    // HNSW vector index on episode embedding proxy vectors (cosine)
+    let _ = grafeo.create_vector_index(
+        labels::EPISODE,
+        "embedding",
+        None,               // auto-detect dimensions from data
+        Some("cosine"),     // cosine similarity
+        None,               // default M
+        None,               // default ef_construction
+    );
 
     // Property indexes for fast filtering
     let () = grafeo.create_property_index("repo_id");
@@ -48,6 +59,41 @@ mod tests {
         ensure_indexes(&grafeo);
         // Calling again should not panic
         ensure_indexes(&grafeo);
+    }
+
+    #[test]
+    fn test_vector_index_created() {
+        let grafeo = db::new_in_memory();
+
+        // Create an episode with an embedding
+        let node = db::create_episode_node(
+            &grafeo,
+            "ep-vec",
+            "repo",
+            "Ready",
+            1000,
+        );
+        db::set_episode_summary(&grafeo, node, "test summary");
+        db::set_node_embedding(&grafeo, node, &[0.1, 0.2, 0.3, 0.4]);
+
+        ensure_indexes(&grafeo);
+
+        // Hybrid search should work (BM25 + vector via HNSW)
+        let result = grafeo.hybrid_search(
+            labels::EPISODE,
+            "summary_text",
+            "embedding",
+            "test",
+            Some(&[0.1, 0.2, 0.3, 0.4]),
+            5,
+            None,
+        );
+        if let Ok(hits) = result {
+            assert!(
+                !hits.is_empty(),
+                "hybrid search with vector should find the episode"
+            );
+        }
     }
 
     #[test]
