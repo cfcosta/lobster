@@ -5,7 +5,6 @@
 //! decisions, embed, extract, project to Grafeo, mark Ready.
 
 use grafeo::GrafeoDB;
-use redb::Database;
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -21,6 +20,7 @@ use crate::{
     graph::projection,
     store::{
         crud,
+        db::LobsterDb,
         ids::{EpisodeId, RepoId},
         schema::{
             Confidence,
@@ -63,7 +63,7 @@ pub enum FinalizeResult {
 /// 6. Mark Ready (or `RetryQueued` on failure)
 #[allow(clippy::too_many_lines)]
 pub async fn finalize_episode(
-    db: &Database,
+    db: &LobsterDb,
     grafeo: &GrafeoDB,
     repo_path: &str,
     events_json: &[u8],
@@ -92,7 +92,7 @@ pub async fn finalize_episode(
 /// durable state."
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub async fn finalize_episode_at(
-    db: &Database,
+    db: &LobsterDb,
     grafeo: &GrafeoDB,
     repo_path: &str,
     events_json: &[u8],
@@ -642,7 +642,7 @@ mod tests {
             eprintln!("skipping: no API key");
             return;
         }
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let grafeo = grafeo_db::new_in_memory();
 
         let result = finalize_episode(
@@ -674,7 +674,7 @@ mod tests {
             eprintln!("skipping: no API key");
             return;
         }
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let grafeo = grafeo_db::new_in_memory();
 
         let result = finalize_episode(
@@ -711,7 +711,7 @@ mod tests {
             eprintln!("skipping: no API key");
             return;
         }
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let grafeo = grafeo_db::new_in_memory();
 
         // Craft events whose summary will trigger decision
@@ -760,7 +760,7 @@ mod tests {
     /// not heuristic text matching.)
     #[tokio::test]
     async fn test_decision_persistence_via_crud() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
 
         let episode_id = EpisodeId::derive(b"test-ep");
         let repo_id = RepoId::derive(b"repo");
@@ -861,7 +861,7 @@ mod tests {
     /// then attempting to skip it when it already exists.
     #[test]
     fn test_decision_dedup_skips_existing() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let repo_path = "/test/repo";
         let statement = "Use redb for storage";
 
@@ -902,7 +902,7 @@ mod tests {
             eprintln!("skipping: no API key");
             return;
         }
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let grafeo = grafeo_db::new_in_memory();
 
         let result = finalize_episode(
@@ -936,7 +936,7 @@ mod tests {
             eprintln!("skipping: no API key");
             return;
         }
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let grafeo = grafeo_db::new_in_memory();
 
         let result = finalize_episode(
@@ -1219,7 +1219,7 @@ mod tests {
             eprintln!("skipping: no API key");
             return;
         }
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let grafeo = grafeo_db::new_in_memory();
 
         let result = finalize_episode(

@@ -5,7 +5,6 @@
 use std::sync::Arc;
 
 use grafeo::GrafeoDB;
-use redb::Database;
 use rmcp::{
     ServerHandler,
     ServiceExt,
@@ -16,7 +15,7 @@ use rmcp::{
     tool_router,
 };
 
-use crate::mcp::tools;
+use crate::{mcp::tools, store::db::LobsterDb};
 
 /// Request parameters for tools that take a query string.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -35,7 +34,7 @@ pub struct NeighborsRequest {
 /// The Lobster MCP server handler.
 #[derive(Clone)]
 pub struct LobsterServer {
-    db: Arc<Database>,
+    db: Arc<LobsterDb>,
     grafeo: Arc<GrafeoDB>,
     tool_router: ToolRouter<Self>,
 }
@@ -43,7 +42,7 @@ pub struct LobsterServer {
 impl LobsterServer {
     /// Create a new server with the given database and graph.
     #[must_use]
-    pub fn new(db: Arc<Database>, grafeo: Arc<GrafeoDB>) -> Self {
+    pub fn new(db: Arc<LobsterDb>, grafeo: Arc<GrafeoDB>) -> Self {
         Self {
             db,
             grafeo,
@@ -138,7 +137,7 @@ impl ServerHandler for LobsterServer {
 /// Returns an error if the server fails to start or encounters a
 /// fatal transport error.
 pub async fn run_server(
-    db: Arc<Database>,
+    db: Arc<LobsterDb>,
     grafeo: Arc<GrafeoDB>,
 ) -> anyhow::Result<()> {
     let server = LobsterServer::new(db, grafeo);
@@ -154,7 +153,10 @@ mod tests {
 
     #[test]
     fn test_server_creates() {
-        let db = Arc::new(lobster_db::open_in_memory().unwrap());
+        let db = {
+            let (db, _dir) = lobster_db::open_in_memory().unwrap();
+            Arc::new(db)
+        };
         let grafeo = Arc::new(crate::graph::db::new_in_memory());
         let server = LobsterServer::new(db, grafeo);
         let info = server.get_info();
@@ -172,7 +174,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_server_handshake() {
-        let db = Arc::new(lobster_db::open_in_memory().unwrap());
+        let db = {
+            let (db, _dir) = lobster_db::open_in_memory().unwrap();
+            Arc::new(db)
+        };
         let grafeo = Arc::new(crate::graph::db::new_in_memory());
         let server = LobsterServer::new(db, grafeo);
 

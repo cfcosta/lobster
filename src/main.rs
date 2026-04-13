@@ -89,19 +89,16 @@ async fn cmd_hook(
 
     tracing::debug!(hook_type = event.hook_type(), "hook invoked");
 
-    // Stage the event to the filesystem. The MCP server is the sole
-    // owner of the redb database and will watch the staging directory
-    // via inotify to ingest events as they arrive.
-    //
-    // Hooks NEVER open redb directly — they use a snapshot copy to
-    // avoid lock contention with the MCP server.
+    // Stage the event to the filesystem. The MCP server will watch
+    // the staging directory via inotify to ingest events as they
+    // arrive.
     if let Err(e) = lobster::store::staging::stage_event(storage_dir, &input) {
         tracing::warn!(error = %e, "failed to stage event");
     }
 
-    // Run automatic recall for prompt events. Opens a snapshot copy
-    // of the database (never the live file) so we don't block the
-    // MCP server. Fails open: if the DB is unavailable, return empty.
+    // Run automatic recall for prompt events. LMDB allows concurrent
+    // readers, so we open the live database directly. Fails open if
+    // the DB is unavailable.
     let output = try_hook_recall(storage_dir, &event);
 
     let json =
@@ -113,9 +110,10 @@ async fn cmd_hook(
 
 /// Attempt automatic recall for a hook event.
 ///
-/// Opens a read-only snapshot of the database, rebuilds Grafeo, runs
-/// the recall pipeline, and formats the result. Returns empty output
-/// if the database is unavailable or no relevant memories are found.
+/// Opens the database (LMDB allows concurrent readers), rebuilds
+/// Grafeo, runs the recall pipeline, and formats the result. Returns
+/// empty output if the database is unavailable or no relevant
+/// memories are found.
 fn try_hook_recall(
     storage_dir: &std::path::Path,
     event: &lobster::hooks::events::HookEvent,
@@ -126,7 +124,6 @@ fn try_hook_recall(
         tiered::{OutputTier, classify_tier, format_hint},
     };
 
-    // Only run recall for events that produce queries
     let Some(query) = lobster::hooks::recall::construct_query(event) else {
         tracing::debug!("hook recall: no query for this event");
         return HookOutput::empty();
@@ -134,11 +131,14 @@ fn try_hook_recall(
     tracing::debug!(query = %query, "hook recall: constructed query");
 
     let db_path = lobster::app::config::db_path(storage_dir);
-    let Some(db) = lobster::store::db::open_snapshot(&db_path) else {
-        tracing::debug!(path = %db_path.display(), "hook recall: snapshot unavailable");
-        return HookOutput::empty();
+    let db = match lobster::store::db::open(&db_path) {
+        Ok(db) => db,
+        Err(e) => {
+            tracing::debug!(error = %e, "hook recall: database unavailable");
+            return HookOutput::empty();
+        }
     };
-    tracing::debug!("hook recall: snapshot opened");
+    tracing::debug!("hook recall: database opened");
 
     // Rebuild Grafeo from the snapshot for retrieval
     let grafeo = lobster::graph::db::new_in_memory();
@@ -212,7 +212,7 @@ async fn cmd_mcp(storage_dir: &std::path::Path) -> Result<()> {
     // write_handle is available for tools that need to write
     let _ = write_handle;
 
-    // Rebuild Grafeo from redb for the MCP session.
+    // Rebuild Grafeo from the database for the MCP session.
     // Wrap in Arc for sharing with background tasks (GrafeoDB uses
     // interior mutability and is Send+Sync).
     let grafeo = std::sync::Arc::new(lobster::graph::db::new_in_memory());
@@ -372,7 +372,7 @@ fn cmd_reset(storage_dir: &std::path::Path, force: bool) -> Result<()> {
 
     let db_path = lobster::app::config::db_path(storage_dir);
     if db_path.exists() {
-        std::fs::remove_file(&db_path).context("remove database")?;
+        std::fs::remove_dir_all(&db_path).context("remove database")?;
     }
     println!("Memory reset complete.");
 

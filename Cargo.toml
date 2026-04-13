@@ -14,7 +14,8 @@ clap = { version = "4", features = ["derive"] }
 grafeo = "0.5.34"
 notify = "8.2.0"
 pylate-rs = { version = "1.0.4", git = "https://github.com/cfcosta/pylate-rs" }
-redb = "4.0.0"
+byteorder = "1"
+heed = "0.22.1"
 rig-core = "0.34.0"
 rmcp = { version = "1.4.0", features = ["server", "transport-io"] }
 schemars = "1"
@@ -22,6 +23,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
+tempfile = "3"
 tokio = { version = "1.51.1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -31,12 +33,15 @@ hegeltest = "0.4"
 rmcp = { version = "1.4.0", features = ["client", "transport-io"] }
 tempfile = "3"
 
+# tempfile is also used by store::db::open_in_memory for test databases.
+# It is re-exported from dev-dependencies via the integration test boundary.
+
 [features]
 default = []
 cuda = ["pylate-rs/cuda"]
 
 [lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }

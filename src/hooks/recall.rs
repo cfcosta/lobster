@@ -9,7 +9,6 @@
 use std::time::Instant;
 
 use grafeo::GrafeoDB;
-use redb::Database;
 use serde::Serialize;
 
 use crate::{
@@ -23,6 +22,7 @@ use crate::{
         },
         routes::RetrievalResult,
     },
+    store::db::LobsterDb,
 };
 
 /// Maximum items in automatic recall output.
@@ -57,7 +57,7 @@ pub enum RecallItem {
 #[must_use]
 pub fn run_recall(
     event: &HookEvent,
-    db: &Database,
+    db: &LobsterDb,
     grafeo: &GrafeoDB,
 ) -> RecallPayload {
     let start = Instant::now();
@@ -154,7 +154,7 @@ pub fn construct_query(event: &HookEvent) -> Option<String> {
     }
 }
 
-fn result_to_item(result: &RetrievalResult, db: &Database) -> RecallItem {
+fn result_to_item(result: &RetrievalResult, db: &LobsterDb) -> RecallItem {
     use crate::store::crud;
 
     match result.artifact_type.as_str() {
@@ -265,7 +265,7 @@ mod tests {
 
     #[test]
     fn test_run_recall_empty_db() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let grafeo = grafeo_db::new_in_memory();
         let event = make_prompt_event("test query");
 
@@ -276,7 +276,7 @@ mod tests {
 
     #[test]
     fn test_run_recall_stop_noop() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let grafeo = grafeo_db::new_in_memory();
         let event: HookEvent = serde_json::from_value(serde_json::json!({
             "hook_event_name": "Stop",

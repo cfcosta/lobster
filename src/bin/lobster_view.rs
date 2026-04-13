@@ -1,15 +1,15 @@
-//! lobster-view: dump all data from redb and Grafeo for inspection.
+//! lobster-view: dump all data from the database and Grafeo for
+//! inspection.
 //!
-//! Opens the database in read-only mode so it works even while the
-//! MCP server holds the write lock. Embedding vectors are not
-//! printed but their presence is indicated.
+//! LMDB allows concurrent readers, so this works even while the
+//! MCP server is running. Embedding vectors are not printed but
+//! their presence is indicated.
 
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use lobster::store::{schema, tables};
-use redb::{ReadableDatabase, ReadableTable};
+use lobster::store::{db::LobsterDb, schema};
 
 /// Extract a string property from a Grafeo node, stripping
 /// surrounding quotes that `Value::to_string()` adds.
@@ -53,37 +53,20 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Try read-only first; if the MCP server holds an exclusive lock,
-    // fall back to copying the file to a temp location and repairing it.
-    let tmp_path = std::env::temp_dir().join("lobster-view-snapshot.redb");
-    let ro = redb::ReadOnlyDatabase::open(&db_path);
-    let rw;
-    let db: &dyn ReadableDatabase = if let Ok(db) = &ro {
-        db
-    } else {
-        eprintln!(
-            "Database locked (MCP server running?), reading from snapshot copy..."
-        );
-        std::fs::copy(&db_path, &tmp_path).context("copy database")?;
-        rw = redb::Builder::new()
-            .set_repair_callback(|_| {})
-            .open(&tmp_path)
-            .context("open database copy")?;
-        &rw
-    };
+    let db = lobster::store::db::open(&db_path).context("open database")?;
 
-    dump_redb(db)?;
-    let grafeo = rebuild_grafeo(db)?;
+    dump_db(&db)?;
+    let grafeo = rebuild_grafeo(&db)?;
     dump_grafeo(&grafeo);
 
     Ok(())
 }
 
-// ── redb dump ───────────────────────────────────────────────────
+// ── database dump ──────────────────────────────────────────────
 
-fn dump_redb(db: &dyn ReadableDatabase) -> Result<()> {
+fn dump_db(db: &LobsterDb) -> Result<()> {
     println!("═══════════════════════════════════════════════════════");
-    println!("  redb canonical store");
+    println!("  LMDB canonical store");
     println!("═══════════════════════════════════════════════════════");
 
     dump_metadata(db)?;
@@ -103,38 +86,32 @@ fn dump_redb(db: &dyn ReadableDatabase) -> Result<()> {
     Ok(())
 }
 
-fn dump_metadata(db: &dyn ReadableDatabase) -> Result<()> {
-    let txn = db.begin_read().context("begin read")?;
-    let table = txn.open_table(tables::METADATA).context("open metadata")?;
-    let count = table.iter().context("iter")?.count();
+fn dump_metadata(db: &LobsterDb) -> Result<()> {
+    let rtxn = db.env.read_txn().context("begin read")?;
+    let count = db.metadata.len(&rtxn).unwrap_or(0);
     println!("\n── Metadata ({count}) ──");
-    for entry in table.iter().context("iter")? {
-        let (k, v) = entry.context("read entry")?;
-        let val: serde_json::Value = serde_json::from_slice(v.value())
-            .unwrap_or_else(|_| {
-                serde_json::Value::String(
-                    String::from_utf8_lossy(v.value()).into(),
-                )
+    for entry in db.metadata.iter(&rtxn).context("iter")?.flatten() {
+        let (k, v) = entry;
+        let val: serde_json::Value =
+            serde_json::from_slice(v).unwrap_or_else(|_| {
+                serde_json::Value::String(String::from_utf8_lossy(v).into())
             });
-        println!("  {}: {}", k.value(), format_json(&val));
+        println!("  {k}: {}", format_json(&val));
     }
     Ok(())
 }
 
-fn dump_raw_events(db: &dyn ReadableDatabase) -> Result<()> {
-    let txn = db.begin_read().context("begin read")?;
-    let table = txn
-        .open_table(tables::RAW_EVENTS)
-        .context("open raw_events")?;
-    let count = table.iter().context("iter")?.count();
+fn dump_raw_events(db: &LobsterDb) -> Result<()> {
+    let rtxn = db.env.read_txn().context("begin read")?;
+    let count = db.raw_events.len(&rtxn).unwrap_or(0);
     println!("\n── Raw Events ({count}) ──");
-    for entry in table.iter().context("iter")? {
-        let (k, v) = entry.context("read entry")?;
+    for entry in db.raw_events.iter(&rtxn).context("iter")?.flatten() {
+        let (k, v) = entry;
         let event: schema::RawEvent =
-            serde_json::from_slice(v.value()).context("parse event")?;
+            serde_json::from_slice(v).context("parse event")?;
         println!(
             "  seq={} kind={:?} ts={} payload={}B hash={}",
-            k.value(),
+            k,
             event.event_kind,
             format_ts(event.ts_utc_ms),
             event.payload_bytes.len(),
@@ -144,15 +121,14 @@ fn dump_raw_events(db: &dyn ReadableDatabase) -> Result<()> {
     Ok(())
 }
 
-fn dump_episodes(db: &dyn ReadableDatabase) -> Result<()> {
-    let txn = db.begin_read().context("begin read")?;
-    let table = txn.open_table(tables::EPISODES).context("open episodes")?;
-    let count = table.iter().context("iter")?.count();
+fn dump_episodes(db: &LobsterDb) -> Result<()> {
+    let rtxn = db.env.read_txn().context("begin read")?;
+    let count = db.episodes.len(&rtxn).unwrap_or(0);
     println!("\n── Episodes ({count}) ──");
-    for entry in table.iter().context("iter")? {
-        let (_, v) = entry.context("read entry")?;
+    for entry in db.episodes.iter(&rtxn).context("iter")?.flatten() {
+        let (_, v) = entry;
         let ep: schema::Episode =
-            serde_json::from_slice(v.value()).context("parse episode")?;
+            serde_json::from_slice(v).context("parse episode")?;
         println!(
             "  {} state={:?} seqs={}..{} ts={} retries={} noisy={}",
             ep.episode_id,
@@ -170,17 +146,14 @@ fn dump_episodes(db: &dyn ReadableDatabase) -> Result<()> {
     Ok(())
 }
 
-fn dump_decisions(db: &dyn ReadableDatabase) -> Result<()> {
-    let txn = db.begin_read().context("begin read")?;
-    let table = txn
-        .open_table(tables::DECISIONS)
-        .context("open decisions")?;
-    let count = table.iter().context("iter")?.count();
+fn dump_decisions(db: &LobsterDb) -> Result<()> {
+    let rtxn = db.env.read_txn().context("begin read")?;
+    let count = db.decisions.len(&rtxn).unwrap_or(0);
     println!("\n── Decisions ({count}) ──");
-    for entry in table.iter().context("iter")? {
-        let (_, v) = entry.context("read entry")?;
+    for entry in db.decisions.iter(&rtxn).context("iter")?.flatten() {
+        let (_, v) = entry;
         let dec: schema::Decision =
-            serde_json::from_slice(v.value()).context("parse decision")?;
+            serde_json::from_slice(v).context("parse decision")?;
         println!("  {} confidence={:?}", dec.decision_id, dec.confidence);
         println!("    statement: {}", dec.statement);
         println!("    rationale: {}", dec.rationale);
@@ -201,15 +174,14 @@ fn dump_decisions(db: &dyn ReadableDatabase) -> Result<()> {
     Ok(())
 }
 
-fn dump_tasks(db: &dyn ReadableDatabase) -> Result<()> {
-    let txn = db.begin_read().context("begin read")?;
-    let table = txn.open_table(tables::TASKS).context("open tasks")?;
-    let count = table.iter().context("iter")?.count();
+fn dump_tasks(db: &LobsterDb) -> Result<()> {
+    let rtxn = db.env.read_txn().context("begin read")?;
+    let count = db.tasks.len(&rtxn).unwrap_or(0);
     println!("\n── Tasks ({count}) ──");
-    for entry in table.iter().context("iter")? {
-        let (_, v) = entry.context("read entry")?;
+    for entry in db.tasks.iter(&rtxn).context("iter")?.flatten() {
+        let (_, v) = entry;
         let task: schema::Task =
-            serde_json::from_slice(v.value()).context("parse task")?;
+            serde_json::from_slice(v).context("parse task")?;
         println!(
             "  {} status={:?} \"{}\"",
             task.task_id, task.status, task.title,
@@ -222,15 +194,14 @@ fn dump_tasks(db: &dyn ReadableDatabase) -> Result<()> {
     Ok(())
 }
 
-fn dump_entities(db: &dyn ReadableDatabase) -> Result<()> {
-    let txn = db.begin_read().context("begin read")?;
-    let table = txn.open_table(tables::ENTITIES).context("open entities")?;
-    let count = table.iter().context("iter")?.count();
+fn dump_entities(db: &LobsterDb) -> Result<()> {
+    let rtxn = db.env.read_txn().context("begin read")?;
+    let count = db.entities.len(&rtxn).unwrap_or(0);
     println!("\n── Entities ({count}) ──");
-    for entry in table.iter().context("iter")? {
-        let (_, v) = entry.context("read entry")?;
+    for entry in db.entities.iter(&rtxn).context("iter")?.flatten() {
+        let (_, v) = entry;
         let ent: schema::Entity =
-            serde_json::from_slice(v.value()).context("parse entity")?;
+            serde_json::from_slice(v).context("parse entity")?;
         println!(
             "  {} kind={:?} \"{}\"",
             ent.entity_id, ent.kind, ent.canonical_name,
@@ -239,17 +210,14 @@ fn dump_entities(db: &dyn ReadableDatabase) -> Result<()> {
     Ok(())
 }
 
-fn dump_summary_artifacts(db: &dyn ReadableDatabase) -> Result<()> {
-    let txn = db.begin_read().context("begin read")?;
-    let table = txn
-        .open_table(tables::SUMMARY_ARTIFACTS)
-        .context("open summary_artifacts")?;
-    let count = table.iter().context("iter")?.count();
+fn dump_summary_artifacts(db: &LobsterDb) -> Result<()> {
+    let rtxn = db.env.read_txn().context("begin read")?;
+    let count = db.summary_artifacts.len(&rtxn).unwrap_or(0);
     println!("\n── Summary Artifacts ({count}) ──");
-    for entry in table.iter().context("iter")? {
-        let (_, v) = entry.context("read entry")?;
+    for entry in db.summary_artifacts.iter(&rtxn).context("iter")?.flatten() {
+        let (_, v) = entry;
         let art: schema::SummaryArtifact =
-            serde_json::from_slice(v.value()).context("parse summary")?;
+            serde_json::from_slice(v).context("parse summary")?;
         println!(
             "  episode={} rev={} checksum={}",
             art.episode_id,
@@ -264,17 +232,19 @@ fn dump_summary_artifacts(db: &dyn ReadableDatabase) -> Result<()> {
     Ok(())
 }
 
-fn dump_extraction_artifacts(db: &dyn ReadableDatabase) -> Result<()> {
-    let txn = db.begin_read().context("begin read")?;
-    let table = txn
-        .open_table(tables::EXTRACTION_ARTIFACTS)
-        .context("open extraction_artifacts")?;
-    let count = table.iter().context("iter")?.count();
+fn dump_extraction_artifacts(db: &LobsterDb) -> Result<()> {
+    let rtxn = db.env.read_txn().context("begin read")?;
+    let count = db.extraction_artifacts.len(&rtxn).unwrap_or(0);
     println!("\n── Extraction Artifacts ({count}) ──");
-    for entry in table.iter().context("iter")? {
-        let (_, v) = entry.context("read entry")?;
+    for entry in db
+        .extraction_artifacts
+        .iter(&rtxn)
+        .context("iter")?
+        .flatten()
+    {
+        let (_, v) = entry;
         let art: schema::ExtractionArtifact =
-            serde_json::from_slice(v.value()).context("parse extraction")?;
+            serde_json::from_slice(v).context("parse extraction")?;
         println!(
             "  episode={} rev={} checksum={}",
             art.episode_id,
@@ -296,17 +266,19 @@ fn dump_extraction_artifacts(db: &dyn ReadableDatabase) -> Result<()> {
     Ok(())
 }
 
-fn dump_embedding_artifacts(db: &dyn ReadableDatabase) -> Result<()> {
-    let txn = db.begin_read().context("begin read")?;
-    let table = txn
-        .open_table(tables::EMBEDDING_ARTIFACTS)
-        .context("open embedding_artifacts")?;
-    let count = table.iter().context("iter")?.count();
+fn dump_embedding_artifacts(db: &LobsterDb) -> Result<()> {
+    let rtxn = db.env.read_txn().context("begin read")?;
+    let count = db.embedding_artifacts.len(&rtxn).unwrap_or(0);
     println!("\n── Embedding Artifacts ({count}) ──");
-    for entry in table.iter().context("iter")? {
-        let (_, v) = entry.context("read entry")?;
+    for entry in db
+        .embedding_artifacts
+        .iter(&rtxn)
+        .context("iter")?
+        .flatten()
+    {
+        let (_, v) = entry;
         let art: schema::EmbeddingArtifact =
-            serde_json::from_slice(v.value()).context("parse embedding")?;
+            serde_json::from_slice(v).context("parse embedding")?;
         let pooled_dims = art.pooled_vector_bytes.len() / 4;
         let late_status = art.late_interaction_bytes.as_ref().map_or_else(
             || "no".to_string(),
@@ -327,160 +299,71 @@ fn dump_embedding_artifacts(db: &dyn ReadableDatabase) -> Result<()> {
     Ok(())
 }
 
-fn dump_processing_jobs(db: &dyn ReadableDatabase) -> Result<()> {
-    let txn = db.begin_read().context("begin read")?;
-    let table = txn
-        .open_table(tables::PROCESSING_JOBS)
-        .context("open processing_jobs")?;
-    let count = table.iter().context("iter")?.count();
+fn dump_processing_jobs(db: &LobsterDb) -> Result<()> {
+    let rtxn = db.env.read_txn().context("begin read")?;
+    let count = db.processing_jobs.len(&rtxn).unwrap_or(0);
     println!("\n── Processing Jobs ({count}) ──");
-    for entry in table.iter().context("iter")? {
-        let (k, v) = entry.context("read entry")?;
+    for entry in db.processing_jobs.iter(&rtxn).context("iter")?.flatten() {
+        let (k, v) = entry;
         let val: serde_json::Value =
-            serde_json::from_slice(v.value()).unwrap_or_default();
-        println!("  seq={}: {}", k.value(), format_json(&val));
+            serde_json::from_slice(v).unwrap_or_default();
+        println!("  seq={}: {}", k, format_json(&val));
     }
     Ok(())
 }
 
-fn dump_projection_metadata(db: &dyn ReadableDatabase) -> Result<()> {
-    let txn = db.begin_read().context("begin read")?;
-    let table = txn
-        .open_table(tables::PROJECTION_METADATA)
-        .context("open projection_metadata")?;
-    let count = table.iter().context("iter")?.count();
+fn dump_projection_metadata(db: &LobsterDb) -> Result<()> {
+    let rtxn = db.env.read_txn().context("begin read")?;
+    let count = db.projection_metadata.len(&rtxn).unwrap_or(0);
     println!("\n── Projection Metadata ({count}) ──");
-    for entry in table.iter().context("iter")? {
-        let (_, v) = entry.context("read entry")?;
+    for entry in db
+        .projection_metadata
+        .iter(&rtxn)
+        .context("iter")?
+        .flatten()
+    {
+        let (_, v) = entry;
         let val: serde_json::Value =
-            serde_json::from_slice(v.value()).unwrap_or_default();
+            serde_json::from_slice(v).unwrap_or_default();
         println!("  {}", format_json(&val));
     }
     Ok(())
 }
 
-fn dump_repo_config(db: &dyn ReadableDatabase) -> Result<()> {
-    let txn = db.begin_read().context("begin read")?;
-    let table = txn
-        .open_table(tables::REPO_CONFIG)
-        .context("open repo_config")?;
-    let count = table.iter().context("iter")?.count();
+fn dump_repo_config(db: &LobsterDb) -> Result<()> {
+    let rtxn = db.env.read_txn().context("begin read")?;
+    let count = db.repo_config.len(&rtxn).unwrap_or(0);
     println!("\n── Repo Config ({count}) ──");
-    for entry in table.iter().context("iter")? {
-        let (_, v) = entry.context("read entry")?;
+    for entry in db.repo_config.iter(&rtxn).context("iter")?.flatten() {
+        let (_, v) = entry;
         let val: serde_json::Value =
-            serde_json::from_slice(v.value()).unwrap_or_default();
+            serde_json::from_slice(v).unwrap_or_default();
         println!("  {}", format_json(&val));
     }
     Ok(())
 }
 
-fn dump_retrieval_stats(db: &dyn ReadableDatabase) -> Result<()> {
-    let txn = db.begin_read().context("begin read")?;
-    let table = txn
-        .open_table(tables::RETRIEVAL_STATS)
-        .context("open retrieval_stats")?;
-    let count = table.iter().context("iter")?.count();
+fn dump_retrieval_stats(db: &LobsterDb) -> Result<()> {
+    let rtxn = db.env.read_txn().context("begin read")?;
+    let count = db.retrieval_stats.len(&rtxn).unwrap_or(0);
     println!("\n── Retrieval Stats ({count}) ──");
-    for entry in table.iter().context("iter")? {
-        let (k, v) = entry.context("read entry")?;
+    for entry in db.retrieval_stats.iter(&rtxn).context("iter")?.flatten() {
+        let (k, v) = entry;
         let val: serde_json::Value =
-            serde_json::from_slice(v.value()).unwrap_or_default();
-        println!("  {}: {}", k.value(), format_json(&val));
+            serde_json::from_slice(v).unwrap_or_default();
+        println!("  {k}: {}", format_json(&val));
     }
     Ok(())
 }
 
 // ── Grafeo rebuild + dump ───────────────────────────────────────
 
-fn rebuild_grafeo(db: &dyn ReadableDatabase) -> Result<grafeo::GrafeoDB> {
-    use lobster::{
-        episodes::finalize::parse_entity_kind,
-        extract::traits::ExtractionOutput,
-        graph::{db as gdb, projection},
-        store::ids::EntityId,
-    };
-
-    let grafeo = gdb::new_in_memory();
-
-    let txn = db.begin_read().context("begin read")?;
-    let ep_table = txn.open_table(tables::EPISODES).context("open episodes")?;
-
-    for entry in ep_table.iter().context("iter")? {
-        let (_, v) = entry.context("read entry")?;
-        let ep: schema::Episode =
-            serde_json::from_slice(v.value()).context("parse episode")?;
-
-        if ep.processing_state != schema::ProcessingState::Ready {
-            continue;
-        }
-
-        let ep_node = projection::project_episode(&grafeo, &ep);
-
-        let sum_table = txn
-            .open_table(tables::SUMMARY_ARTIFACTS)
-            .context("open summary_artifacts")?;
-        if let Some(sum_guard) = sum_table
-            .get(ep.episode_id.raw().as_bytes())
-            .context("get summary")?
-        {
-            if let Ok(art) = serde_json::from_slice::<schema::SummaryArtifact>(
-                sum_guard.value(),
-            ) {
-                gdb::set_episode_summary(&grafeo, ep_node, &art.summary_text);
-            }
-        }
-
-        let dec_table = txn
-            .open_table(tables::DECISIONS)
-            .context("open decisions")?;
-        for dec_entry in dec_table.iter().context("iter")? {
-            let (_, dv) = dec_entry.context("read entry")?;
-            if let Ok(dec) =
-                serde_json::from_slice::<schema::Decision>(dv.value())
-            {
-                if dec.episode_id == ep.episode_id {
-                    projection::project_decision(&grafeo, &dec, ep_node);
-                }
-            }
-        }
-
-        let ext_table = txn
-            .open_table(tables::EXTRACTION_ARTIFACTS)
-            .context("open extraction_artifacts")?;
-        if let Some(ext_guard) = ext_table
-            .get(ep.episode_id.raw().as_bytes())
-            .context("get extraction")?
-        {
-            if let Ok(art) = serde_json::from_slice::<schema::ExtractionArtifact>(
-                ext_guard.value(),
-            ) {
-                if let Ok(output) =
-                    serde_json::from_slice::<ExtractionOutput>(&art.output_json)
-                {
-                    for entity_fact in &output.entities {
-                        let Some(kind) = parse_entity_kind(&entity_fact.kind)
-                        else {
-                            continue;
-                        };
-                        let ent = schema::Entity {
-                            entity_id: EntityId::derive(
-                                entity_fact.name.as_bytes(),
-                            ),
-                            repo_id: ep.repo_id,
-                            kind,
-                            canonical_name: entity_fact.name.clone(),
-                            first_seen_episode: None,
-                            last_seen_ts_utc_ms: None,
-                            mention_count: 0,
-                        };
-                        projection::project_entity(&grafeo, &ent, ep_node);
-                    }
-                }
-            }
-        }
+fn rebuild_grafeo(db: &LobsterDb) -> Result<grafeo::GrafeoDB> {
+    let grafeo = lobster::graph::db::new_in_memory();
+    if let Err(e) = lobster::graph::rebuild::rebuild_from_redb(db, &grafeo) {
+        anyhow::bail!("rebuild failed: {e}");
     }
-
+    lobster::graph::indexes::ensure_indexes(&grafeo);
     Ok(grafeo)
 }
 
@@ -496,9 +379,7 @@ fn dump_grafeo(grafeo: &grafeo::GrafeoDB) {
     );
     println!("═══════════════════════════════════════════════════════");
 
-    // Build a lookup: NodeId -> short display name for readable edges
     let mut node_names: BTreeMap<grafeo::NodeId, String> = BTreeMap::new();
-    // Also collect edges per source node for inline display
     let mut outgoing: BTreeMap<grafeo::NodeId, Vec<(String, String)>> =
         BTreeMap::new();
 
@@ -521,7 +402,7 @@ fn dump_grafeo(grafeo: &grafeo::GrafeoDB) {
             .push((edge.edge_type.to_string(), dst_name));
     }
 
-    // ── Episodes ────────────────────────────────────────────────
+    // Episodes
     let episodes: Vec<_> = grafeo
         .iter_nodes()
         .filter(|n| n.has_label("Episode"))
@@ -555,7 +436,7 @@ fn dump_grafeo(grafeo: &grafeo::GrafeoDB) {
         }
     }
 
-    // ── Decisions ───────────────────────────────────────────────
+    // Decisions
     let decisions: Vec<_> = grafeo
         .iter_nodes()
         .filter(|n| n.has_label("Decision"))
@@ -576,7 +457,7 @@ fn dump_grafeo(grafeo: &grafeo::GrafeoDB) {
         }
     }
 
-    // ── Tasks ───────────────────────────────────────────────────
+    // Tasks
     let tasks: Vec<_> = grafeo
         .iter_nodes()
         .filter(|n| n.has_label("Task"))
@@ -716,8 +597,6 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        // Find the last char boundary at or before `max` to avoid
-        // slicing inside a multi-byte UTF-8 sequence.
         let mut end = max;
         while end > 0 && !s.is_char_boundary(end) {
             end -= 1;
@@ -738,7 +617,6 @@ mod tests {
 
     // ── format_ts ───────────────────────────────────────────────
 
-    /// Any i64 produces a non-empty string (never panics).
     #[hegel::test(test_cases = 500)]
     fn prop_format_ts_never_panics(tc: TestCase) {
         let ms: i64 = tc.draw(gs::integers());
@@ -746,11 +624,8 @@ mod tests {
         assert!(!out.is_empty());
     }
 
-    /// Valid timestamps (post-epoch, pre-year-9999) produce the
-    /// expected `YYYY-MM-DD HH:MM:SS` format (19 chars).
     #[hegel::test(test_cases = 500)]
     fn prop_format_ts_valid_range_format(tc: TestCase) {
-        // 1970-01-01 to 2100-01-01 in millis
         let ms: i64 = tc
             .draw(gs::integers().min_value(0_i64).max_value(4_102_444_800_000));
         let out = format_ts(ms);
@@ -759,24 +634,16 @@ mod tests {
             19,
             "expected YYYY-MM-DD HH:MM:SS (19 chars), got {out:?}"
         );
-        assert_eq!(&out[4..5], "-");
-        assert_eq!(&out[7..8], "-");
-        assert_eq!(&out[10..11], " ");
-        assert_eq!(&out[13..14], ":");
-        assert_eq!(&out[16..17], ":");
     }
 
-    /// Out-of-range timestamps fall back to `{ms}ms`.
     #[test]
     fn test_format_ts_fallback() {
-        // chrono cannot represent i64::MIN as millis
         let out = format_ts(i64::MIN);
         assert!(out.ends_with("ms"), "expected fallback, got {out:?}");
     }
 
     // ── hex_short ───────────────────────────────────────────────
 
-    /// Output is always exactly 11 bytes: 8 hex chars + "...".
     #[hegel::test(test_cases = 500)]
     fn prop_hex_short_length(tc: TestCase) {
         let bytes: [u8; 32] = tc.draw(gs::arrays(gs::integers()));
@@ -784,7 +651,6 @@ mod tests {
         assert_eq!(out.len(), 11, "got {out:?}");
     }
 
-    /// Output matches manual formatting of the first 4 bytes.
     #[hegel::test(test_cases = 500)]
     fn prop_hex_short_matches_reference(tc: TestCase) {
         let bytes: [u8; 32] = tc.draw(gs::arrays(gs::integers()));
@@ -797,23 +663,15 @@ mod tests {
 
     // ── truncate ────────────────────────────────────────────────
 
-    /// Output length never exceeds max + 3 (for the "..." suffix).
     #[hegel::test(test_cases = 500)]
     fn prop_truncate_bounded(tc: TestCase) {
         let s: String = tc.draw(gs::text().max_size(500));
         let max: usize =
             tc.draw(gs::integers::<usize>().min_value(0).max_value(500));
         let out = truncate(&s, max);
-        assert!(
-            out.len() <= max + 3,
-            "truncate({:?}, {max}) = {:?} (len {})",
-            s,
-            out,
-            out.len()
-        );
+        assert!(out.len() <= max + 3);
     }
 
-    /// Strings at or below max are returned unchanged.
     #[hegel::test(test_cases = 500)]
     fn prop_truncate_identity_when_short(tc: TestCase) {
         let s: String = tc.draw(gs::text().max_size(200));
@@ -825,7 +683,6 @@ mod tests {
         assert_eq!(truncate(&s, max), s);
     }
 
-    /// Strings longer than max get the "..." suffix.
     #[hegel::test(test_cases = 500)]
     fn prop_truncate_adds_ellipsis(tc: TestCase) {
         let s: String = tc.draw(gs::text().min_size(2).max_size(500));
@@ -840,7 +697,6 @@ mod tests {
 
     // ── strip_quotes ────────────────────────────────────────────
 
-    /// Wrapping a string in quotes then stripping recovers original.
     #[hegel::test(test_cases = 500)]
     fn prop_strip_quotes_round_trip(tc: TestCase) {
         let s: String = tc.draw(gs::text().max_size(200));
@@ -848,18 +704,14 @@ mod tests {
         assert_eq!(strip_quotes(&quoted), s);
     }
 
-    /// Applying `strip_quotes` twice to an unquoted string is the
-    /// same as applying it once (idempotent on unquoted input).
     #[hegel::test(test_cases = 500)]
     fn prop_strip_quotes_idempotent_unquoted(tc: TestCase) {
-        // Generate strings that don't start AND end with quotes
         let s: String = tc.draw(gs::text().max_size(200));
         let once = strip_quotes(&s);
         let twice = strip_quotes(&once);
         assert_eq!(once, twice);
     }
 
-    /// Strings without matching quotes are returned unchanged.
     #[test]
     fn test_strip_quotes_partial() {
         assert_eq!(strip_quotes("\"hello"), "\"hello");
@@ -870,11 +722,8 @@ mod tests {
 
     // ── format_json ─────────────────────────────────────────────
 
-    /// `format_json` round-trips with `serde_json::from_str` for any
-    /// valid JSON value.
     #[hegel::test(test_cases = 200)]
     fn prop_format_json_roundtrip(tc: TestCase) {
-        // Generate simple JSON values
         let n: i64 = tc.draw(gs::integers());
         let val = serde_json::Value::Number(n.into());
         let out = format_json(&val);
@@ -883,7 +732,7 @@ mod tests {
         assert_eq!(val, parsed);
     }
 
-    // ── redb dump round-trip ────────────────────────────────────
+    // ── database dump tests ────────────────────────────────────
 
     use lobster::store::{
         crud,
@@ -945,59 +794,44 @@ mod tests {
         }
     }
 
-    /// Helper: count entries in a redb table via the same iteration
-    /// pattern that the dump functions use.
-    fn count_table_entries<K: redb::Key + 'static, V: redb::Value + 'static>(
-        db: &impl ReadableDatabase,
-        table_def: redb::TableDefinition<K, V>,
-    ) -> usize {
-        let txn = db.begin_read().unwrap();
-        let table = txn.open_table(table_def).unwrap();
-        table.iter().unwrap().count()
-    }
-
-    /// Writing N raw events via CRUD produces exactly N entries
-    /// when iterated with the dump pattern.
     #[hegel::test(test_cases = 50)]
     fn prop_raw_events_dump_count(tc: TestCase) {
         let n: usize =
             tc.draw(gs::integers::<usize>().min_value(0).max_value(20));
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
 
         for seq in 0..n {
             let event = tc.draw(gen_raw_event(seq as u64));
             crud::append_raw_event(&database, &event).unwrap();
         }
 
-        assert_eq!(count_table_entries(&database, tables::RAW_EVENTS), n);
+        let rtxn = database.env.read_txn().unwrap();
+        let count = database.raw_events.len(&rtxn).unwrap() as usize;
+        assert_eq!(count, n);
     }
 
-    /// Writing N episodes via CRUD produces exactly N entries
-    /// when iterated with the dump pattern. Uses unique episode
-    /// IDs to avoid overwrites.
     #[hegel::test(test_cases = 50)]
     fn prop_episodes_dump_count(tc: TestCase) {
         let n: usize =
             tc.draw(gs::integers::<usize>().min_value(0).max_value(20));
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
 
         for i in 0..n {
             let mut ep = tc.draw(gen_episode());
-            // Ensure unique episode IDs by mixing in the index
             ep.episode_id = EpisodeId::derive(format!("ep-{i}").as_bytes());
             crud::put_episode(&database, &ep).unwrap();
         }
 
-        assert_eq!(count_table_entries(&database, tables::EPISODES), n);
+        let rtxn = database.env.read_txn().unwrap();
+        let count = database.episodes.len(&rtxn).unwrap() as usize;
+        assert_eq!(count, n);
     }
 
-    /// Every raw event written can be deserialized back through
-    /// the table iteration pattern (same as dump functions).
     #[hegel::test(test_cases = 50)]
     fn prop_raw_events_deserialize_roundtrip(tc: TestCase) {
         let n: usize =
             tc.draw(gs::integers::<usize>().min_value(1).max_value(10));
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let mut written = Vec::new();
 
         for seq in 0..n {
@@ -1006,13 +840,11 @@ mod tests {
             written.push(event);
         }
 
-        // Read back via the same pattern as dump_raw_events
-        let txn = database.begin_read().unwrap();
-        let table = txn.open_table(tables::RAW_EVENTS).unwrap();
+        let rtxn = database.env.read_txn().unwrap();
         let mut read_back = Vec::new();
-        for entry in table.iter().unwrap() {
-            let (_, v) = entry.unwrap();
-            let event: RawEvent = serde_json::from_slice(v.value()).unwrap();
+        for entry in database.raw_events.iter(&rtxn).unwrap().flatten() {
+            let (_, v) = entry;
+            let event: RawEvent = serde_json::from_slice(v).unwrap();
             read_back.push(event);
         }
 
@@ -1022,13 +854,11 @@ mod tests {
         }
     }
 
-    /// Every episode written can be deserialized back through
-    /// table iteration.
     #[hegel::test(test_cases = 50)]
     fn prop_episodes_deserialize_roundtrip(tc: TestCase) {
         let n: usize =
             tc.draw(gs::integers::<usize>().min_value(1).max_value(10));
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let mut written = Vec::new();
 
         for i in 0..n {
@@ -1038,16 +868,14 @@ mod tests {
             written.push(ep);
         }
 
-        let txn = database.begin_read().unwrap();
-        let table = txn.open_table(tables::EPISODES).unwrap();
+        let rtxn = database.env.read_txn().unwrap();
         let mut read_back: Vec<Episode> = Vec::new();
-        for entry in table.iter().unwrap() {
-            let (_, v) = entry.unwrap();
-            read_back.push(serde_json::from_slice(v.value()).unwrap());
+        for entry in database.episodes.iter(&rtxn).unwrap().flatten() {
+            let (_, v) = entry;
+            read_back.push(serde_json::from_slice(v).unwrap());
         }
 
         assert_eq!(written.len(), read_back.len());
-        // Sort both by episode_id for stable comparison
         written.sort_by_key(|e| e.episode_id);
         read_back.sort_by_key(|e| e.episode_id);
         for (w, r) in written.iter().zip(read_back.iter()) {
@@ -1062,9 +890,6 @@ mod tests {
         graph::db as grafeo_db,
     };
 
-    /// `rebuild_grafeo` on a database with finalized episodes produces
-    /// the same node count as the original Grafeo that was built
-    /// during finalization.
     #[hegel::test(test_cases = 20)]
     fn prop_rebuild_matches_original_node_count(tc: TestCase) {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -1075,7 +900,7 @@ mod tests {
         let n: usize =
             tc.draw(gs::integers::<usize>().min_value(1).max_value(3));
 
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let original_grafeo = grafeo_db::new_in_memory();
 
         for i in 0..n {
@@ -1097,7 +922,6 @@ mod tests {
         let original_nodes = original_grafeo.node_count();
         assert!(original_nodes >= n, "expected at least {n} nodes");
 
-        // Rebuild from the same redb
         let rebuilt = rebuild_grafeo(&database).unwrap();
 
         assert_eq!(
@@ -1107,11 +931,9 @@ mod tests {
         );
     }
 
-    /// `rebuild_grafeo` skips non-Ready episodes: only Pending
-    /// episodes produce zero nodes.
     #[test]
     fn test_rebuild_skips_pending() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let ep = Episode {
             episode_id: EpisodeId::derive(b"pending-ep"),
             repo_id: RepoId::derive(b"repo"),
@@ -1133,101 +955,49 @@ mod tests {
         );
     }
 
-    /// `rebuild_grafeo` on an empty database produces an empty graph.
     #[test]
     fn test_rebuild_empty_db() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let grafeo = rebuild_grafeo(&database).unwrap();
         assert_eq!(grafeo.node_count(), 0);
         assert_eq!(grafeo.edge_count(), 0);
     }
 
-    // ── Snapshot fallback ───────────────────────────────────────
+    // ── Persistence round-trip ──────────────────────────────────
 
-    /// A cleanly-closed database can be copied and opened via the
-    /// snapshot fallback path, and reads back the same record count.
     #[hegel::test(test_cases = 20)]
-    fn prop_snapshot_reads_same_data(tc: TestCase) {
+    fn prop_file_db_reads_same_data(tc: TestCase) {
         let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("test.redb");
+        let db_dir = dir.path().join("lmdb");
 
-        // Write N raw events to a file-based database
         let n: usize =
             tc.draw(gs::integers::<usize>().min_value(1).max_value(15));
         {
-            let database = db::open(&db_path).unwrap();
+            let database = db::open(&db_dir).unwrap();
             for seq in 0..n {
                 let event = tc.draw(gen_raw_event(seq as u64));
                 crud::append_raw_event(&database, &event).unwrap();
             }
-            // database dropped here — cleanly closed
         }
 
-        // Simulate the snapshot fallback: copy + repair + open
-        let copy_path = dir.path().join("snapshot.redb");
-        std::fs::copy(&db_path, &copy_path).unwrap();
-        let snapshot = redb::Builder::new()
-            .set_repair_callback(|_| {})
-            .open(&copy_path)
-            .expect("open snapshot copy");
-
-        let count = count_table_entries(&snapshot, tables::RAW_EVENTS);
-        assert_eq!(count, n, "snapshot should have all {n} events");
+        // Reopen and verify
+        let database = db::open(&db_dir).unwrap();
+        let rtxn = database.env.read_txn().unwrap();
+        let count = database.raw_events.len(&rtxn).unwrap() as usize;
+        assert_eq!(count, n);
     }
 
-    /// Snapshot fallback preserves episode data including all fields.
-    #[hegel::test(test_cases = 20)]
-    fn prop_snapshot_preserves_episodes(tc: TestCase) {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("test.redb");
-
-        let n: usize =
-            tc.draw(gs::integers::<usize>().min_value(1).max_value(10));
-        let mut written = Vec::new();
-        {
-            let database = db::open(&db_path).unwrap();
-            for i in 0..n {
-                let mut ep = tc.draw(gen_episode());
-                ep.episode_id =
-                    EpisodeId::derive(format!("snap-ep-{i}").as_bytes());
-                crud::put_episode(&database, &ep).unwrap();
-                written.push(ep);
-            }
-        }
-
-        let copy_path = dir.path().join("snapshot.redb");
-        std::fs::copy(&db_path, &copy_path).unwrap();
-        let snapshot = redb::Builder::new()
-            .set_repair_callback(|_| {})
-            .open(&copy_path)
-            .unwrap();
-
-        let txn = snapshot.begin_read().unwrap();
-        let table = txn.open_table(tables::EPISODES).unwrap();
-        let mut read_back: Vec<Episode> = Vec::new();
-        for entry in table.iter().unwrap() {
-            let (_, v) = entry.unwrap();
-            read_back.push(serde_json::from_slice(v.value()).unwrap());
-        }
-
-        written.sort_by_key(|e| e.episode_id);
-        read_back.sort_by_key(|e| e.episode_id);
-        assert_eq!(written, read_back);
-    }
-
-    /// `rebuild_grafeo` on a snapshot copy produces the same graph
-    /// as on the original database.
     #[test]
-    fn test_snapshot_rebuild_matches_original() {
+    fn test_file_db_rebuild_matches_original() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
 
         let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("test.redb");
+        let db_dir = dir.path().join("lmdb");
 
-        let database = db::open(&db_path).unwrap();
+        let database = db::open(&db_dir).unwrap();
         let grafeo = grafeo_db::new_in_memory();
 
         let result = rt.block_on(finalize_episode(
@@ -1242,18 +1012,11 @@ mod tests {
         assert!(matches!(result, FinalizeResult::Ready { .. }));
         let original_nodes = grafeo.node_count();
 
-        // Close the original to release the lock
         drop(database);
 
-        // Snapshot path
-        let copy_path = dir.path().join("snapshot.redb");
-        std::fs::copy(&db_path, &copy_path).unwrap();
-        let snapshot = redb::Builder::new()
-            .set_repair_callback(|_| {})
-            .open(&copy_path)
-            .unwrap();
-
-        let rebuilt = rebuild_grafeo(&snapshot).unwrap();
+        // Reopen
+        let database = db::open(&db_dir).unwrap();
+        let rebuilt = rebuild_grafeo(&database).unwrap();
         assert_eq!(rebuilt.node_count(), original_nodes);
     }
 }

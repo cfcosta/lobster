@@ -3,13 +3,13 @@
 //! This is the entry point for ALL data into Lobster. Every hook
 //! event is appended to redb as a `RawEvent`.
 
-use redb::Database;
 use sha2::{Digest, Sha256};
 
 use crate::{
     hooks::{events::HookEvent, redact},
     store::{
         crud,
+        db::LobsterDb,
         ids::RepoId,
         schema::{EventKind, RawEvent},
     },
@@ -23,7 +23,7 @@ use crate::{
 ///
 /// Returns `StoreError` if persistence fails.
 pub fn capture_event(
-    db: &Database,
+    db: &LobsterDb,
     event: &HookEvent,
     seq: u64,
 ) -> Result<u64, crud::StoreError> {
@@ -78,21 +78,15 @@ pub fn capture_event(
 /// In a real system this would use an atomic counter, but for
 /// the single-writer hook model, scanning the last key works.
 #[must_use]
-pub fn next_seq(db: &Database) -> u64 {
-    use redb::{ReadableDatabase, ReadableTable};
-
-    let Ok(read_txn) = db.begin_read() else {
+pub fn next_seq(db: &LobsterDb) -> u64 {
+    let Ok(rtxn) = db.env.read_txn() else {
         return 0;
     };
-    let Ok(table) = read_txn.open_table(crate::store::tables::RAW_EVENTS)
-    else {
-        return 0;
-    };
-    let Ok(last) = table.last() else {
+    let Ok(last) = db.raw_events.last(&rtxn) else {
         return 0;
     };
 
-    last.map_or(0, |(k, _)| k.value() + 1)
+    last.map_or(0, |(k, _)| k + 1)
 }
 
 #[cfg(test)]
@@ -111,7 +105,7 @@ mod tests {
 
     #[test]
     fn test_capture_persists_event() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let event = make_event("fix the bug");
 
         let seq = capture_event(&database, &event, 0).unwrap();
@@ -126,7 +120,7 @@ mod tests {
 
     #[test]
     fn test_capture_multiple_events() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
 
         capture_event(&database, &make_event("first"), 0).unwrap();
         capture_event(&database, &make_event("second"), 1).unwrap();
@@ -140,13 +134,13 @@ mod tests {
 
     #[test]
     fn test_next_seq_empty_db() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         assert_eq!(next_seq(&database), 0);
     }
 
     #[test]
     fn test_next_seq_after_capture() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         capture_event(&database, &make_event("test"), 0).unwrap();
         assert_eq!(next_seq(&database), 1);
 
@@ -156,7 +150,7 @@ mod tests {
 
     #[test]
     fn test_capture_redacts_secrets() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let mut event = make_event("fix the bug");
         // Inject a secret-like pattern in the prompt
         event.extra.insert(
@@ -184,7 +178,7 @@ mod tests {
     /// can be read back.
     #[hegel::test(test_cases = 50)]
     fn prop_capture_roundtrip(tc: TestCase) {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let prompt: String = tc.draw(
             gs::text()
                 .min_size(1)

@@ -4,10 +4,9 @@
 //! supersedes an older one. Uses word-overlap similarity on statements
 //! to identify candidates, then marks the older decision's `valid_to`.
 
-use redb::{Database, ReadableDatabase};
-
 use crate::store::{
     crud,
+    db::LobsterDb,
     schema::{Confidence, Decision},
 };
 
@@ -83,7 +82,7 @@ pub fn word_overlap(a: &str, b: &str) -> f64 {
 /// newer decision's `valid_from`.
 #[allow(clippy::must_use_candidate)]
 pub fn scan_superseded_decisions(
-    db: &Database,
+    db: &LobsterDb,
     config: &SupersessionConfig,
 ) -> SupersessionResult {
     scan_superseded_decisions_inner(db, config, true)
@@ -91,34 +90,27 @@ pub fn scan_superseded_decisions(
 
 /// Inner implementation with `MaxSim` toggle for testing.
 fn scan_superseded_decisions_inner(
-    db: &Database,
+    db: &LobsterDb,
     config: &SupersessionConfig,
     use_maxsim: bool,
 ) -> SupersessionResult {
-    use redb::ReadableTable;
-
     let mut result = SupersessionResult::default();
 
-    // Load all decisions
-    let Ok(read_txn) = db.begin_read() else {
-        return result;
-    };
-    let Ok(table) = read_txn.open_table(crate::store::tables::DECISIONS) else {
-        return result;
-    };
-    let Ok(iter) = table.iter() else {
-        return result;
-    };
-
     let mut decisions: Vec<Decision> = Vec::new();
-    for entry in iter.flatten() {
-        let (_, value) = entry;
-        if let Ok(dec) = serde_json::from_slice::<Decision>(value.value()) {
-            decisions.push(dec);
+    {
+        let Ok(rtxn) = db.env.read_txn() else {
+            return result;
+        };
+        let Ok(iter) = db.decisions.iter(&rtxn) else {
+            return result;
+        };
+        for entry in iter.flatten() {
+            let (_, value) = entry;
+            if let Ok(dec) = serde_json::from_slice::<Decision>(value) {
+                decisions.push(dec);
+            }
         }
     }
-    drop(table);
-    drop(read_txn);
 
     result.decisions_scanned = decisions.len();
 
@@ -273,7 +265,7 @@ mod tests {
     // -- Unit: supersession detects matching decisions --
     #[test]
     fn test_supersession_detects_match() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
 
         let old = make_decision(
             b"old",
@@ -308,7 +300,7 @@ mod tests {
     // -- Unit: unrelated decisions are not superseded --
     #[test]
     fn test_unrelated_not_superseded() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
 
         let d1 = make_decision(b"d1", "Use redb for storage", "Fast", 1000);
         let d2 = make_decision(
@@ -329,7 +321,7 @@ mod tests {
     // -- Unit: already superseded decisions are skipped --
     #[test]
     fn test_already_superseded_skipped() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
 
         let mut old =
             make_decision(b"old", "Use SQLite for storage", "Available", 1000);
@@ -354,7 +346,7 @@ mod tests {
     // -- Unit: empty DB produces no supersessions --
     #[test]
     fn test_empty_db() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let result = scan_superseded_decisions_inner(
             &database,
             &SupersessionConfig::default(),
@@ -367,7 +359,7 @@ mod tests {
     // -- Property: supersession is idempotent --
     #[hegel::test(test_cases = 30)]
     fn prop_supersession_idempotent(tc: TestCase) {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
 
         // Create 2-4 decisions with overlapping topics
         let n: usize =
@@ -413,7 +405,7 @@ mod tests {
     // -- Property: superseded count never exceeds total - 1 --
     #[hegel::test(test_cases = 30)]
     fn prop_superseded_bounded(tc: TestCase) {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let n: usize =
             tc.draw(gs::integers::<usize>().min_value(1).max_value(6));
 
@@ -454,7 +446,7 @@ mod tests {
             return;
         }
 
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
 
         let old = make_decision(
             b"old",

@@ -1,296 +1,231 @@
 //! Database initialization and lifecycle management.
 //!
-//! Wraps redb with Lobster-specific setup: creates all tables on
-//! first open and provides an in-memory backend for testing.
+//! Wraps LMDB (via heed) with Lobster-specific setup: creates all
+//! named databases on first open. LMDB provides MVCC — multiple
+//! readers can coexist with a single writer without blocking.
+#![allow(unsafe_code)]
 
 use std::path::Path;
 
-use redb::{Database, backends::InMemoryBackend};
+use heed::{
+    Database,
+    Env,
+    EnvOpenOptions,
+    types::{Bytes, Str, U64},
+};
 
-use crate::store::tables;
+/// Default map size: 1 GiB. LMDB requires a pre-declared maximum.
+const DEFAULT_MAP_SIZE: usize = 1024 * 1024 * 1024;
 
-/// Open or create a Lobster database at the given path.
+/// Maximum number of named databases (we have 15, leave headroom).
+const MAX_DBS: u32 = 20;
+
+/// A sequence-keyed database (u64 -> bytes).
+pub type SeqDb = Database<U64<byteorder::BigEndian>, Bytes>;
+
+/// An ID-keyed database ([u8] -> bytes).
+pub type IdDb = Database<Bytes, Bytes>;
+
+/// A string-keyed database (str -> bytes).
+pub type StrDb = Database<Str, Bytes>;
+
+/// The Lobster database: an LMDB environment plus all named databases.
+pub struct LobsterDb {
+    pub env: Env,
+
+    // Core record tables
+    pub raw_events: SeqDb,
+    pub episodes: IdDb,
+    pub decisions: IdDb,
+    pub tasks: IdDb,
+    pub entities: IdDb,
+
+    // Artifact tables
+    pub summary_artifacts: IdDb,
+    pub extraction_artifacts: IdDb,
+    pub embedding_artifacts: IdDb,
+
+    // Operational tables
+    pub processing_jobs: SeqDb,
+    pub projection_metadata: IdDb,
+    pub repo_config: IdDb,
+    pub retrieval_stats: StrDb,
+    pub tool_sequences: IdDb,
+    pub recall_engagements: IdDb,
+    pub metadata: StrDb,
+}
+
+/// Open or create a Lobster database at the given directory path.
 ///
-/// All tables are created lazily on first access, but we open them
-/// once here to ensure the schema exists.
+/// Creates all named databases on first access. The path must be a
+/// directory (LMDB stores `data.mdb` and `lock.mdb` inside it).
 ///
 /// # Errors
 ///
-/// Returns a redb error if the file cannot be created or opened.
-pub fn open(path: &Path) -> Result<Database, redb::Error> {
-    let db = Database::create(path)?;
-    init_tables(&db)?;
-    Ok(db)
+/// Returns a heed error if the environment cannot be opened.
+pub fn open(path: &Path) -> Result<LobsterDb, heed::Error> {
+    std::fs::create_dir_all(path).map_err(|e| {
+        heed::Error::Io(std::io::Error::new(
+            e.kind(),
+            format!("create db dir: {e}"),
+        ))
+    })?;
+
+    let env = unsafe {
+        EnvOpenOptions::new()
+            .map_size(DEFAULT_MAP_SIZE)
+            .max_dbs(MAX_DBS)
+            .open(path)?
+    };
+
+    create_databases(&env)
 }
 
-/// Try to open the database, returning `None` if the file is locked
-/// by another process (e.g., the MCP server).
+/// Create a temporary database for testing.
 ///
-/// This is used by hooks to opportunistically access redb when the
-/// MCP server is not running, without blocking or crashing.
-#[must_use]
-pub fn try_open(path: &Path) -> Option<Database> {
-    if !path.exists() {
-        return None;
-    }
-    match Database::create(path) {
-        Ok(db) => match init_tables(&db) {
-            Ok(()) => Some(db),
-            Err(e) => {
-                tracing::debug!(error = %e, "try_open: init_tables failed");
-                None
-            }
-        },
-        Err(e) => {
-            tracing::debug!(error = %e, "try_open: database locked or error");
-            None
-        }
-    }
-}
-
-/// Create an in-memory database for testing.
+/// Uses a temp directory that lives as long as the returned struct.
 ///
 /// # Errors
 ///
-/// Returns a redb error if the database cannot be initialized.
-pub fn open_in_memory() -> Result<Database, redb::Error> {
-    let backend = InMemoryBackend::new();
-    let db = Database::builder().create_with_backend(backend)?;
-    init_tables(&db)?;
-    Ok(db)
+/// Returns a heed error if the database cannot be initialized.
+pub fn open_in_memory() -> Result<(LobsterDb, tempfile::TempDir), heed::Error> {
+    let dir = tempfile::tempdir().map_err(|e| {
+        heed::Error::Io(std::io::Error::new(e.kind(), format!("tempdir: {e}")))
+    })?;
+
+    let env = unsafe {
+        EnvOpenOptions::new()
+            .map_size(DEFAULT_MAP_SIZE)
+            .max_dbs(MAX_DBS)
+            .open(dir.path())?
+    };
+
+    let db = create_databases(&env)?;
+    Ok((db, dir))
 }
 
-/// Open a read-only snapshot of the database.
-///
-/// Tries `ReadOnlyDatabase` first. If the file is exclusively locked
-/// (e.g. by the MCP server), copies it to a temp file, repairs it,
-/// and opens the copy. Returns `None` if the file doesn't exist or
-/// both approaches fail.
-#[must_use]
-pub fn open_snapshot(path: &Path) -> Option<Database> {
-    if !path.exists() {
-        return None;
-    }
+/// Create all named databases within an environment.
+fn create_databases(env: &Env) -> Result<LobsterDb, heed::Error> {
+    let mut wtxn = env.write_txn()?;
 
-    // Fast path: try opening the copy directly with repair allowed
-    let tmp = path.with_extension("redb.snapshot");
-    if std::fs::copy(path, &tmp).is_err() {
-        return None;
-    }
+    let raw_events = env.create_database(&mut wtxn, Some("raw_events"))?;
+    let episodes = env.create_database(&mut wtxn, Some("episodes"))?;
+    let decisions = env.create_database(&mut wtxn, Some("decisions"))?;
+    let tasks = env.create_database(&mut wtxn, Some("tasks"))?;
+    let entities = env.create_database(&mut wtxn, Some("entities"))?;
+    let summary_artifacts =
+        env.create_database(&mut wtxn, Some("summary_artifacts"))?;
+    let extraction_artifacts =
+        env.create_database(&mut wtxn, Some("extraction_artifacts"))?;
+    let embedding_artifacts =
+        env.create_database(&mut wtxn, Some("embedding_artifacts"))?;
+    let processing_jobs =
+        env.create_database(&mut wtxn, Some("processing_jobs"))?;
+    let projection_metadata =
+        env.create_database(&mut wtxn, Some("projection_metadata"))?;
+    let repo_config = env.create_database(&mut wtxn, Some("repo_config"))?;
+    let retrieval_stats =
+        env.create_database(&mut wtxn, Some("retrieval_stats"))?;
+    let tool_sequences =
+        env.create_database(&mut wtxn, Some("tool_sequences"))?;
+    let recall_engagements =
+        env.create_database(&mut wtxn, Some("recall_engagements"))?;
+    let metadata = env.create_database(&mut wtxn, Some("metadata"))?;
 
-    let result = redb::Builder::new().set_repair_callback(|_| {}).open(&tmp);
+    wtxn.commit()?;
 
-    match result {
-        Ok(db) => Some(db),
-        Err(e) => {
-            tracing::debug!(error = %e, "open_snapshot: failed to open copy");
-            let _ = std::fs::remove_file(&tmp);
-            None
-        }
-    }
-}
-
-/// Ensure all tables exist by opening each one in a single write
-/// transaction.
-fn init_tables(db: &Database) -> Result<(), redb::Error> {
-    let write_txn = db.begin_write()?;
-    write_txn.open_table(tables::RAW_EVENTS)?;
-    write_txn.open_table(tables::EPISODES)?;
-    write_txn.open_table(tables::DECISIONS)?;
-    write_txn.open_table(tables::TASKS)?;
-    write_txn.open_table(tables::ENTITIES)?;
-    write_txn.open_table(tables::SUMMARY_ARTIFACTS)?;
-    write_txn.open_table(tables::EXTRACTION_ARTIFACTS)?;
-    write_txn.open_table(tables::EMBEDDING_ARTIFACTS)?;
-    write_txn.open_table(tables::PROCESSING_JOBS)?;
-    write_txn.open_table(tables::PROJECTION_METADATA)?;
-    write_txn.open_table(tables::REPO_CONFIG)?;
-    write_txn.open_table(tables::RETRIEVAL_STATS)?;
-    write_txn.open_table(tables::METADATA)?;
-    write_txn.commit()?;
-    Ok(())
+    Ok(LobsterDb {
+        env: env.clone(),
+        raw_events,
+        episodes,
+        decisions,
+        tasks,
+        entities,
+        summary_artifacts,
+        extraction_artifacts,
+        embedding_artifacts,
+        processing_jobs,
+        projection_metadata,
+        repo_config,
+        retrieval_stats,
+        tool_sequences,
+        recall_engagements,
+        metadata,
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use redb::{ReadableDatabase, ReadableTable};
-
     use super::*;
 
     #[test]
     fn test_open_in_memory() {
-        let db = open_in_memory().expect("in-memory db");
-        // Verify we can read a table (get returns None for missing key)
-        let read_txn = db.begin_read().expect("begin read");
-        let table =
-            read_txn.open_table(tables::RAW_EVENTS).expect("open table");
-        assert!(table.get(0u64).expect("get").is_none());
+        let (db, _dir) = open_in_memory().expect("in-memory db");
+        let rtxn = db.env.read_txn().expect("begin read");
+        assert!(db.raw_events.get(&rtxn, &0u64).expect("get").is_none());
     }
 
     #[test]
     fn test_open_file() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("test.redb");
-        let db = open(&path).expect("open file db");
+        let db = open(dir.path()).expect("open file db");
 
-        // Write something, close, reopen
+        // Write something, verify persistence
         {
-            let write_txn = db.begin_write().expect("write");
-            {
-                let mut table =
-                    write_txn.open_table(tables::METADATA).expect("open");
-                table
-                    .insert("schema_version", b"1".as_slice())
-                    .expect("insert");
-            }
-            write_txn.commit().expect("commit");
+            let mut wtxn = db.env.write_txn().expect("write");
+            db.metadata
+                .put(&mut wtxn, "schema_version", b"1")
+                .expect("insert");
+            wtxn.commit().expect("commit");
         }
-        drop(db);
 
-        // Reopen and verify persistence
-        let db2 = open(&path).expect("reopen");
-        let read_txn = db2.begin_read().expect("read");
-        let table = read_txn.open_table(tables::METADATA).expect("open");
-        let val = table.get("schema_version").expect("get");
+        // Read back
+        let rtxn = db.env.read_txn().expect("read");
+        let val = db.metadata.get(&rtxn, "schema_version").expect("get");
         assert!(val.is_some());
-        assert_eq!(val.unwrap().value(), b"1");
+        assert_eq!(val.unwrap(), b"1");
     }
 
     #[test]
-    fn test_try_open_nonexistent() {
+    fn test_reopen_persists() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("nonexistent.redb");
-        assert!(try_open(&path).is_none());
-    }
 
-    #[test]
-    fn test_try_open_unlocked() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("test.redb");
-
-        // Create the DB first, then close it
+        // Write and close
         {
-            let _db = open(&path).expect("create");
+            let db = open(dir.path()).expect("open");
+            let mut wtxn = db.env.write_txn().expect("write");
+            db.metadata
+                .put(&mut wtxn, "test_key", b"test_val")
+                .expect("insert");
+            wtxn.commit().expect("commit");
         }
 
-        // try_open should succeed on an unlocked file
-        let db = try_open(&path);
-        assert!(db.is_some());
+        // Reopen and verify
+        let db2 = open(dir.path()).expect("reopen");
+        let rtxn = db2.env.read_txn().expect("read");
+        let val = db2.metadata.get(&rtxn, "test_key").expect("get");
+        assert_eq!(val.unwrap(), b"test_val");
     }
 
     #[test]
-    fn test_try_open_locked() {
+    fn test_concurrent_read_write_across_threads() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("test.redb");
+        let db = std::sync::Arc::new(open(dir.path()).expect("open"));
 
-        // Hold the DB open (simulating MCP server)
-        let _holder = open(&path).expect("open");
-
-        // try_open should fail because the file is locked
-        let result = try_open(&path);
-        assert!(
-            result.is_none(),
-            "try_open should return None when DB is locked"
-        );
-    }
-
-    // ── open_snapshot ───────────────────────────────────────────
-
-    #[test]
-    fn test_open_snapshot_nonexistent() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("nope.redb");
-        assert!(open_snapshot(&path).is_none());
-    }
-
-    #[test]
-    fn test_open_snapshot_reads_data() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("test.redb");
-
-        // Write data, then close
+        // Write initial data
         {
-            let db = open(&path).expect("create");
-            let write_txn = db.begin_write().expect("write");
-            {
-                let mut table =
-                    write_txn.open_table(tables::METADATA).expect("open");
-                table
-                    .insert("test_key", b"test_val".as_slice())
-                    .expect("insert");
-            }
-            write_txn.commit().expect("commit");
+            let mut wtxn = db.env.write_txn().expect("write");
+            db.raw_events.put(&mut wtxn, &0u64, b"event0").expect("put");
+            wtxn.commit().expect("commit");
         }
 
-        // Snapshot should read the same data
-        let snap = open_snapshot(&path).expect("snapshot");
-        let read_txn = snap.begin_read().expect("read");
-        let table = read_txn.open_table(tables::METADATA).expect("open");
-        let val = table.get("test_key").expect("get");
-        assert!(val.is_some());
-        assert_eq!(val.unwrap().value(), b"test_val");
-    }
-
-    use hegel::{TestCase, generators as gs};
-
-    /// `open_snapshot` on a populated DB produces a snapshot with
-    /// the same number of raw events.
-    #[hegel::test(test_cases = 20)]
-    fn prop_open_snapshot_preserves_event_count(tc: TestCase) {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.redb");
-
-        let n: usize =
-            tc.draw(gs::integers::<usize>().min_value(1).max_value(15));
-        {
-            let db = open(&path).unwrap();
-            for seq in 0..n {
-                let event = crate::store::schema::RawEvent {
-                    seq: seq as u64,
-                    repo_id: crate::store::ids::RepoId::derive(b"repo"),
-                    ts_utc_ms: 1_700_000_000_000,
-                    event_kind:
-                        crate::store::schema::EventKind::UserPromptSubmit,
-                    payload_hash: [0; 32],
-                    payload_bytes: vec![],
-                };
-                crate::store::crud::append_raw_event(&db, &event).unwrap();
-            }
-        }
-
-        let snap = open_snapshot(&path).expect("snapshot");
-        let read_txn = snap.begin_read().unwrap();
-        let table = read_txn.open_table(tables::RAW_EVENTS).unwrap();
-        let count = table.iter().unwrap().count();
-        assert_eq!(count, n);
-    }
-
-    /// `open_snapshot` works even when the original DB is locked.
-    #[hegel::test(test_cases = 10)]
-    fn prop_open_snapshot_while_locked(tc: TestCase) {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.redb");
-
-        let n: usize =
-            tc.draw(gs::integers::<usize>().min_value(1).max_value(10));
-        let db = open(&path).unwrap();
-        for seq in 0..n {
-            let event = crate::store::schema::RawEvent {
-                seq: seq as u64,
-                repo_id: crate::store::ids::RepoId::derive(b"repo"),
-                ts_utc_ms: 1_700_000_000_000,
-                event_kind: crate::store::schema::EventKind::UserPromptSubmit,
-                payload_hash: [0; 32],
-                payload_bytes: vec![],
-            };
-            crate::store::crud::append_raw_event(&db, &event).unwrap();
-        }
-
-        // DB is still open (locked) — snapshot should still work
-        let snap = open_snapshot(&path).expect("snapshot while locked");
-        let read_txn = snap.begin_read().unwrap();
-        let table = read_txn.open_table(tables::RAW_EVENTS).unwrap();
-        let count = table.iter().unwrap().count();
-        assert_eq!(count, n);
+        // Read from another thread while main thread could write
+        let db2 = db;
+        let handle = std::thread::spawn(move || {
+            let rtxn = db2.env.read_txn().expect("read");
+            let val = db2.raw_events.get(&rtxn, &0u64).expect("get");
+            assert_eq!(val.unwrap(), b"event0");
+        });
+        handle.join().expect("thread join");
     }
 }

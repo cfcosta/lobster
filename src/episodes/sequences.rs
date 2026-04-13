@@ -4,11 +4,9 @@
 //! events from redb and produces the ordered sequence of `EventKind`
 //! values. This is the input for procedural-memory pattern detection.
 
-use redb::{Database, ReadableDatabase};
-
 use crate::store::{
+    db::LobsterDb,
     schema::{EventKind, RawEvent},
-    tables,
 };
 
 /// Extract the ordered sequence of `EventKind` values from an
@@ -19,7 +17,7 @@ use crate::store::{
 /// is empty or the table is unavailable.
 #[must_use]
 pub fn extract_event_sequence(
-    db: &Database,
+    db: &LobsterDb,
     start_seq: u64,
     end_seq: u64,
 ) -> Vec<EventKind> {
@@ -27,21 +25,18 @@ pub fn extract_event_sequence(
         return vec![];
     }
 
-    let Ok(read_txn) = db.begin_read() else {
-        return vec![];
-    };
-    let Ok(table) = read_txn.open_table(tables::RAW_EVENTS) else {
+    let Ok(rtxn) = db.env.read_txn() else {
         return vec![];
     };
 
-    let Ok(range) = table.range(start_seq..=end_seq) else {
+    let Ok(range) = db.raw_events.range(&rtxn, &(&start_seq..=&end_seq)) else {
         return vec![];
     };
 
     let mut kinds = Vec::new();
     for entry in range.flatten() {
         let (_, value) = entry;
-        if let Ok(event) = serde_json::from_slice::<RawEvent>(value.value()) {
+        if let Ok(event) = serde_json::from_slice::<RawEvent>(value) {
             kinds.push(event.event_kind);
         }
     }
@@ -121,7 +116,7 @@ mod tests {
     // -- Property: extracted sequence length <= number of events in range --
     #[hegel::test(test_cases = 50)]
     fn prop_sequence_length_bounded(tc: TestCase) {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let n_events: u64 =
             tc.draw(gs::integers::<u64>().min_value(0).max_value(20));
 
@@ -144,7 +139,7 @@ mod tests {
     // -- Property: extracted kinds are all valid EventKind values --
     #[hegel::test(test_cases = 50)]
     fn prop_extracted_kinds_valid(tc: TestCase) {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let n_events: u64 =
             tc.draw(gs::integers::<u64>().min_value(1).max_value(15));
         let valid_kinds = all_event_kinds();
@@ -166,7 +161,7 @@ mod tests {
     // -- Property: extraction preserves insertion order --
     #[hegel::test(test_cases = 50)]
     fn prop_extraction_preserves_order(tc: TestCase) {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let n_events: usize =
             tc.draw(gs::integers::<usize>().min_value(2).max_value(15));
 
@@ -186,7 +181,7 @@ mod tests {
     // -- Property: empty range produces empty sequence --
     #[hegel::test(test_cases = 50)]
     fn prop_empty_range_empty_sequence(tc: TestCase) {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         // Insert some events
         for seq in 0..5 {
             crud::append_raw_event(
@@ -210,7 +205,7 @@ mod tests {
     #[allow(clippy::cast_possible_truncation)]
     #[hegel::test(test_cases = 50)]
     fn prop_subrange_extraction(tc: TestCase) {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let total: u64 =
             tc.draw(gs::integers::<u64>().min_value(5).max_value(20));
 

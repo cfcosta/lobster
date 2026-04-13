@@ -6,11 +6,9 @@
 //! `ChatGPT`'s always-injected user facts and Hermes's frozen
 //! `MEMORY.md` prompt block.
 
-use redb::{Database, ReadableDatabase, ReadableTable};
-
 use crate::store::{
+    db::LobsterDb,
     schema::{Confidence, Decision},
-    tables,
 };
 
 /// Maximum number of core memory items to inject.
@@ -34,20 +32,17 @@ pub struct CoreMemoryItem {
 ///
 /// Returns at most `MAX_CORE_ITEMS` items.
 #[must_use]
-pub fn load_core_memory(db: &Database) -> Vec<CoreMemoryItem> {
+pub fn load_core_memory(db: &LobsterDb) -> Vec<CoreMemoryItem> {
     load_core_memory_n(db, MAX_CORE_ITEMS)
 }
 
 /// Load core memory with a configurable limit.
 #[must_use]
-pub fn load_core_memory_n(db: &Database, limit: usize) -> Vec<CoreMemoryItem> {
-    let Ok(read_txn) = db.begin_read() else {
+pub fn load_core_memory_n(db: &LobsterDb, limit: usize) -> Vec<CoreMemoryItem> {
+    let Ok(rtxn) = db.env.read_txn() else {
         return vec![];
     };
-    let Ok(table) = read_txn.open_table(tables::DECISIONS) else {
-        return vec![];
-    };
-    let Ok(iter) = table.iter() else {
+    let Ok(iter) = db.decisions.iter(&rtxn) else {
         return vec![];
     };
 
@@ -56,7 +51,7 @@ pub fn load_core_memory_n(db: &Database, limit: usize) -> Vec<CoreMemoryItem> {
     let mut candidates: Vec<Decision> = Vec::new();
     for entry in iter.flatten() {
         let (_, value) = entry;
-        if let Ok(dec) = serde_json::from_slice::<Decision>(value.value()) {
+        if let Ok(dec) = serde_json::from_slice::<Decision>(value) {
             // Only include still-valid decisions
             if dec.valid_to_ts_utc_ms.is_some_and(|vt| vt <= now_ms) {
                 continue;
@@ -186,7 +181,7 @@ mod tests {
     // -- Unit: empty DB returns empty core memory --
     #[test]
     fn test_empty_db() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let items = load_core_memory(&database);
         assert!(items.is_empty());
     }
@@ -194,7 +189,7 @@ mod tests {
     // -- Unit: high confidence decisions come first --
     #[test]
     fn test_confidence_ordering() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
 
         crud::put_decision(
             &database,
@@ -222,7 +217,7 @@ mod tests {
     // -- Unit: superseded decisions are excluded --
     #[test]
     fn test_superseded_excluded() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
 
         let mut old =
             make_decision(b"old", "Old decision", Confidence::High, 1000);
@@ -241,7 +236,7 @@ mod tests {
     // -- Unit: limit is respected --
     #[test]
     fn test_limit() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         for i in 0..10u32 {
             crud::put_decision(
                 &database,
@@ -262,7 +257,7 @@ mod tests {
     // -- Property: result count <= limit --
     #[hegel::test(test_cases = 30)]
     fn prop_result_bounded(tc: TestCase) {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let n: usize =
             tc.draw(gs::integers::<usize>().min_value(0).max_value(8));
         let limit: usize =
@@ -298,7 +293,7 @@ mod tests {
     // -- Property: results are sorted by confidence then recency --
     #[hegel::test(test_cases = 30)]
     fn prop_sorted_by_confidence(tc: TestCase) {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let n: usize =
             tc.draw(gs::integers::<usize>().min_value(2).max_value(6));
 

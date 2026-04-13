@@ -29,7 +29,7 @@ async fn test_decision_detection_end_to_end() {
 
 #[test]
 fn test_recall_pipeline_runs_on_empty_db() {
-    let database = db::open_in_memory().unwrap();
+    let (database, _dir) = db::open_in_memory().unwrap();
     let grafeo = grafeo_db::new_in_memory();
 
     let event = make_prompt_event("What did we decide about storage?");

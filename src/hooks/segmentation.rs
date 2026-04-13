@@ -1,14 +1,12 @@
 //! Hook-level episode segmentation.
 //!
 //! Since hooks are short-lived processes, segmentation checks
-//! the last event in redb and decides whether the new event
-//! starts a new episode or extends the current one.
-
-use redb::{Database, ReadableDatabase, ReadableTable};
+//! the last event in the database and decides whether the new
+//! event starts a new episode or extends the current one.
 
 use crate::{
     episodes::segmenter::SegmentationConfig,
-    store::{ids::RepoId, schema::RawEvent, tables},
+    store::{db::LobsterDb, ids::RepoId, schema::RawEvent},
 };
 
 /// Result of the segmentation check.
@@ -24,17 +22,15 @@ pub enum SegmentAction {
 /// or start a new one, based on idle gap and repo transition.
 #[must_use]
 pub fn check_segmentation(
-    db: &Database,
+    db: &LobsterDb,
     new_event_ts_ms: i64,
     new_repo_id: &RepoId,
     new_seq: u64,
     config: &SegmentationConfig,
 ) -> SegmentAction {
-    // Find the most recent event in redb
     let last_event = get_last_event(db);
 
     let Some(last) = last_event else {
-        // No previous events — this is the first event ever
         return SegmentAction::StartNew { seq: new_seq };
     };
 
@@ -49,9 +45,6 @@ pub fn check_segmentation(
         return SegmentAction::StartNew { seq: new_seq };
     }
 
-    // No boundary — extend the current episode
-    // Find the start of the current episode by walking back
-    // from the last event to find where the previous boundary was
     let start_seq = find_episode_start(db, &last, config);
 
     SegmentAction::ExtendCurrent {
@@ -60,25 +53,21 @@ pub fn check_segmentation(
     }
 }
 
-/// Get the most recent raw event from redb.
-fn get_last_event(db: &Database) -> Option<RawEvent> {
-    let read_txn = db.begin_read().ok()?;
-    let table = read_txn.open_table(tables::RAW_EVENTS).ok()?;
-    let (_, value) = table.last().ok()??;
-    serde_json::from_slice(value.value()).ok()
+/// Get the most recent raw event.
+fn get_last_event(db: &LobsterDb) -> Option<RawEvent> {
+    let rtxn = db.env.read_txn().ok()?;
+    let (_, value) = db.raw_events.last(&rtxn).ok()??;
+    serde_json::from_slice(value).ok()
 }
 
 /// Walk backwards from a given event to find where the current
 /// episode started (i.e., where the last boundary was).
 fn find_episode_start(
-    db: &Database,
+    db: &LobsterDb,
     last: &RawEvent,
     config: &SegmentationConfig,
 ) -> u64 {
-    let Ok(read_txn) = db.begin_read() else {
-        return last.seq;
-    };
-    let Ok(table) = read_txn.open_table(tables::RAW_EVENTS) else {
+    let Ok(rtxn) = db.env.read_txn() else {
         return last.seq;
     };
 
@@ -86,20 +75,17 @@ fn find_episode_start(
     let mut prev_ts = last.ts_utc_ms;
     let mut prev_repo = last.repo_id;
 
-    // Walk backwards through events
     if last.seq == 0 {
         return 0;
     }
     for seq in (0..last.seq).rev() {
-        let Ok(Some(guard)) = table.get(seq) else {
+        let Ok(Some(bytes)) = db.raw_events.get(&rtxn, &seq) else {
             break;
         };
-        let Ok(event) = serde_json::from_slice::<RawEvent>(guard.value())
-        else {
+        let Ok(event) = serde_json::from_slice::<RawEvent>(bytes) else {
             break;
         };
 
-        // Check if this event is a boundary
         let gap = prev_ts - event.ts_utc_ms;
         if gap >= config.idle_gap_ms || event.repo_id != prev_repo {
             break;
@@ -118,12 +104,12 @@ mod tests {
     use super::*;
     use crate::store::{
         crud,
-        db,
+        db::{self, LobsterDb},
         ids::RepoId,
         schema::{EventKind, RawEvent},
     };
 
-    fn insert_event(database: &redb::Database, seq: u64, ts: i64, repo: &[u8]) {
+    fn insert_event(database: &LobsterDb, seq: u64, ts: i64, repo: &[u8]) {
         let event = RawEvent {
             seq,
             repo_id: RepoId::derive(repo),
@@ -137,7 +123,7 @@ mod tests {
 
     #[test]
     fn test_first_event_starts_new() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let config = SegmentationConfig::default();
         let repo = RepoId::derive(b"/project");
 
@@ -148,15 +134,13 @@ mod tests {
 
     #[test]
     fn test_close_events_extend() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let config = SegmentationConfig {
-            idle_gap_ms: 5 * 60 * 1000, // 5 min
+            idle_gap_ms: 5 * 60 * 1000,
         };
 
-        // Insert event with explicit timestamp
         insert_event(&database, 0, 1_700_000_000_000, b"/project");
 
-        // Second event 10 seconds later — should extend
         let repo = RepoId::derive(b"/project");
         let action =
             check_segmentation(&database, 1_700_000_010_000, &repo, 1, &config);
@@ -168,33 +152,26 @@ mod tests {
 
     #[test]
     fn test_idle_gap_starts_new() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let config = SegmentationConfig {
             idle_gap_ms: 5 * 60 * 1000,
         };
 
         insert_event(&database, 0, 1_700_000_000_000, b"/project");
 
-        // Second event 10 minutes later — should start new
         let repo = RepoId::derive(b"/project");
-        let action = check_segmentation(
-            &database,
-            1_700_000_600_000, // 10 min gap
-            &repo,
-            1,
-            &config,
-        );
+        let action =
+            check_segmentation(&database, 1_700_000_600_000, &repo, 1, &config);
         assert_eq!(action, SegmentAction::StartNew { seq: 1 });
     }
 
     #[test]
     fn test_repo_transition_starts_new() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let config = SegmentationConfig::default();
 
         insert_event(&database, 0, 1_700_000_000_000, b"/project-a");
 
-        // Same time but different repo
         let repo_b = RepoId::derive(b"/project-b");
         let action = check_segmentation(
             &database,

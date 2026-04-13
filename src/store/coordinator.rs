@@ -1,17 +1,17 @@
-//! Write-coordinator task for serialized redb writes.
+//! Write-coordinator task for serialized LMDB writes.
 //!
-//! Only one `WriteTransaction` can be active at a time in redb.
+//! Only one write transaction can be active at a time in LMDB.
 //! The coordinator receives write requests via an mpsc channel
 //! and executes them sequentially. Other components send requests
 //! rather than acquiring write locks directly.
 
 use std::sync::Arc;
 
-use redb::Database;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::store::{
     crud,
+    db::LobsterDb,
     schema::{
         Decision,
         EmbeddingArtifact,
@@ -71,7 +71,7 @@ impl WriteHandle {
     ///
     /// # Errors
     ///
-    /// Returns `StoreError` if serialization or the redb write fails.
+    /// Returns `StoreError` if serialization or the write fails.
     pub async fn append_raw_event(
         &self,
         event: RawEvent,
@@ -84,10 +84,10 @@ impl WriteHandle {
             })
             .await
             .map_err(|_| {
-                crud::StoreError::Redb("coordinator channel closed".into())
+                crud::StoreError::Db("coordinator channel closed".into())
             })?;
         reply_rx.await.map_err(|_| {
-            crud::StoreError::Redb("coordinator reply dropped".into())
+            crud::StoreError::Db("coordinator reply dropped".into())
         })?
     }
 
@@ -108,10 +108,10 @@ impl WriteHandle {
             })
             .await
             .map_err(|_| {
-                crud::StoreError::Redb("coordinator channel closed".into())
+                crud::StoreError::Db("coordinator channel closed".into())
             })?;
         reply_rx.await.map_err(|_| {
-            crud::StoreError::Redb("coordinator reply dropped".into())
+            crud::StoreError::Db("coordinator reply dropped".into())
         })?
     }
 }
@@ -122,7 +122,7 @@ impl WriteHandle {
 /// `JoinHandle` for the background task.
 #[must_use]
 pub fn spawn(
-    db: Arc<Database>,
+    db: Arc<LobsterDb>,
     buffer_size: usize,
 ) -> (WriteHandle, tokio::task::JoinHandle<()>) {
     let (tx, mut rx) = mpsc::channel::<WriteRequest>(buffer_size);
@@ -180,7 +180,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_coordinator_append_raw_event() {
-        let database = Arc::new(db::open_in_memory().expect("db"));
+        let (database, _dir) = db::open_in_memory().expect("db");
+        let database = Arc::new(database);
         let (write_handle, _join) = spawn(database.clone(), 16);
 
         let event = RawEvent {
@@ -204,7 +205,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_coordinator_put_episode() {
-        let database = Arc::new(db::open_in_memory().expect("db"));
+        let (database, _dir) = db::open_in_memory().expect("db");
+        let database = Arc::new(database);
         let (write_handle, _join) = spawn(database.clone(), 16);
 
         let ep = Episode {
@@ -228,7 +230,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_coordinator_serializes_writes() {
-        let database = Arc::new(db::open_in_memory().expect("db"));
+        let (database, _dir) = db::open_in_memory().expect("db");
+        let database = Arc::new(database);
         let (write_handle, _join) = spawn(database.clone(), 64);
 
         // Send multiple writes concurrently

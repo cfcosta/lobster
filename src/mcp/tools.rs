@@ -4,12 +4,11 @@
 //! MCP protocol. Each tool returns JSON-serializable results.
 
 use grafeo::GrafeoDB;
-use redb::Database;
 use serde::Serialize;
 
 use crate::{
     rank::routes::execute_query,
-    store::{crud, schema::EntityKind},
+    store::{crud, db::LobsterDb, schema::EntityKind},
 };
 
 /// Load the actual text content for an artifact from redb.
@@ -18,7 +17,7 @@ use crate::{
 /// depending on artifact type. Falls back to artifact type + ID
 /// if the record is missing.
 fn load_artifact_text(
-    db: &Database,
+    db: &LobsterDb,
     artifact_type: &str,
     id: &crate::store::ids::RawId,
 ) -> String {
@@ -45,7 +44,7 @@ fn load_artifact_text(
 
 /// Load `repo_id` and `task_id` for an artifact from redb.
 fn load_artifact_metadata(
-    db: &Database,
+    db: &LobsterDb,
     artifact_type: &str,
     id: &crate::store::ids::RawId,
 ) -> (Option<String>, Option<String>) {
@@ -117,7 +116,7 @@ pub struct ContextItem {
 #[must_use]
 pub fn memory_context(
     query: &str,
-    db: &Database,
+    db: &LobsterDb,
     grafeo: &GrafeoDB,
 ) -> ContextBundle {
     let results = execute_query(query, db, grafeo, true);
@@ -173,52 +172,54 @@ const MAX_RECENT_EPISODES: usize = 20;
 /// This is the `memory_recent` MCP tool. Filters by `repo_id` when
 /// provided, sorts newest-first, and limits to [`MAX_RECENT_EPISODES`].
 #[must_use]
-pub fn memory_recent(db: &Database, repo_id: Option<&str>) -> RecentResult {
-    use redb::{ReadableDatabase, ReadableTable};
-
-    use crate::store::{ids::RepoId, tables};
+pub fn memory_recent(db: &LobsterDb, repo_id: Option<&str>) -> RecentResult {
+    use crate::store::ids::RepoId;
 
     let repo_filter = repo_id.map(|r| RepoId::derive(r.as_bytes()));
 
     let mut episodes: Vec<(i64, RecentEpisode)> = Vec::new();
 
-    if let Ok(read_txn) = db.begin_read() {
-        if let Ok(table) = read_txn.open_table(tables::EPISODES) {
-            if let Ok(iter) = table.iter() {
-                for entry in iter.flatten() {
-                    let (_, value) = entry;
-                    if let Ok(ep) = serde_json::from_slice::<
-                        crate::store::schema::Episode,
-                    >(value.value())
+    if let Ok(rtxn) = db.env.read_txn() {
+        if let Ok(iter) = db.episodes.iter(&rtxn) {
+            for entry in iter.flatten() {
+                let (_, value) = entry;
+                if let Ok(ep) = serde_json::from_slice::<
+                    crate::store::schema::Episode,
+                >(value)
+                {
+                    if ep.processing_state
+                        != crate::store::schema::ProcessingState::Ready
                     {
-                        if ep.processing_state
-                            != crate::store::schema::ProcessingState::Ready
-                        {
+                        continue;
+                    }
+                    if let Some(ref filter_id) = repo_filter {
+                        if ep.repo_id != *filter_id {
                             continue;
                         }
-                        // Filter by repo_id when provided
-                        if let Some(ref filter_id) = repo_filter {
-                            if ep.repo_id != *filter_id {
-                                continue;
-                            }
-                        }
+                    }
 
-                        let summary = crud::get_summary_artifact(
-                            db,
-                            &ep.episode_id.raw(),
-                        )
+                    let summary = db
+                        .summary_artifacts
+                        .get(&rtxn, ep.episode_id.raw().as_bytes())
+                        .ok()
+                        .flatten()
+                        .and_then(|bytes| {
+                            serde_json::from_slice::<
+                                crate::store::schema::SummaryArtifact,
+                            >(bytes)
+                            .ok()
+                        })
                         .map(|s| s.summary_text)
                         .unwrap_or_default();
 
-                        episodes.push((
-                            ep.finalized_ts_utc_ms,
-                            RecentEpisode {
-                                episode_id: ep.episode_id.to_string(),
-                                summary,
-                                state: format!("{:?}", ep.processing_state),
-                            },
-                        ));
-                    }
+                    episodes.push((
+                        ep.finalized_ts_utc_ms,
+                        RecentEpisode {
+                            episode_id: ep.episode_id.to_string(),
+                            summary,
+                            state: format!("{:?}", ep.processing_state),
+                        },
+                    ));
                 }
             }
         }
@@ -247,7 +248,7 @@ pub struct SearchResult {
 #[must_use]
 pub fn memory_search(
     query: &str,
-    db: &Database,
+    db: &LobsterDb,
     grafeo: &GrafeoDB,
 ) -> SearchResult {
     let results = execute_query(query, db, grafeo, true);
@@ -353,40 +354,35 @@ pub struct DecisionsResult {
 /// Return decision timeline, optionally filtered by repo.
 #[must_use]
 pub fn memory_decisions(
-    db: &Database,
+    db: &LobsterDb,
     repo_id: Option<&str>,
 ) -> DecisionsResult {
-    use redb::{ReadableDatabase, ReadableTable};
-
-    use crate::store::{ids::RepoId, tables};
+    use crate::store::ids::RepoId;
 
     let repo_filter = repo_id.map(|r| RepoId::derive(r.as_bytes()));
     let mut decisions = Vec::new();
 
-    if let Ok(read_txn) = db.begin_read() {
-        if let Ok(table) = read_txn.open_table(tables::DECISIONS) {
-            if let Ok(iter) = table.iter() {
-                for entry in iter.flatten() {
-                    let (_, value) = entry;
-                    if let Ok(dec) = serde_json::from_slice::<
-                        crate::store::schema::Decision,
-                    >(value.value())
-                    {
-                        // Filter by repo if provided
-                        if let Some(ref filter_id) = repo_filter {
-                            if dec.repo_id != *filter_id {
-                                continue;
-                            }
+    if let Ok(rtxn) = db.env.read_txn() {
+        if let Ok(iter) = db.decisions.iter(&rtxn) {
+            for entry in iter.flatten() {
+                let (_, value) = entry;
+                if let Ok(dec) = serde_json::from_slice::<
+                    crate::store::schema::Decision,
+                >(value)
+                {
+                    if let Some(ref filter_id) = repo_filter {
+                        if dec.repo_id != *filter_id {
+                            continue;
                         }
-                        decisions.push(DecisionTimelineEntry {
-                            decision_id: dec.decision_id.to_string(),
-                            statement: dec.statement,
-                            rationale: dec.rationale,
-                            confidence: format!("{:?}", dec.confidence),
-                            valid_from_ms: dec.valid_from_ts_utc_ms,
-                            episode_id: dec.episode_id.to_string(),
-                        });
                     }
+                    decisions.push(DecisionTimelineEntry {
+                        decision_id: dec.decision_id.to_string(),
+                        statement: dec.statement,
+                        rationale: dec.rationale,
+                        confidence: format!("{:?}", dec.confidence),
+                        valid_from_ms: dec.valid_from_ts_utc_ms,
+                        episode_id: dec.episode_id.to_string(),
+                    });
                 }
             }
         }
@@ -479,7 +475,7 @@ mod tests {
 
     #[test]
     fn test_memory_context_empty_db() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let grafeo = grafeo_db::new_in_memory();
 
         let bundle = memory_context("test query", &database, &grafeo);
@@ -512,7 +508,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_memory_recent_returns_ready_episodes() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let grafeo = grafeo_db::new_in_memory();
 
         // Finalize an episode
@@ -535,7 +531,7 @@ mod tests {
 
     #[test]
     fn test_memory_recent_empty_db() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let recent = memory_recent(&database, None);
         assert!(recent.episodes.is_empty());
     }
@@ -548,7 +544,7 @@ mod tests {
             schema::{Episode, ProcessingState, SummaryArtifact},
         };
 
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
 
         // Create episodes with different timestamps
         for ts in [3000_i64, 1000, 2000] {
@@ -589,7 +585,7 @@ mod tests {
             schema::{Episode, ProcessingState, SummaryArtifact},
         };
 
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
 
         // Two repos
         for (repo, label) in [("repo-a", "alpha"), ("repo-b", "beta")] {
@@ -635,7 +631,7 @@ mod tests {
             schema::{Episode, ProcessingState, SummaryArtifact},
         };
 
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let n: usize =
             tc.draw(gs::integers::<usize>().min_value(0).max_value(30));
 
@@ -684,7 +680,7 @@ mod tests {
             schema::{Entity, EntityKind, EventKind, ToolSequence},
         };
 
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let grafeo = grafeo_db::new_in_memory();
 
         // Create a workflow entity and tool sequence

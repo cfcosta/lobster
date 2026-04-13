@@ -1,9 +1,7 @@
 //! Retrieval execution: MMR diversity, ready-set intersection,
 //! and cosine reranking.
 
-use redb::Database;
-
-use crate::store::{crud, ids::RawId, schema::ProcessingState};
+use crate::store::{crud, db::LobsterDb, ids::RawId, schema::ProcessingState};
 
 /// Check if an episode is in the Ready state.
 ///
@@ -11,7 +9,7 @@ use crate::store::{crud, ids::RawId, schema::ProcessingState};
 /// `ProcessingState::Ready`. All retrieval results must pass
 /// this check before being surfaced.
 #[must_use]
-pub fn is_ready(db: &Database, episode_id: &RawId) -> bool {
+pub fn is_ready(db: &LobsterDb, episode_id: &RawId) -> bool {
     crud::get_episode(db, episode_id)
         .is_ok_and(|ep| ep.processing_state == ProcessingState::Ready)
 }
@@ -19,7 +17,7 @@ pub fn is_ready(db: &Database, episode_id: &RawId) -> bool {
 /// Filter a list of candidate episode IDs to only those in Ready
 /// state.
 #[must_use]
-pub fn intersect_ready_set(db: &Database, candidates: &[RawId]) -> Vec<RawId> {
+pub fn intersect_ready_set(db: &LobsterDb, candidates: &[RawId]) -> Vec<RawId> {
     candidates
         .iter()
         .filter(|id| is_ready(db, id))
@@ -154,7 +152,7 @@ mod tests {
 
     #[test]
     fn test_ready_set_filters_non_ready() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
 
         // Create a Ready episode and a Pending episode
         let ready_ep = Episode {

@@ -28,7 +28,7 @@ async fn test_full_pipeline_smoke() {
         eprintln!("skipping: no API key");
         return;
     }
-    let database = db::open_in_memory().unwrap();
+    let (database, _dir) = db::open_in_memory().unwrap();
     let grafeo = grafeo_db::new_in_memory();
 
     let result = finalize_episode(
@@ -70,7 +70,7 @@ async fn test_multiple_episodes_accumulate() {
         eprintln!("skipping: no API key");
         return;
     }
-    let database = db::open_in_memory().unwrap();
+    let (database, _dir) = db::open_in_memory().unwrap();
     let grafeo = grafeo_db::new_in_memory();
 
     for i in 0..3 {

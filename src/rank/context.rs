@@ -1,11 +1,9 @@
 //! Retrieval context: current task detection and scoring helpers.
 
-use redb::{Database, ReadableDatabase, ReadableTable};
-
 use crate::store::{
+    db::LobsterDb,
     ids::{RawId, RepoId, TaskId},
     schema::Task,
-    tables,
 };
 
 /// Find the most recently seen open task for a repo.
@@ -14,16 +12,15 @@ use crate::store::{
 /// is most recent. This is the "current task context" used for
 /// `task_overlap_score`.
 #[must_use]
-pub fn find_current_task(db: &Database, repo_id: &RepoId) -> Option<TaskId> {
-    let read_txn = db.begin_read().ok()?;
-    let table = read_txn.open_table(tables::TASKS).ok()?;
-    let iter = table.iter().ok()?;
+pub fn find_current_task(db: &LobsterDb, repo_id: &RepoId) -> Option<TaskId> {
+    let rtxn = db.env.read_txn().ok()?;
+    let iter = db.tasks.iter(&rtxn).ok()?;
 
     let mut best: Option<Task> = None;
 
     for entry in iter.flatten() {
         let (_, value) = entry;
-        if let Ok(task) = serde_json::from_slice::<Task>(value.value()) {
+        if let Ok(task) = serde_json::from_slice::<Task>(value) {
             if task.repo_id == *repo_id
                 && task.status == crate::store::schema::TaskStatus::Open
             {
@@ -51,7 +48,7 @@ pub fn find_current_task(db: &Database, repo_id: &RepoId) -> Option<TaskId> {
 /// as the current context, 0.0 otherwise.
 #[must_use]
 pub fn task_overlap(
-    db: &Database,
+    db: &LobsterDb,
     candidate_id: &RawId,
     current_task: Option<&TaskId>,
 ) -> f64 {
@@ -130,14 +127,14 @@ mod tests {
 
     #[test]
     fn test_find_current_task_empty() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let repo = RepoId::derive(b"repo");
         assert!(find_current_task(&database, &repo).is_none());
     }
 
     #[test]
     fn test_find_current_task_returns_open() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let repo = RepoId::derive(b"repo");
 
         let task = Task {
@@ -156,7 +153,7 @@ mod tests {
 
     #[test]
     fn test_find_current_task_ignores_completed() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let repo = RepoId::derive(b"repo");
 
         let completed = Task {
@@ -174,7 +171,7 @@ mod tests {
 
     #[test]
     fn test_task_overlap_no_context() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let id = EpisodeId::derive(b"ep").raw();
         assert!((task_overlap(&database, &id, None)).abs() < f64::EPSILON);
     }

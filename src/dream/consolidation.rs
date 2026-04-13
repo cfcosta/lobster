@@ -8,13 +8,11 @@
 
 use std::collections::HashMap;
 
-use redb::{Database, ReadableDatabase, ReadableTable};
-
 use crate::store::{
     crud,
+    db::LobsterDb,
     ids::{EpisodeId, TaskId},
     schema::{Episode, ProcessingState},
-    tables,
 };
 
 /// Result of a consolidation pass.
@@ -88,35 +86,31 @@ pub fn merge_summaries(summaries: &[(EpisodeId, String)]) -> String {
 /// retrieval.
 #[allow(clippy::must_use_candidate)]
 pub fn scan_consolidation_candidates(
-    db: &Database,
+    db: &LobsterDb,
 ) -> (ConsolidationResult, Vec<ConsolidatedTaskSummary>) {
     let mut result = ConsolidationResult::default();
     let mut consolidated = Vec::new();
 
     // Load all Ready episodes grouped by task_id
-    let Ok(read_txn) = db.begin_read() else {
-        return (result, consolidated);
-    };
-    let Ok(table) = read_txn.open_table(tables::EPISODES) else {
-        return (result, consolidated);
-    };
-    let Ok(iter) = table.iter() else {
-        return (result, consolidated);
-    };
-
     let mut by_task: HashMap<TaskId, Vec<Episode>> = HashMap::new();
-    for entry in iter.flatten() {
-        let (_, value) = entry;
-        if let Ok(ep) = serde_json::from_slice::<Episode>(value.value()) {
-            if ep.processing_state == ProcessingState::Ready {
-                if let Some(task_id) = ep.task_id {
-                    by_task.entry(task_id).or_default().push(ep);
+    {
+        let Ok(rtxn) = db.env.read_txn() else {
+            return (result, consolidated);
+        };
+        let Ok(iter) = db.episodes.iter(&rtxn) else {
+            return (result, consolidated);
+        };
+        for entry in iter.flatten() {
+            let (_, value) = entry;
+            if let Ok(ep) = serde_json::from_slice::<Episode>(value) {
+                if ep.processing_state == ProcessingState::Ready {
+                    if let Some(task_id) = ep.task_id {
+                        by_task.entry(task_id).or_default().push(ep);
+                    }
                 }
             }
         }
     }
-    drop(table);
-    drop(read_txn);
 
     // For each task with 2+ episodes, merge summaries
     for (task_id, episodes) in &by_task {
@@ -244,7 +238,7 @@ mod tests {
     // -- Unit: consolidation with no multi-episode tasks --
     #[test]
     fn test_consolidation_no_multi_episode() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
 
         // Single episode with a task
         let ep = Episode {
@@ -268,7 +262,7 @@ mod tests {
     // -- Unit: consolidation with multi-episode task --
     #[test]
     fn test_consolidation_multi_episode() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let task_id = TaskId::derive(b"task1");
 
         for i in 0..3u32 {
@@ -336,7 +330,7 @@ mod tests {
     // -- Property: episode_count matches source_episodes length --
     #[test]
     fn test_episode_count_consistency() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let task_id = TaskId::derive(b"task1");
 
         for i in 0..4u32 {

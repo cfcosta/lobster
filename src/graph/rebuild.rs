@@ -5,7 +5,6 @@
 //! It should not require re-running summarization or extraction.
 
 use grafeo::GrafeoDB;
-use redb::{Database, ReadableDatabase, ReadableTable};
 
 use crate::{
     episodes::finalize::parse_entity_kind,
@@ -13,9 +12,9 @@ use crate::{
     graph::{db as gdb, projection},
     store::{
         crud,
+        db::LobsterDb,
         ids::EntityId,
         schema::{Episode, ProcessingState},
-        tables,
     },
 };
 
@@ -29,25 +28,25 @@ use crate::{
 /// Returns an error description if rebuilding fails.
 #[allow(clippy::too_many_lines)]
 pub fn rebuild_from_redb(
-    db: &Database,
+    db: &LobsterDb,
     grafeo: &GrafeoDB,
 ) -> Result<RebuildStats, String> {
     let mut stats = RebuildStats::default();
 
-    // Read all episodes from redb
-    let read_txn = db.begin_read().map_err(|e| e.to_string())?;
-    let table = read_txn
-        .open_table(tables::EPISODES)
-        .map_err(|e| e.to_string())?;
+    // Collect all episodes first, then process with direct field access
+    let mut all_episodes: Vec<Episode> = Vec::new();
+    {
+        let rtxn = db.env.read_txn().map_err(|e| e.to_string())?;
+        let iter = db.episodes.iter(&rtxn).map_err(|e| e.to_string())?;
+        for result in iter {
+            let (_, value) = result.map_err(|e| e.to_string())?;
+            let episode: Episode =
+                serde_json::from_slice(value).map_err(|e| e.to_string())?;
+            all_episodes.push(episode);
+        }
+    }
 
-    // Iterate all entries
-    let iter = table.iter().map_err(|e| e.to_string())?;
-
-    for result in iter {
-        let (_, value) = result.map_err(|e| e.to_string())?;
-        let episode: Episode =
-            serde_json::from_slice(value.value()).map_err(|e| e.to_string())?;
-
+    for episode in &all_episodes {
         stats.episodes_scanned += 1;
 
         // Only project Ready episodes
@@ -57,7 +56,7 @@ pub fn rebuild_from_redb(
         }
 
         // 1. Project episode node
-        let ep_node = projection::project_episode(grafeo, &episode);
+        let ep_node = projection::project_episode(grafeo, episode);
         stats.episodes_projected += 1;
 
         // 2. Restore summary_text on the episode node
@@ -81,24 +80,21 @@ pub fn rebuild_from_redb(
 
         // 4. Project decisions for this episode
         let mut decision_nodes = std::collections::HashMap::new();
-        if let Ok(dec_txn) = db.begin_read() {
-            if let Ok(dec_table) = dec_txn.open_table(tables::DECISIONS) {
-                if let Ok(dec_iter) = dec_table.iter() {
-                    for dec_entry in dec_iter.flatten() {
-                        let (_, dec_val) = dec_entry;
-                        if let Ok(dec) =
-                            serde_json::from_slice::<
-                                crate::store::schema::Decision,
-                            >(dec_val.value())
-                        {
-                            if dec.episode_id == episode.episode_id {
-                                let dn = projection::project_decision(
-                                    grafeo, &dec, ep_node,
-                                );
-                                decision_nodes
-                                    .insert(dec.decision_id.to_string(), dn);
-                                stats.decisions_projected += 1;
-                            }
+        if let Ok(dec_rtxn) = db.env.read_txn() {
+            if let Ok(dec_iter) = db.decisions.iter(&dec_rtxn) {
+                for dec_entry in dec_iter.flatten() {
+                    let (_, dec_val) = dec_entry;
+                    if let Ok(dec) = serde_json::from_slice::<
+                        crate::store::schema::Decision,
+                    >(dec_val)
+                    {
+                        if dec.episode_id == episode.episode_id {
+                            let dn = projection::project_decision(
+                                grafeo, &dec, ep_node,
+                            );
+                            decision_nodes
+                                .insert(dec.decision_id.to_string(), dn);
+                            stats.decisions_projected += 1;
                         }
                     }
                 }
@@ -107,25 +103,22 @@ pub fn rebuild_from_redb(
 
         // 5. Project tasks linked to this episode
         let mut task_nodes = std::collections::HashMap::new();
-        if let Ok(task_txn) = db.begin_read() {
-            if let Ok(task_table) = task_txn.open_table(tables::TASKS) {
-                if let Ok(task_iter) = task_table.iter() {
-                    for task_entry in task_iter.flatten() {
-                        let (_, task_val) = task_entry;
-                        if let Ok(task) = serde_json::from_slice::<
-                            crate::store::schema::Task,
-                        >(
-                            task_val.value()
-                        ) {
-                            if task.opened_in == episode.episode_id
-                                || task.last_seen_in == episode.episode_id
-                            {
-                                let tn = projection::project_task(
-                                    grafeo, &task, ep_node,
-                                );
-                                task_nodes.insert(task.task_id.to_string(), tn);
-                                stats.tasks_projected += 1;
-                            }
+        if let Ok(task_rtxn) = db.env.read_txn() {
+            if let Ok(task_iter) = db.tasks.iter(&task_rtxn) {
+                for task_entry in task_iter.flatten() {
+                    let (_, task_val) = task_entry;
+                    if let Ok(task) = serde_json::from_slice::<
+                        crate::store::schema::Task,
+                    >(task_val)
+                    {
+                        if task.opened_in == episode.episode_id
+                            || task.last_seen_in == episode.episode_id
+                        {
+                            let tn = projection::project_task(
+                                grafeo, &task, ep_node,
+                            );
+                            task_nodes.insert(task.task_id.to_string(), tn);
+                            stats.tasks_projected += 1;
                         }
                     }
                 }
@@ -227,7 +220,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rebuild_empty_db() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let grafeo = grafeo_db::new_in_memory();
 
         let stats = rebuild_from_redb(&database, &grafeo).unwrap();
@@ -238,7 +231,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rebuild_skips_non_ready() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let grafeo_original = grafeo_db::new_in_memory();
 
         // Create an episode but leave it Pending (don't finalize)
@@ -264,7 +257,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rebuild_after_finalization() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let grafeo_original = grafeo_db::new_in_memory();
 
         // Finalize an episode (creates Ready state)
@@ -300,7 +293,7 @@ mod tests {
             schema::{EmbeddingArtifact, EmbeddingBackend, SummaryArtifact},
         };
 
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
 
         // Create a Ready episode with summary and embedding
         let ep = Episode {
@@ -362,7 +355,7 @@ mod tests {
             schema::{Task, TaskStatus},
         };
 
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
 
         let ep = Episode {
             episode_id: EpisodeId::derive(b"ep1"),

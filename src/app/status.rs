@@ -1,8 +1,6 @@
-//! Status reporting: scan redb and report episode counts by state.
+//! Status reporting: scan database and report episode counts by state.
 
-use redb::{Database, ReadableDatabase, ReadableTable};
-
-use crate::store::{schema::ProcessingState, tables};
+use crate::store::{db::LobsterDb, schema::ProcessingState};
 
 /// Counts of episodes by processing state.
 #[derive(Debug, Default)]
@@ -35,53 +33,48 @@ impl std::fmt::Display for StatusReport {
     }
 }
 
-/// Scan the redb database and produce a status report.
+/// Scan the database and produce a status report.
 #[must_use]
-pub fn scan(db: &Database) -> StatusReport {
+pub fn scan(db: &LobsterDb) -> StatusReport {
     let mut report = StatusReport::default();
 
+    let Ok(rtxn) = db.env.read_txn() else {
+        return report;
+    };
+
     // Count episodes by state
-    if let Ok(read_txn) = db.begin_read() {
-        if let Ok(table) = read_txn.open_table(tables::EPISODES) {
-            if let Ok(iter) = table.iter() {
-                for entry in iter.flatten() {
-                    let (_, value) = entry;
-                    if let Ok(ep) = serde_json::from_slice::<
-                        crate::store::schema::Episode,
-                    >(value.value())
-                    {
-                        match ep.processing_state {
-                            ProcessingState::Pending => {
-                                report.pending += 1;
-                            }
-                            ProcessingState::Ready => {
-                                report.ready += 1;
-                            }
-                            ProcessingState::RetryQueued => {
-                                report.retry_queued += 1;
-                            }
-                            ProcessingState::FailedFinal => {
-                                report.failed_final += 1;
-                            }
-                        }
+    if let Ok(iter) = db.episodes.iter(&rtxn) {
+        for entry in iter.flatten() {
+            let (_, value) = entry;
+            if let Ok(ep) =
+                serde_json::from_slice::<crate::store::schema::Episode>(value)
+            {
+                match ep.processing_state {
+                    ProcessingState::Pending => {
+                        report.pending += 1;
+                    }
+                    ProcessingState::Ready => {
+                        report.ready += 1;
+                    }
+                    ProcessingState::RetryQueued => {
+                        report.retry_queued += 1;
+                    }
+                    ProcessingState::FailedFinal => {
+                        report.failed_final += 1;
                     }
                 }
             }
         }
+    }
 
-        // Count summary artifacts
-        if let Ok(table) = read_txn.open_table(tables::SUMMARY_ARTIFACTS) {
-            if let Ok(iter) = table.iter() {
-                report.summary_artifacts = iter.flatten().count();
-            }
-        }
+    // Count summary artifacts
+    if let Ok(iter) = db.summary_artifacts.iter(&rtxn) {
+        report.summary_artifacts = iter.flatten().count();
+    }
 
-        // Count extraction artifacts
-        if let Ok(table) = read_txn.open_table(tables::EXTRACTION_ARTIFACTS) {
-            if let Ok(iter) = table.iter() {
-                report.extraction_artifacts = iter.flatten().count();
-            }
-        }
+    // Count extraction artifacts
+    if let Ok(iter) = db.extraction_artifacts.iter(&rtxn) {
+        report.extraction_artifacts = iter.flatten().count();
     }
 
     report
@@ -98,7 +91,7 @@ mod tests {
 
     #[test]
     fn test_empty_db() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let report = scan(&database);
         assert_eq!(report.total_episodes(), 0);
         assert_eq!(report.summary_artifacts, 0);
@@ -106,7 +99,7 @@ mod tests {
 
     #[test]
     fn test_counts_by_state() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
 
         for (i, state) in [
             ProcessingState::Ready,
@@ -142,7 +135,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_counts_after_finalization() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let grafeo = grafeo_db::new_in_memory();
 
         let result =

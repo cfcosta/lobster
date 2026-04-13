@@ -6,9 +6,7 @@
 
 use std::time::{Duration, Instant};
 
-use redb::{Database, ReadableDatabase, ReadableTable};
-
-use crate::store::{crud, schema::ProcessingState, tables};
+use crate::store::{crud, db::LobsterDb, schema::ProcessingState};
 
 /// Configuration for the dreaming scheduler.
 #[derive(Debug, Clone)]
@@ -49,7 +47,7 @@ pub struct DreamCycleResult {
 /// - Entity dedup (`dream::workers::find_duplicate_entities`)
 /// - Stale task scanning (`dream::workers::scan_stale_tasks`)
 #[must_use]
-pub fn run_cycle(db: &Database, config: &DreamConfig) -> DreamCycleResult {
+pub fn run_cycle(db: &LobsterDb, config: &DreamConfig) -> DreamCycleResult {
     let start = Instant::now();
     let mut result = DreamCycleResult::default();
 
@@ -123,27 +121,25 @@ pub fn run_cycle(db: &Database, config: &DreamConfig) -> DreamCycleResult {
 }
 
 /// Find all episodes in `RetryQueued` state.
-fn find_retry_queued(db: &Database) -> Vec<crate::store::ids::RawId> {
+fn find_retry_queued(db: &LobsterDb) -> Vec<crate::store::ids::RawId> {
     let mut result = Vec::new();
 
-    let Ok(read_txn) = db.begin_read() else {
+    let Ok(rtxn) = db.env.read_txn() else {
         return result;
     };
 
-    let Ok(table) = read_txn.open_table(tables::EPISODES) else {
+    let Ok(iter) = db.episodes.iter(&rtxn) else {
         return result;
     };
 
-    let Ok(iter) = table.iter() else {
-        return result;
-    };
-
-    for (key, value) in iter.flatten() {
-        if let Ok(ep) = serde_json::from_slice::<crate::store::schema::Episode>(
-            value.value(),
-        ) {
+    for entry in iter.flatten() {
+        let (key, value) = entry;
+        if let Ok(ep) =
+            serde_json::from_slice::<crate::store::schema::Episode>(value)
+        {
             if ep.processing_state == ProcessingState::RetryQueued {
-                result.push(crate::store::ids::RawId::from_bytes(*key.value()));
+                let key_bytes: [u8; 16] = key.try_into().unwrap_or([0; 16]);
+                result.push(crate::store::ids::RawId::from_bytes(key_bytes));
             }
         }
     }
@@ -169,7 +165,7 @@ mod tests {
     };
 
     fn make_episode(
-        database: &Database,
+        database: &LobsterDb,
         suffix: &[u8],
         state: ProcessingState,
     ) {
@@ -189,7 +185,7 @@ mod tests {
 
     #[test]
     fn test_empty_db_noop() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let config = DreamConfig::default();
         let result = run_cycle(&database, &config);
         assert_eq!(result.retries_attempted, 0);
@@ -199,7 +195,7 @@ mod tests {
 
     #[test]
     fn test_retry_queued_exhausted_goes_to_failed_final() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         // Create episodes with retry_count >= max_retries so they
         // go straight to FailedFinal
         let ep1 = Episode {
@@ -235,7 +231,7 @@ mod tests {
 
     #[test]
     fn test_ready_not_touched() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         make_episode(&database, b"ready", ProcessingState::Ready);
 
         let config = DreamConfig::default();
@@ -265,7 +261,7 @@ mod tests {
 
     #[test]
     fn test_find_retry_queued() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         make_episode(&database, b"r1", ProcessingState::RetryQueued);
         make_episode(&database, b"p1", ProcessingState::Pending);
         make_episode(&database, b"r2", ProcessingState::RetryQueued);

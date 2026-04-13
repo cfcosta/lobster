@@ -65,7 +65,7 @@ fn prop_recall_empty_db_returns_empty(tc: TestCase) {
             .max_size(100)
             .alphabet("abcdefghijklmnopqrstuvwxyz "),
     );
-    let database = db::open_in_memory().unwrap();
+    let (database, _dir) = db::open_in_memory().unwrap();
     let grafeo = grafeo_db::new_in_memory();
     let event = make_prompt_event(&prompt);
 
@@ -76,7 +76,7 @@ fn prop_recall_empty_db_returns_empty(tc: TestCase) {
 /// `run_recall` for Stop events returns empty (latency 0).
 #[test]
 fn test_recall_stop_returns_empty() {
-    let database = db::open_in_memory().unwrap();
+    let (database, _dir) = db::open_in_memory().unwrap();
     let grafeo = grafeo_db::new_in_memory();
     let payload = run_recall(&make_stop_event(), &database, &grafeo);
     assert!(payload.items.is_empty());
@@ -92,7 +92,7 @@ fn prop_recall_respects_latency_budget(tc: TestCase) {
         .build()
         .unwrap();
 
-    let database = db::open_in_memory().unwrap();
+    let (database, _dir) = db::open_in_memory().unwrap();
     let grafeo = grafeo_db::new_in_memory();
 
     // Finalize a few episodes to populate the DB
@@ -189,7 +189,7 @@ fn test_full_snapshot_recall_path() {
         .unwrap();
 
     let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("test.redb");
+    let db_path = dir.path().join("lmdb");
 
     // Finalize an episode into a file-based DB
     let database = db::open(&db_path).unwrap();
@@ -206,8 +206,8 @@ fn test_full_snapshot_recall_path() {
     assert!(matches!(result, FinalizeResult::Ready { .. }));
     drop(database);
 
-    // Open via snapshot
-    let snap = db::open_snapshot(&db_path).expect("snapshot");
+    // Reopen the database (LMDB allows concurrent readers)
+    let snap = db::open(&db_path).expect("reopen");
     let snap_grafeo = grafeo_db::new_in_memory();
     lobster::graph::rebuild::rebuild_from_redb(&snap, &snap_grafeo)
         .expect("rebuild");

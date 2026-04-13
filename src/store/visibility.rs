@@ -6,23 +6,21 @@
 //! derived artifacts are eligible for retrieval.
 //!
 //! Protocol:
-//! 1. Persist episode and artifacts in redb as `Pending`
+//! 1. Persist episode and artifacts as `Pending`
 //! 2. Apply Grafeo projection
-//! 3. Record projection metadata in redb
+//! 3. Record projection metadata
 //! 4. Flip episode to `Ready`
 //! 5. All retrieval intersects with the ready set
 
-use redb::Database;
-
-use crate::store::{crud, ids::RawId, schema::ProcessingState};
+use crate::store::{crud, db::LobsterDb, ids::RawId, schema::ProcessingState};
 
 /// Check whether an episode is visible for retrieval.
 ///
-/// An episode is visible only if it exists in redb AND has
+/// An episode is visible only if it exists AND has
 /// `ProcessingState::Ready`. Pending, `RetryQueued`, and
 /// `FailedFinal` episodes are not visible.
 #[must_use]
-pub fn is_episode_visible(db: &Database, episode_id: &RawId) -> bool {
+pub fn is_episode_visible(db: &LobsterDb, episode_id: &RawId) -> bool {
     crud::get_episode(db, episode_id)
         .is_ok_and(|ep| ep.processing_state == ProcessingState::Ready)
 }
@@ -32,7 +30,7 @@ pub fn is_episode_visible(db: &Database, episode_id: &RawId) -> bool {
 /// This is the "ready-set intersection" that every retrieval
 /// path must perform before returning results.
 #[must_use]
-pub fn filter_visible(db: &Database, episode_ids: &[RawId]) -> Vec<RawId> {
+pub fn filter_visible(db: &LobsterDb, episode_ids: &[RawId]) -> Vec<RawId> {
     episode_ids
         .iter()
         .filter(|id| is_episode_visible(db, id))
@@ -43,7 +41,10 @@ pub fn filter_visible(db: &Database, episode_ids: &[RawId]) -> Vec<RawId> {
 /// Get the processing state of an episode, or `None` if it
 /// doesn't exist.
 #[must_use]
-pub fn get_state(db: &Database, episode_id: &RawId) -> Option<ProcessingState> {
+pub fn get_state(
+    db: &LobsterDb,
+    episode_id: &RawId,
+) -> Option<ProcessingState> {
     crud::get_episode(db, episode_id)
         .ok()
         .map(|ep| ep.processing_state)
@@ -61,7 +62,7 @@ mod tests {
     };
 
     fn make_episode(
-        database: &Database,
+        database: &LobsterDb,
         suffix: &[u8],
         state: ProcessingState,
     ) -> EpisodeId {
@@ -82,11 +83,9 @@ mod tests {
     }
 
     // ── Property: only Ready episodes are visible ────────
-    // Invariant: is_episode_visible returns true iff state
-    // is Ready. This is the core safety guarantee.
     #[test]
     fn test_only_ready_is_visible() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
 
         let ready = make_episode(&database, b"r", ProcessingState::Ready);
         let pending = make_episode(&database, b"p", ProcessingState::Pending);
@@ -103,7 +102,7 @@ mod tests {
     // ── Property: nonexistent episodes are not visible ───
     #[test]
     fn test_nonexistent_not_visible() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let ghost = EpisodeId::derive(b"ghost");
         assert!(!is_episode_visible(&database, &ghost.raw()));
     }
@@ -111,7 +110,7 @@ mod tests {
     // ── Property: filter_visible only keeps Ready ────────
     #[test]
     fn test_filter_visible() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
 
         let r1 = make_episode(&database, b"r1", ProcessingState::Ready);
         let r2 = make_episode(&database, b"r2", ProcessingState::Ready);
@@ -127,10 +126,9 @@ mod tests {
     }
 
     // ── PBT: visibility is deterministic ─────────────────
-    // Same database state → same visibility decision.
     #[hegel::test(test_cases = 100)]
     fn prop_visibility_deterministic(tc: TestCase) {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let state_idx: usize =
             tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
         let states = [
@@ -156,10 +154,9 @@ mod tests {
     }
 
     // ── PBT: filter_visible ⊆ input ─────────────────────
-    // The filtered set is always a subset of the input.
     #[hegel::test(test_cases = 50)]
     fn prop_filter_is_subset(tc: TestCase) {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let n: usize =
             tc.draw(gs::integers::<usize>().min_value(0).max_value(10));
         let mut ids = Vec::with_capacity(n);
@@ -180,7 +177,6 @@ mod tests {
 
         let visible = filter_visible(&database, &ids);
 
-        // Every visible ID must be in the original set
         for v in &visible {
             assert!(
                 ids.contains(v),

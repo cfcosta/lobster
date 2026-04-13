@@ -22,10 +22,10 @@ pub fn resolve_storage_path(start_dir: &Path) -> PathBuf {
     start_dir.join(".lobster")
 }
 
-/// Path to the redb database file within the storage directory.
+/// Path to the LMDB database directory within the storage directory.
 #[must_use]
 pub fn db_path(storage_dir: &Path) -> PathBuf {
-    storage_dir.join("lobster.redb")
+    storage_dir.join("lmdb")
 }
 
 #[cfg(test)]
@@ -55,9 +55,6 @@ mod tests {
     #[test]
     fn test_db_path() {
         let storage = PathBuf::from("/tmp/.lobster");
-        assert_eq!(
-            db_path(&storage),
-            PathBuf::from("/tmp/.lobster/lobster.redb")
-        );
+        assert_eq!(db_path(&storage), PathBuf::from("/tmp/.lobster/lmdb"));
     }
 }

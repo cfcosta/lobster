@@ -42,7 +42,7 @@ async fn test_summary_persistence_roundtrip() {
         eprintln!("skipping: no API key");
         return;
     }
-    let database = lobster::store::db::open_in_memory().unwrap();
+    let (database, _dir) = lobster::store::db::open_in_memory().unwrap();
     let summarizer = RigSummarizer::default();
     let episode_id = EpisodeId::derive(b"test-ep");
 

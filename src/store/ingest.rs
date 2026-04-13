@@ -7,7 +7,6 @@
 //! 4. Runs segmentation and finalization when appropriate
 
 use grafeo::GrafeoDB;
-use redb::Database;
 
 use crate::{
     hooks::{
@@ -15,7 +14,7 @@ use crate::{
         events::HookEvent,
         segmentation::{self, SegmentAction},
     },
-    store::staging,
+    store::{db::LobsterDb, staging},
 };
 
 /// Result of a single ingestion cycle.
@@ -38,7 +37,7 @@ pub struct IngestResult {
 /// point for the MCP server's ingestion loop.
 pub async fn ingest_staged(
     storage_dir: &std::path::Path,
-    db: &Database,
+    db: &LobsterDb,
     grafeo: &GrafeoDB,
 ) -> IngestResult {
     let mut result = IngestResult::default();
@@ -99,7 +98,7 @@ pub async fn ingest_staged(
 /// Try to finalize an episode for the given event.
 async fn try_finalize(
     event: &HookEvent,
-    db: &Database,
+    db: &LobsterDb,
     grafeo: &GrafeoDB,
     seq: u64,
 ) -> bool {
@@ -187,7 +186,7 @@ mod tests {
     #[tokio::test]
     async fn test_ingest_empty_staging() {
         let dir = tempfile::tempdir().unwrap();
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let grafeo = grafeo_db::new_in_memory();
 
         let result = ingest_staged(dir.path(), &database, &grafeo).await;
@@ -198,7 +197,7 @@ mod tests {
     #[tokio::test]
     async fn test_ingest_captures_events() {
         let dir = tempfile::tempdir().unwrap();
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let grafeo = grafeo_db::new_in_memory();
 
         // Stage two events
@@ -217,7 +216,7 @@ mod tests {
     #[tokio::test]
     async fn test_ingest_handles_invalid_json() {
         let dir = tempfile::tempdir().unwrap();
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let grafeo = grafeo_db::new_in_memory();
 
         staging::stage_event(dir.path(), "not valid json").unwrap();
@@ -231,7 +230,7 @@ mod tests {
     #[tokio::test]
     async fn test_ingest_clears_staging() {
         let dir = tempfile::tempdir().unwrap();
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let grafeo = grafeo_db::new_in_memory();
 
         staging::stage_event(dir.path(), &make_tool_json("Write")).unwrap();
@@ -266,7 +265,7 @@ mod tests {
         }
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let grafeo = grafeo_db::new_in_memory();
 
         let result = rt.block_on(ingest_staged(dir.path(), &database, &grafeo));

@@ -5,12 +5,11 @@
 //! and workflow pattern detection.
 
 use grafeo::GrafeoDB;
-use redb::{Database, ReadableDatabase, ReadableTable};
 
 use crate::store::{
+    db::LobsterDb,
     ids::RawId,
     schema::{Entity, Task, TaskStatus},
-    tables,
 };
 
 /// Scan for tasks that haven't been seen in recent episodes and
@@ -18,32 +17,22 @@ use crate::store::{
 ///
 /// Returns the number of stale tasks found.
 #[must_use]
-pub fn scan_stale_tasks(db: &Database) -> Vec<(RawId, String)> {
+pub fn scan_stale_tasks(db: &LobsterDb) -> Vec<(RawId, String)> {
     let mut stale = Vec::new();
 
-    let Ok(read_txn) = db.begin_read() else {
+    let Ok(rtxn) = db.env.read_txn() else {
         return stale;
     };
-    let Ok(table) = read_txn.open_table(tables::TASKS) else {
-        return stale;
-    };
-    let Ok(iter) = table.iter() else {
+    let Ok(iter) = db.tasks.iter(&rtxn) else {
         return stale;
     };
 
     for entry in iter.flatten() {
         let (key, value) = entry;
-        if let Ok(task) = serde_json::from_slice::<Task>(value.value()) {
-            // A task is stale if it's still Open but its
-            // last_seen_in episode is old. Without timestamps
-            // on the task itself, we check if the episode is
-            // Ready (meaning it was finalized and the task
-            // wasn't updated since).
+        if let Ok(task) = serde_json::from_slice::<Task>(value) {
             if task.status == TaskStatus::Open {
-                stale.push((
-                    RawId::from_bytes(*key.value()),
-                    task.title.clone(),
-                ));
+                let key_bytes: [u8; 16] = key.try_into().unwrap_or([0; 16]);
+                stale.push((RawId::from_bytes(key_bytes), task.title.clone()));
             }
         }
     }
@@ -56,27 +45,25 @@ pub fn scan_stale_tasks(db: &Database) -> Vec<(RawId, String)> {
 /// These are merge candidates that the dreaming scheduler can
 /// propose for deduplication.
 #[must_use]
-pub fn find_duplicate_entities(db: &Database) -> Vec<(String, Vec<RawId>)> {
+pub fn find_duplicate_entities(db: &LobsterDb) -> Vec<(String, Vec<RawId>)> {
     let mut by_name: std::collections::HashMap<String, Vec<RawId>> =
         std::collections::HashMap::new();
 
-    let Ok(read_txn) = db.begin_read() else {
+    let Ok(rtxn) = db.env.read_txn() else {
         return vec![];
     };
-    let Ok(table) = read_txn.open_table(tables::ENTITIES) else {
-        return vec![];
-    };
-    let Ok(iter) = table.iter() else {
+    let Ok(iter) = db.entities.iter(&rtxn) else {
         return vec![];
     };
 
     for entry in iter.flatten() {
         let (key, value) = entry;
-        if let Ok(entity) = serde_json::from_slice::<Entity>(value.value()) {
+        if let Ok(entity) = serde_json::from_slice::<Entity>(value) {
+            let key_bytes: [u8; 16] = key.try_into().unwrap_or([0; 16]);
             by_name
                 .entry(entity.canonical_name.to_lowercase())
                 .or_default()
-                .push(RawId::from_bytes(*key.value()));
+                .push(RawId::from_bytes(key_bytes));
         }
     }
 
@@ -113,7 +100,7 @@ pub struct WorkflowMiningResult {
 /// graph state.
 #[allow(clippy::too_many_lines)]
 pub fn scan_workflow_patterns(
-    db: &Database,
+    db: &LobsterDb,
     _grafeo: &GrafeoDB,
     config: &super::patterns::PatternConfig,
 ) -> WorkflowMiningResult {
@@ -130,28 +117,23 @@ pub fn scan_workflow_patterns(
     let mut result = WorkflowMiningResult::default();
 
     // 1. Load all Ready episodes
-    let Ok(read_txn) = db.begin_read() else {
-        return result;
-    };
-    let Ok(table) = read_txn.open_table(tables::EPISODES) else {
-        return result;
-    };
-    let Ok(iter) = table.iter() else {
-        return result;
-    };
-
     let mut episodes: Vec<Episode> = Vec::new();
-    for entry in iter.flatten() {
-        let (_, value) = entry;
-        if let Ok(ep) = serde_json::from_slice::<Episode>(value.value()) {
-            if ep.processing_state == ProcessingState::Ready {
-                episodes.push(ep);
+    {
+        let Ok(rtxn) = db.env.read_txn() else {
+            return result;
+        };
+        let Ok(iter) = db.episodes.iter(&rtxn) else {
+            return result;
+        };
+        for entry in iter.flatten() {
+            let (_, value) = entry;
+            if let Ok(ep) = serde_json::from_slice::<Episode>(value) {
+                if ep.processing_state == ProcessingState::Ready {
+                    episodes.push(ep);
+                }
             }
         }
     }
-    // Drop the read transaction before we write
-    drop(table);
-    drop(read_txn);
 
     result.episodes_scanned = episodes.len();
 
@@ -265,14 +247,14 @@ mod tests {
 
     #[test]
     fn test_scan_stale_tasks_empty() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let stale = scan_stale_tasks(&database);
         assert!(stale.is_empty());
     }
 
     #[test]
     fn test_scan_stale_tasks_finds_open() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
 
         let task = Task {
             task_id: TaskId::derive(b"t1"),
@@ -301,7 +283,7 @@ mod tests {
 
     #[test]
     fn test_find_duplicate_entities_none() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let entity = Entity {
             entity_id: EntityId::derive(b"e1"),
             repo_id: RepoId::derive(b"repo"),
@@ -319,7 +301,7 @@ mod tests {
 
     #[test]
     fn test_find_duplicate_entities_detects() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
 
         // Two entities with same name but different IDs
         let e1 = Entity {
@@ -359,7 +341,7 @@ mod tests {
     /// Create a Ready episode with raw events of the given kinds.
     #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
     fn setup_episode_with_events(
-        database: &redb::Database,
+        database: &LobsterDb,
         ep_suffix: &[u8],
         start_seq: u64,
         kinds: &[EventKind],
@@ -392,7 +374,7 @@ mod tests {
 
     #[test]
     fn test_workflow_mining_empty_db() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let grafeo = grafeo_db::new_in_memory();
         let config = PatternConfig::default();
 
@@ -403,7 +385,7 @@ mod tests {
 
     #[test]
     fn test_workflow_mining_detects_recurring_pattern() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let grafeo = grafeo_db::new_in_memory();
 
         // Same tool sequence in 3 episodes
@@ -435,7 +417,7 @@ mod tests {
 
     #[test]
     fn test_workflow_mining_idempotent() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let grafeo = grafeo_db::new_in_memory();
 
         let pattern = [EventKind::ToolUse, EventKind::FileWrite];
@@ -457,7 +439,7 @@ mod tests {
 
     #[test]
     fn test_workflow_mining_below_threshold() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let grafeo = grafeo_db::new_in_memory();
 
         // Only 1 episode — can't meet min_frequency=2
@@ -477,7 +459,7 @@ mod tests {
     fn prop_workflows_meet_threshold(tc: hegel::TestCase) {
         use hegel::generators as gs;
 
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let grafeo = grafeo_db::new_in_memory();
 
         let n_eps: usize =
@@ -534,7 +516,7 @@ mod tests {
     fn prop_workflow_mining_no_entities(tc: hegel::TestCase) {
         use hegel::generators as gs;
 
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let grafeo = grafeo_db::new_in_memory();
 
         // Use a fixed shared pattern to guarantee detection

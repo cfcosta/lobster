@@ -4,12 +4,10 @@
 //! against candidate proxy vectors for reranking. Assumes the
 //! `ColBERT` model is installed.
 
-use redb::Database;
-
 use crate::{
     embeddings::{encoder, proxy},
     rank::retrieval::cosine_similarity,
-    store::{crud, ids::RawId},
+    store::{crud, db::LobsterDb, ids::RawId},
 };
 
 /// Compute the reranking score for a candidate.
@@ -19,7 +17,7 @@ use crate::{
 /// vector. Returns 0.0 if the candidate has no embedding artifact.
 #[must_use]
 pub fn rerank_score(
-    db: &Database,
+    db: &LobsterDb,
     query_text: &str,
     candidate_id: &RawId,
 ) -> f64 {
@@ -53,7 +51,7 @@ mod tests {
 
     #[test]
     fn test_rerank_missing_artifact() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let id = ArtifactId::derive(b"missing").raw();
         let score = rerank_score(&database, "test", &id);
         assert!(score.abs() < f64::EPSILON);
@@ -69,7 +67,7 @@ mod tests {
             }
         };
 
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
 
         // Encode a real document and store its proxy
         let texts = vec!["Use redb for ACID storage".to_string()];

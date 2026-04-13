@@ -5,7 +5,6 @@
 //! MMR diversity, ready-set intersection, and confidence rejection.
 
 use grafeo::GrafeoDB;
-use redb::Database;
 
 use crate::{
     rank::{
@@ -22,7 +21,7 @@ use crate::{
             normalize_score,
         },
     },
-    store::{ids::RawId, visibility},
+    store::{db::LobsterDb, ids::RawId, visibility},
 };
 
 /// A retrieval result with score and metadata.
@@ -43,7 +42,7 @@ pub struct RetrievalResult {
 /// 5. Return results (or empty if Abstain)
 pub fn execute_query(
     query: &str,
-    db: &Database,
+    db: &LobsterDb,
     grafeo: &GrafeoDB,
     is_mcp: bool,
 ) -> Vec<RetrievalResult> {
@@ -53,7 +52,7 @@ pub fn execute_query(
 /// Execute a query with optional task context for scoring.
 pub fn execute_query_with_context(
     query: &str,
-    db: &Database,
+    db: &LobsterDb,
     grafeo: &GrafeoDB,
     is_mcp: bool,
     current_task_id: Option<&crate::store::ids::TaskId>,
@@ -184,7 +183,7 @@ pub fn execute_query_with_context(
 
 /// Load proxy vectors for candidates from embedding artifacts.
 fn load_proxy_vectors(
-    db: &Database,
+    db: &LobsterDb,
     candidates: &[ScoredCandidate],
 ) -> std::collections::HashMap<crate::store::ids::RawId, Vec<f32>> {
     use crate::store::crud;
@@ -442,7 +441,7 @@ mod tests {
 
     #[test]
     fn test_execute_query_returns_empty_for_no_data() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let grafeo = grafeo_db::new_in_memory();
 
         let results =
@@ -454,7 +453,7 @@ mod tests {
 
     #[test]
     fn test_execute_query_classifies_correctly() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let grafeo = grafeo_db::new_in_memory();
 
         // File path → exact route
@@ -469,7 +468,7 @@ mod tests {
 
     #[test]
     fn test_execute_query_filters_non_ready() {
-        let database = db::open_in_memory().unwrap();
+        let (database, _dir) = db::open_in_memory().unwrap();
         let grafeo = grafeo_db::new_in_memory();
 
         // Create a Pending episode — should not appear in results
