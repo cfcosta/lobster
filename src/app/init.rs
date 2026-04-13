@@ -145,7 +145,11 @@ fn has_command_containing(entry: &serde_json::Value, needle: &str) -> bool {
 }
 
 fn home_dir() -> Option<std::path::PathBuf> {
-    std::env::var("HOME").ok().map(std::path::PathBuf::from)
+    // HOME is set on Linux and macOS; USERPROFILE on Windows.
+    std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()
+        .map(std::path::PathBuf::from)
 }
 
 #[cfg(test)]
