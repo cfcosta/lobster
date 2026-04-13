@@ -6,6 +6,31 @@ Local, deterministic, per-repo memory system for Claude Code.
 
 Lobster gives Claude Code persistent memory. When you make decisions, discuss architecture, or solve problems, Lobster captures them. The next time you (or Claude) return to the repo, prior decisions, constraints, and context are automatically surfaced.
 
+## Install
+
+### Nix
+
+```bash
+# CPU-only (default)
+nix profile install github:cfcosta/lobster
+
+# NVIDIA GPU (CUDA acceleration for ColBERT embeddings)
+nix profile install github:cfcosta/lobster#lobster-cuda
+
+# Apple GPU (Metal acceleration for ColBERT embeddings)
+nix profile install github:cfcosta/lobster#lobster-metal
+```
+
+### Cargo
+
+```bash
+# CPU-only (default)
+cargo install --git https://github.com/cfcosta/lobster
+
+# NVIDIA GPU
+cargo install --git https://github.com/cfcosta/lobster --features cuda
+```
+
 ## Setup
 
 ```bash
