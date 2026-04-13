@@ -234,13 +234,7 @@ fn search_grafeo(
         query,
         20,
     ) {
-        collect_hits(
-            grafeo,
-            &hits,
-            "decision_id",
-            "decision",
-            &mut candidates,
-        );
+        collect_hits(grafeo, &hits, "decision_id", "decision", &mut candidates);
     }
 
     // BM25 text search on entity canonical names

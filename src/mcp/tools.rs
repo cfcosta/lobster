@@ -12,6 +12,39 @@ use crate::{
     store::{crud, schema::EntityKind},
 };
 
+/// Load the actual text content for an artifact from redb.
+///
+/// Returns the decision statement, summary text, or entity name
+/// depending on artifact type. Falls back to artifact type + ID
+/// if the record is missing.
+fn load_artifact_text(
+    db: &Database,
+    artifact_type: &str,
+    id: &crate::store::ids::RawId,
+) -> String {
+    match artifact_type {
+        "decision" => crud::get_decision(db, id).map_or_else(
+            |_| format!("decision:{id}"),
+            |d| d.statement,
+        ),
+        "summary" => crud::get_summary_artifact(db, id).map_or_else(
+            |_| format!("summary:{id}"),
+            |s| s.summary_text,
+        ),
+        "entity" => crud::get_entity(db, id).map_or_else(
+            |_| format!("entity:{id}"),
+            |e| {
+                if e.kind == EntityKind::Workflow {
+                    format!("Workflow: {}", e.canonical_name)
+                } else {
+                    e.canonical_name
+                }
+            },
+        ),
+        other => format!("{other}:{id}"),
+    }
+}
+
 /// Result of a `memory_context` tool call.
 #[derive(Debug, Clone, Serialize)]
 pub struct ContextBundle {
@@ -57,16 +90,20 @@ pub fn memory_context(
 
     let items: Vec<ContextItem> = results
         .into_iter()
-        .map(|r| ContextItem {
-            artifact_type: r.artifact_type,
-            snippet: None,
-            repo_id: None,
-            task_id: None,
-            confidence: None,
-            provenance: None,
-            graph_context: None,
-            score: r.score,
-            content: format!("Retrieved via {:?} route", r.route),
+        .map(|r| {
+            let content =
+                load_artifact_text(db, &r.artifact_type, &r.episode_id);
+            ContextItem {
+                artifact_type: r.artifact_type,
+                snippet: None,
+                repo_id: None,
+                task_id: None,
+                confidence: None,
+                provenance: Some(r.episode_id.to_string()),
+                graph_context: None,
+                score: r.score,
+                content,
+            }
         })
         .collect();
 
@@ -215,6 +252,7 @@ pub fn memory_search(
                 }
                 _ => (None, None),
             };
+            let content = load_artifact_text(db, &r.artifact_type, &r.episode_id);
             ContextItem {
                 artifact_type: r.artifact_type,
                 snippet,
@@ -224,7 +262,7 @@ pub fn memory_search(
                 provenance: Some(r.episode_id.to_string()),
                 graph_context: None,
                 score: r.score,
-                content: format!("Score: {:.2}", r.score),
+                content,
             }
         })
         .collect();
@@ -506,7 +544,7 @@ mod tests {
             provenance: Some("abc123".into()),
             graph_context: None,
             score: 0.75,
-            content: "Score: 0.75".into(),
+            content: "Workflow: FileEdit→TestRun".into(),
         };
         let json = serde_json::to_string(&item).unwrap();
         assert!(json.contains("Workflow"));
