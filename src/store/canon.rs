@@ -21,25 +21,31 @@ pub fn normalize(input: &str) -> String {
         .to_lowercase()
 }
 
-/// Normalize a file path: trim, normalize separators to `/`,
-/// collapse repeated slashes, strip trailing slash.
+/// Normalize a file path: trim outer whitespace, strip control
+/// characters, normalize separators to `/`, collapse repeated
+/// slashes, strip trailing slash.
+///
+/// Internal spaces are preserved (e.g., `my project/src` stays
+/// intact) — only leading/trailing whitespace and control
+/// characters are removed.
 #[must_use]
 pub fn normalize_path(path: &str) -> String {
-    // Strip all whitespace and control characters. Paths with
-    // spaces in the middle are normalized to no-space (this is a
-    // simplification — real path handling would need OS-specific
-    // logic, but for repo identity purposes, stripping all
-    // whitespace ensures idempotence).
+    // Remove control characters but preserve internal spaces.
+    // Trim before and after control-char removal for idempotency.
     let cleaned: String = path
+        .trim()
         .chars()
-        .filter(|c| !c.is_whitespace() && !c.is_control())
-        .collect();
+        .filter(|c| !c.is_control())
+        .collect::<String>();
+    let cleaned = cleaned.trim().to_string();
     let normalized: String = cleaned.replace('\\', "/");
     let collapsed = collapse_slashes(&normalized);
-    collapsed
+    let stripped = collapsed
         .strip_suffix('/')
-        .unwrap_or(&collapsed)
-        .to_string()
+        .unwrap_or(&collapsed);
+    // Trim again after slash removal for idempotency when input
+    // has trailing "space + /"
+    stripped.trim_end().to_string()
 }
 
 fn collapse_slashes(s: &str) -> String {
@@ -225,6 +231,24 @@ mod tests {
         assert_eq!(normalize_path("/home/user/repo/"), "/home/user/repo");
         assert_eq!(normalize_path("path\\to\\file"), "path/to/file");
         assert_eq!(normalize_path("a///b//c/"), "a/b/c");
+    }
+
+    #[test]
+    fn test_normalize_path_preserves_spaces() {
+        // Paths with spaces in directory/file names should be preserved
+        assert_eq!(
+            normalize_path("/home/user/my project/src"),
+            "/home/user/my project/src"
+        );
+        assert_eq!(
+            normalize_path("Program Files/app"),
+            "Program Files/app"
+        );
+        // But leading/trailing whitespace is trimmed
+        assert_eq!(
+            normalize_path("  /home/user/repo  "),
+            "/home/user/repo"
+        );
     }
 
     #[test]
