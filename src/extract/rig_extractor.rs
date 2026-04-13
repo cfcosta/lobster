@@ -163,25 +163,6 @@ fn parse_extraction_response(
         })
         .unwrap_or_default();
 
-    // Ensure at least one reference exists
-    if entities.is_empty()
-        && task_refs.is_empty()
-        && decision_refs.is_empty()
-        && decisions.is_empty()
-    {
-        // Fall back to a repo entity so validation passes
-        return Ok(ExtractionOutput {
-            task_refs,
-            decision_refs,
-            entities: vec![ExtractedEntity {
-                kind: "repo".to_string(),
-                name: "unknown".to_string(),
-            }],
-            relations,
-            decisions: vec![],
-        });
-    }
-
     Ok(ExtractionOutput {
         task_refs,
         decision_refs,
@@ -226,7 +207,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_empty_falls_back_to_repo() {
+    fn test_parse_empty_extraction_is_valid() {
         let json = r#"{
             "entities": [],
             "relations": [],
@@ -235,8 +216,8 @@ mod tests {
         }"#;
 
         let result = parse_extraction_response(json).unwrap();
-        assert_eq!(result.entities.len(), 1);
-        assert_eq!(result.entities[0].kind, "repo");
+        // Empty extraction is valid — no fake entities injected
+        assert!(result.entities.is_empty());
     }
 
     #[test]

@@ -80,13 +80,10 @@ pub fn validate(output: &ExtractionOutput) -> Result<(), Vec<ValidationError>> {
         }
     }
 
-    // Must have at least one reference
-    if output.task_refs.is_empty()
-        && output.decision_refs.is_empty()
-        && output.entities.is_empty()
-    {
-        errors.push(ValidationError::NoEvidence);
-    }
+    // Empty extraction is valid — not every episode produces
+    // extractable facts. Decisions count as evidence too.
+    // (Previously this required at least one entity/task/decision ref,
+    // which forced the extractor to inject fake entities.)
 
     if errors.is_empty() {
         Ok(())
@@ -163,7 +160,7 @@ mod tests {
     }
 
     #[test]
-    fn test_no_references_fails() {
+    fn test_empty_extraction_is_valid() {
         let output = ExtractionOutput {
             task_refs: vec![],
             decision_refs: vec![],
@@ -171,10 +168,7 @@ mod tests {
             relations: vec![],
             decisions: vec![],
         };
-        let errs = validate(&output).unwrap_err();
-        assert!(
-            errs.iter()
-                .any(|e| matches!(e, ValidationError::NoEvidence))
-        );
+        // Empty extraction is valid — not every episode produces facts
+        assert!(validate(&output).is_ok());
     }
 }
