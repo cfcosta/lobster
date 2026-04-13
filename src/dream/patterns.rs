@@ -211,10 +211,7 @@ mod tests {
 
         for detected in &results {
             for &idx in &detected.source_indices {
-                assert!(
-                    idx < sequences.len(),
-                    "source index out of bounds"
-                );
+                assert!(idx < sequences.len(), "source index out of bounds");
                 assert!(
                     is_subsequence(&detected.pattern, &sequences[idx]),
                     "pattern {:?} not found in sequence {}",

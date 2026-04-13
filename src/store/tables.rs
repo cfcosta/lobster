@@ -65,6 +65,11 @@ pub const REPO_CONFIG: TableDefinition<&[u8; 16], &[u8]> =
 pub const RETRIEVAL_STATS: TableDefinition<&str, &[u8]> =
     TableDefinition::new("retrieval_stats");
 
+/// Tool-use workflow patterns (procedural memory), keyed by
+/// workflow ID bytes.
+pub const TOOL_SEQUENCES: TableDefinition<&[u8; 16], &[u8]> =
+    TableDefinition::new("tool_sequences");
+
 /// Global metadata (schema version, last sequence number, etc.).
 pub const METADATA: TableDefinition<&str, &[u8]> =
     TableDefinition::new("metadata");
@@ -88,6 +93,7 @@ mod tests {
             "summary_artifacts",
             "extraction_artifacts",
             "embedding_artifacts",
+            "tool_sequences",
             "processing_jobs",
             "projection_metadata",
             "repo_config",
@@ -133,6 +139,9 @@ mod tests {
         write_txn
             .open_table(EMBEDDING_ARTIFACTS)
             .expect("embedding_artifacts");
+        write_txn
+            .open_table(TOOL_SEQUENCES)
+            .expect("tool_sequences");
         write_txn
             .open_table(PROCESSING_JOBS)
             .expect("processing_jobs");

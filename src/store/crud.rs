@@ -19,6 +19,7 @@ use crate::store::{
         RawEvent,
         SummaryArtifact,
         Task,
+        ToolSequence,
     },
     tables,
 };
@@ -221,6 +222,49 @@ pub fn get_embedding_artifact(
     artifact_id: &RawId,
 ) -> Result<EmbeddingArtifact, StoreError> {
     get_by_id(db, tables::EMBEDDING_ARTIFACTS, artifact_id)
+}
+
+// ── Tool Sequence (procedural memory) ────────────────────────
+
+pub fn put_tool_sequence(
+    db: &Database,
+    ts: &ToolSequence,
+) -> Result<(), StoreError> {
+    put_by_id(db, tables::TOOL_SEQUENCES, &ts.workflow_id.raw(), ts)
+}
+
+pub fn get_tool_sequence(
+    db: &Database,
+    workflow_id: &RawId,
+) -> Result<ToolSequence, StoreError> {
+    get_by_id(db, tables::TOOL_SEQUENCES, workflow_id)
+}
+
+/// List all stored tool sequences.
+#[must_use]
+pub fn list_tool_sequences(db: &Database) -> Vec<ToolSequence> {
+    use redb::ReadableTable;
+
+    let mut results = Vec::new();
+
+    let Ok(read_txn) = db.begin_read() else {
+        return results;
+    };
+    let Ok(table) = read_txn.open_table(tables::TOOL_SEQUENCES) else {
+        return results;
+    };
+    let Ok(iter) = table.iter() else {
+        return results;
+    };
+
+    for entry in iter.flatten() {
+        let (_, value) = entry;
+        if let Ok(ts) = serde_json::from_slice::<ToolSequence>(value.value()) {
+            results.push(ts);
+        }
+    }
+
+    results
 }
 
 // ── Repo Config ──────────────────────────────────────────────
@@ -484,6 +528,121 @@ mod tests {
         assert_eq!(art, loaded);
     }
 
+    // ── ToolSequence round-trip ────────────────────────────────
+
+    #[hegel::composite]
+    fn gen_tool_sequence(tc: hegel::TestCase) -> ToolSequence {
+        use crate::store::ids::WorkflowId;
+
+        let wf_input: Vec<u8> =
+            tc.draw(gs::vecs(gs::integers::<u8>()).min_size(1).max_size(16));
+        let repo_input: Vec<u8> =
+            tc.draw(gs::vecs(gs::integers::<u8>()).min_size(1).max_size(16));
+
+        let kinds = vec![
+            EventKind::UserPromptSubmit,
+            EventKind::ToolUse,
+            EventKind::FileRead,
+            EventKind::FileWrite,
+            EventKind::TestRun,
+        ];
+        let n: usize =
+            tc.draw(gs::integers::<usize>().min_value(2).max_value(6));
+        let mut pattern = Vec::with_capacity(n);
+        for _ in 0..n {
+            pattern.push(tc.draw(gs::sampled_from(kinds.clone())));
+        }
+
+        let n_sources: usize =
+            tc.draw(gs::integers::<usize>().min_value(2).max_value(5));
+        let mut sources = Vec::with_capacity(n_sources);
+        for i in 0..n_sources {
+            let mut ep_in = wf_input.clone();
+            #[allow(clippy::cast_possible_truncation)]
+            ep_in.extend_from_slice(&(i as u32).to_le_bytes());
+            sources.push(EpisodeId::derive(&ep_in));
+        }
+
+        ToolSequence {
+            workflow_id: WorkflowId::derive(&wf_input),
+            repo_id: RepoId::derive(&repo_input),
+            pattern,
+            label: tc.draw(gs::text().min_size(1).max_size(80)),
+            frequency: tc
+                .draw(gs::integers::<u32>().min_value(2).max_value(50)),
+            source_episodes: sources,
+            detected_ts_utc_ms: tc.draw(
+                gs::integers::<i64>().min_value(0).max_value(i64::MAX / 2),
+            ),
+        }
+    }
+
+    // -- Property: put then get ToolSequence = identity --
+    #[hegel::test(test_cases = 50)]
+    fn prop_tool_sequence_roundtrip(tc: TestCase) {
+        let ts = tc.draw(gen_tool_sequence());
+        let db = test_db();
+        put_tool_sequence(&db, &ts).expect("put");
+        let loaded =
+            get_tool_sequence(&db, &ts.workflow_id.raw()).expect("get");
+        assert_eq!(ts, loaded);
+    }
+
+    // -- Property: duplicate puts are idempotent --
+    #[hegel::test(test_cases = 30)]
+    fn prop_tool_sequence_put_idempotent(tc: TestCase) {
+        let ts = tc.draw(gen_tool_sequence());
+        let db = test_db();
+        put_tool_sequence(&db, &ts).expect("put 1");
+        put_tool_sequence(&db, &ts).expect("put 2");
+        let loaded =
+            get_tool_sequence(&db, &ts.workflow_id.raw()).expect("get");
+        assert_eq!(ts, loaded);
+    }
+
+    // -- Property: list returns all stored sequences --
+    #[hegel::test(test_cases = 30)]
+    fn prop_tool_sequence_list_complete(tc: TestCase) {
+        let db = test_db();
+        let n: usize =
+            tc.draw(gs::integers::<usize>().min_value(0).max_value(5));
+
+        let mut stored = Vec::new();
+        for i in 0..n {
+            let mut wf_in = vec![0u8; 4];
+            #[allow(clippy::cast_possible_truncation)]
+            wf_in.extend_from_slice(&(i as u32).to_le_bytes());
+            let ts = ToolSequence {
+                workflow_id: crate::store::ids::WorkflowId::derive(&wf_in),
+                repo_id: RepoId::derive(b"repo"),
+                pattern: vec![EventKind::ToolUse, EventKind::FileWrite],
+                label: format!("workflow-{i}"),
+                frequency: 3,
+                source_episodes: vec![
+                    EpisodeId::derive(b"ep1"),
+                    EpisodeId::derive(b"ep2"),
+                ],
+                detected_ts_utc_ms: 1_700_000_000_000,
+            };
+            put_tool_sequence(&db, &ts).expect("put");
+            stored.push(ts);
+        }
+
+        let listed = list_tool_sequences(&db);
+        assert_eq!(
+            listed.len(),
+            stored.len(),
+            "list should return all stored sequences"
+        );
+        for ts in &stored {
+            assert!(
+                listed.iter().any(|l| l.workflow_id == ts.workflow_id),
+                "missing workflow {}",
+                ts.workflow_id
+            );
+        }
+    }
+
     // ── Not found ────────────────────────────────────────────
 
     #[test]
@@ -491,6 +650,26 @@ mod tests {
         let db = test_db();
         let id = EpisodeId::derive(b"nonexistent");
         let result = get_episode(&db, &id.raw());
+        assert!(matches!(result, Err(StoreError::NotFound)));
+    }
+
+    #[test]
+    fn test_get_missing_tool_sequence() {
+        let db = test_db();
+        // Write one sequence so the table exists
+        let ts = ToolSequence {
+            workflow_id: crate::store::ids::WorkflowId::derive(b"exists"),
+            repo_id: RepoId::derive(b"repo"),
+            pattern: vec![EventKind::ToolUse, EventKind::FileWrite],
+            label: "test".into(),
+            frequency: 2,
+            source_episodes: vec![EpisodeId::derive(b"ep1")],
+            detected_ts_utc_ms: 1_000,
+        };
+        put_tool_sequence(&db, &ts).expect("put");
+
+        let id = crate::store::ids::WorkflowId::derive(b"nonexistent");
+        let result = get_tool_sequence(&db, &id.raw());
         assert!(matches!(result, Err(StoreError::NotFound)));
     }
 }
