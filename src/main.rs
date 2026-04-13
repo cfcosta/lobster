@@ -380,6 +380,14 @@ fn cmd_reset(storage_dir: &std::path::Path, force: bool) -> Result<()> {
 }
 
 fn cmd_init(storage_dir: &std::path::Path) -> Result<()> {
+    let repo_root = storage_dir
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+
+    // Guard: refuse to initialize in the user's home directory
+    lobster::app::init::reject_home_directory(repo_root)
+        .map_err(|msg| anyhow::anyhow!("{msg}"))?;
+
     std::fs::create_dir_all(storage_dir).context("create storage dir")?;
 
     // 1. Initialize the database
@@ -394,32 +402,16 @@ fn cmd_init(storage_dir: &std::path::Path) -> Result<()> {
         .to_string_lossy()
         .to_string();
 
-    // 3. Write .claude/settings.json with hook configuration
-    let repo_root = storage_dir
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."));
+    // 3. Merge lobster hooks into .claude/settings.json
     let claude_dir = repo_root.join(".claude");
     std::fs::create_dir_all(&claude_dir).context("create .claude dir")?;
 
     let settings_path = claude_dir.join("settings.json");
-    let settings = serde_json::json!({
-        "hooks": {
-            "UserPromptSubmit": [{
-                "hooks": [{
-                    "type": "command",
-                    "command": format!("{bin_path} hook UserPromptSubmit"),
-                    "timeout": 10
-                }]
-            }],
-            "PostToolUse": [{
-                "hooks": [{
-                    "type": "command",
-                    "command": format!("{bin_path} hook PostToolUse"),
-                    "timeout": 10
-                }]
-            }]
-        }
-    });
+    let existing_settings = std::fs::read_to_string(&settings_path).ok();
+    let settings = lobster::app::init::merge_claude_settings(
+        existing_settings.as_deref(),
+        &bin_path,
+    );
     std::fs::write(
         &settings_path,
         serde_json::to_string_pretty(&settings)
@@ -428,16 +420,13 @@ fn cmd_init(storage_dir: &std::path::Path) -> Result<()> {
     .context("write .claude/settings.json")?;
     println!("Hooks: {}", settings_path.display());
 
-    // 4. Write .mcp.json with MCP server configuration
+    // 4. Merge lobster MCP server into .mcp.json
     let mcp_path = repo_root.join(".mcp.json");
-    let mcp = serde_json::json!({
-        "mcpServers": {
-            "lobster": {
-                "command": bin_path,
-                "args": ["mcp"]
-            }
-        }
-    });
+    let existing_mcp = std::fs::read_to_string(&mcp_path).ok();
+    let mcp = lobster::app::init::merge_mcp_config(
+        existing_mcp.as_deref(),
+        &bin_path,
+    );
     std::fs::write(
         &mcp_path,
         serde_json::to_string_pretty(&mcp).context("serialize mcp config")?,
