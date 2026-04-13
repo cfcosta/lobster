@@ -2,7 +2,7 @@
 //!
 //! Reads provider and model from environment variables:
 //! - `ANTHROPIC_API_KEY` + `ANTHROPIC_MODEL` (default: `claude-sonnet-4-6`)
-//! - `OPENAI_API_KEY` + `OPENAI_MODEL` (default: `gpt-4o-mini`)
+//! - `OPENAI_API_KEY` + `OPENAI_MODEL` (default: `gpt-5.4-mini`)
 
 use rig::{
     client::{CompletionClient, ProviderClient},
@@ -10,7 +10,7 @@ use rig::{
 };
 
 const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-4-6";
-const DEFAULT_OPENAI_MODEL: &str = "gpt-4o-mini";
+const DEFAULT_OPENAI_MODEL: &str = "gpt-5.4-mini";
 
 /// Call an LLM with a system preamble and user prompt.
 ///

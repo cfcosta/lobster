@@ -41,7 +41,7 @@ export OPENAI_API_KEY=sk-...
 
 # Optional: override default models
 export ANTHROPIC_MODEL=claude-sonnet-4-6   # default
-export OPENAI_MODEL=gpt-4o-mini            # default
+export OPENAI_MODEL=gpt-5.4-mini            # default
 
 # 2. Initialize Lobster for your repo
 cd /path/to/your/repo
@@ -92,7 +92,7 @@ When running `lobster mcp`, these tools are available:
 | `ANTHROPIC_API_KEY` | One of these | —                   | Anthropic API key |
 | `OPENAI_API_KEY`    | required     | —                   | OpenAI API key    |
 | `ANTHROPIC_MODEL`   | No           | `claude-sonnet-4-6` | Anthropic model   |
-| `OPENAI_MODEL`      | No           | `gpt-4o-mini`       | OpenAI model      |
+| `OPENAI_MODEL`      | No           | `gpt-5.4-mini`       | OpenAI model      |
 
 ## Architecture
 

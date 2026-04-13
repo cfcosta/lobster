@@ -2,7 +2,7 @@
 //!
 //! Uses `app::llm::call` which reads provider and model from env:
 //! - `ANTHROPIC_API_KEY` + `ANTHROPIC_MODEL` (default: claude-sonnet-4-6)
-//! - `OPENAI_API_KEY` + `OPENAI_MODEL` (default: gpt-4o-mini)
+//! - `OPENAI_API_KEY` + `OPENAI_MODEL` (default: gpt-5.4-mini)
 
 use crate::extract::traits::{
     ExtractedDecision,

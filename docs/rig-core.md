@@ -83,8 +83,8 @@ Model constants:
 
 ```rust
 // OpenAI
-openai::GPT_4O                          // "gpt-4o"
-openai::GPT_4O_MINI                     // "gpt-4o-mini"
+openai::GPT_4O                          // "gpt-5.4"
+openai::GPT_4O_MINI                     // "gpt-5.4-mini"
 openai::O3                              // "o3"
 openai::TEXT_EMBEDDING_3_LARGE          // "text-embedding-3-large"
 openai::TEXT_EMBEDDING_ADA_002          // "text-embedding-ada-002"
