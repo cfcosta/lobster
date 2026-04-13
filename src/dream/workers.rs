@@ -124,7 +124,11 @@ pub fn scan_workflow_patterns(
             crud,
             ids::{EntityId, RepoId, WorkflowId},
             schema::{
-                Entity, EntityKind, Episode, ProcessingState, ToolSequence,
+                Entity,
+                EntityKind,
+                Episode,
+                ProcessingState,
+                ToolSequence,
             },
         },
     };
@@ -200,9 +204,8 @@ pub fn scan_workflow_patterns(
             .collect();
 
         // Check if this pattern already exists
-        let already_exists = existing
-            .iter()
-            .any(|ts| ts.workflow_id == workflow_id);
+        let already_exists =
+            existing.iter().any(|ts| ts.workflow_id == workflow_id);
 
         if already_exists {
             // Update: merge new source episodes
@@ -481,10 +484,7 @@ mod tests {
 
         // Verify stored in redb
         let stored = crud::list_tool_sequences(&database);
-        assert!(
-            !stored.is_empty(),
-            "workflows should be persisted to redb"
-        );
+        assert!(!stored.is_empty(), "workflows should be persisted to redb");
     }
 
     #[test]

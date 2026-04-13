@@ -274,8 +274,7 @@ async fn cmd_mcp(storage_dir: &std::path::Path) -> Result<()> {
     let dream_grafeo = grafeo.clone();
     let _dreaming = tokio::spawn(async move {
         let config = lobster::dream::scheduler::DreamConfig::default();
-        let pattern_config =
-            lobster::dream::patterns::PatternConfig::default();
+        let pattern_config = lobster::dream::patterns::PatternConfig::default();
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             let result =
@@ -290,12 +289,11 @@ async fn cmd_mcp(storage_dir: &std::path::Path) -> Result<()> {
             }
 
             // Run workflow pattern mining
-            let wf_result =
-                lobster::dream::workers::scan_workflow_patterns(
-                    &dream_db,
-                    &dream_grafeo,
-                    &pattern_config,
-                );
+            let wf_result = lobster::dream::workers::scan_workflow_patterns(
+                &dream_db,
+                &dream_grafeo,
+                &pattern_config,
+            );
             if wf_result.workflows_created > 0
                 || wf_result.workflows_updated > 0
             {

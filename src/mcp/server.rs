@@ -104,6 +104,7 @@ impl LobsterServer {
     )]
     fn memory_status(&self) -> String {
         let report = crate::app::status::scan(&self.db);
+        let workflows = crate::store::crud::list_tool_sequences(&self.db);
         serde_json::to_string(&serde_json::json!({
             "episodes_total": report.total_episodes(),
             "ready": report.ready,
@@ -112,6 +113,7 @@ impl LobsterServer {
             "failed_final": report.failed_final,
             "summary_artifacts": report.summary_artifacts,
             "extraction_artifacts": report.extraction_artifacts,
+            "workflows": workflows.len(),
         }))
         .unwrap_or_default()
     }
