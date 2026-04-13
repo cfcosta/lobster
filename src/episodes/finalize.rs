@@ -330,27 +330,62 @@ pub async fn finalize_episode_at(
         crate::graph::db::set_node_embedding(grafeo, ep_node, &proxy_vector);
     }
 
-    // Project decisions and persist entities to redb (Fix #4)
+    // Build name → Grafeo node maps for relation projection
+    let mut decision_nodes: std::collections::HashMap<String, grafeo::NodeId> =
+        std::collections::HashMap::new();
+    let mut entity_nodes: std::collections::HashMap<String, grafeo::NodeId> =
+        std::collections::HashMap::new();
+
+    // Project decisions
     for dec in &created_decisions {
         let dec_node = projection::project_decision(grafeo, dec, ep_node);
+        decision_nodes.insert(dec.statement.clone(), dec_node);
+    }
 
-        for entity_fact in &extraction_output.entities {
-            let ent = make_entity(repo_path, repo_id, entity_fact);
-            // Persist entity to redb (canonical truth)
-            let _ = crud::put_entity(db, &ent);
-            let ent_node = projection::project_entity(grafeo, &ent, ep_node);
-            projection::link_decision_entity(
-                grafeo, dec_node, ent_node, now_ms,
-            );
+    // Project entities and persist to redb
+    for entity_fact in &extraction_output.entities {
+        let ent = make_entity(repo_path, repo_id, entity_fact);
+        let _ = crud::put_entity(db, &ent);
+        let ent_node = projection::project_entity(grafeo, &ent, ep_node);
+        entity_nodes.insert(entity_fact.name.clone(), ent_node);
+    }
+
+    // Project task nodes (task_refs from extraction)
+    let mut task_nodes: std::collections::HashMap<String, grafeo::NodeId> =
+        std::collections::HashMap::new();
+    if let Some(tid) = task_id {
+        if let Ok(task) = crud::get_task(db, &tid.raw()) {
+            let task_node = projection::project_task(grafeo, &task, ep_node);
+            task_nodes.insert(task.title, task_node);
         }
     }
 
-    if created_decisions.is_empty() {
-        for entity_fact in &extraction_output.entities {
-            let ent = make_entity(repo_path, repo_id, entity_fact);
-            // Persist entity to redb (canonical truth)
-            let _ = crud::put_entity(db, &ent);
-            projection::project_entity(grafeo, &ent, ep_node);
+    // Project extracted relations into typed graph edges
+    for rel in &extraction_output.relations {
+        let from_node = decision_nodes
+            .get(&rel.from)
+            .or_else(|| entity_nodes.get(&rel.from))
+            .or_else(|| task_nodes.get(&rel.from));
+        let to_node = decision_nodes
+            .get(&rel.to)
+            .or_else(|| entity_nodes.get(&rel.to))
+            .or_else(|| task_nodes.get(&rel.to));
+
+        if let (Some(&from), Some(&to)) = (from_node, to_node) {
+            match rel.relation_type {
+                crate::extract::traits::RelationType::TaskDecision => {
+                    projection::link_task_decision(grafeo, from, to, now_ms);
+                }
+                crate::extract::traits::RelationType::TaskEntity => {
+                    projection::link_task_entity(grafeo, from, to, now_ms);
+                }
+                crate::extract::traits::RelationType::DecisionEntity => {
+                    projection::link_decision_entity(grafeo, from, to, now_ms);
+                }
+                crate::extract::traits::RelationType::EntityEntity => {
+                    projection::link_entity_entity(grafeo, from, to, now_ms);
+                }
+            }
         }
     }
 

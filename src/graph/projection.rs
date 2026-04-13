@@ -126,6 +126,42 @@ pub fn link_decision_entity(
     );
 }
 
+/// Link a task to an entity in the graph.
+pub fn link_task_entity(
+    grafeo: &GrafeoDB,
+    task_node: grafeo::NodeId,
+    entity_node: grafeo::NodeId,
+    valid_from_ms: i64,
+) {
+    db::create_temporal_edge_with_evidence(
+        grafeo,
+        task_node,
+        entity_node,
+        edges::TASK_ENTITY,
+        valid_from_ms,
+        None,
+        None,
+    );
+}
+
+/// Link two entities in the graph.
+pub fn link_entity_entity(
+    grafeo: &GrafeoDB,
+    from_node: grafeo::NodeId,
+    to_node: grafeo::NodeId,
+    valid_from_ms: i64,
+) {
+    db::create_temporal_edge_with_evidence(
+        grafeo,
+        from_node,
+        to_node,
+        edges::ENTITY_ENTITY,
+        valid_from_ms,
+        None,
+        None,
+    );
+}
+
 /// Link a task to a decision in the graph.
 pub fn link_task_decision(
     grafeo: &GrafeoDB,
@@ -256,5 +292,55 @@ mod tests {
         assert_eq!(grafeo.node_count(), 4);
         // 5 edges: 3 provenance + 2 semantic
         assert_eq!(grafeo.edge_count(), 5);
+    }
+
+    #[test]
+    fn test_full_projection_with_all_edge_types() {
+        let grafeo = db::new_in_memory();
+        let ep = test_episode();
+        let dec = test_decision();
+        let task = Task {
+            task_id: TaskId::derive(b"task-1"),
+            repo_id: RepoId::derive(b"repo"),
+            title: "Build memory".into(),
+            status: TaskStatus::Open,
+            opened_in: EpisodeId::derive(b"ep-1"),
+            last_seen_in: EpisodeId::derive(b"ep-1"),
+        };
+        let entity_a = Entity {
+            entity_id: EntityId::derive(b"ent-a"),
+            repo_id: RepoId::derive(b"repo"),
+            kind: EntityKind::Component,
+            canonical_name: "redb".into(),
+            first_seen_episode: None,
+            last_seen_ts_utc_ms: None,
+            mention_count: 0,
+        };
+        let entity_b = Entity {
+            entity_id: EntityId::derive(b"ent-b"),
+            repo_id: RepoId::derive(b"repo"),
+            kind: EntityKind::Concept,
+            canonical_name: "ACID".into(),
+            first_seen_episode: None,
+            last_seen_ts_utc_ms: None,
+            mention_count: 0,
+        };
+
+        let ep_node = project_episode(&grafeo, &ep);
+        let dec_node = project_decision(&grafeo, &dec, ep_node);
+        let task_node = project_task(&grafeo, &task, ep_node);
+        let node_ent_a = project_entity(&grafeo, &entity_a, ep_node);
+        let node_ent_b = project_entity(&grafeo, &entity_b, ep_node);
+
+        // All four semantic link types
+        link_task_decision(&grafeo, task_node, dec_node, 1_700_000_000_000);
+        link_task_entity(&grafeo, task_node, node_ent_a, 1_700_000_000_000);
+        link_decision_entity(&grafeo, dec_node, node_ent_a, 1_700_000_000_000);
+        link_entity_entity(&grafeo, node_ent_a, node_ent_b, 1_700_000_000_000);
+
+        // 5 nodes: episode, decision, task, entity_a, entity_b
+        assert_eq!(grafeo.node_count(), 5);
+        // 4 provenance + 4 semantic = 8
+        assert_eq!(grafeo.edge_count(), 8);
     }
 }
