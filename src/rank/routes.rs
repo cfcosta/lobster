@@ -224,14 +224,7 @@ fn search_grafeo(
         20,
         None,
     ) {
-        collect_hits(
-            grafeo,
-            &hits,
-            "episode_id",
-            "summary",
-            0.85,
-            &mut candidates,
-        );
+        collect_hits(grafeo, &hits, "episode_id", "summary", &mut candidates);
     }
 
     // BM25 text search on decision statements
@@ -246,7 +239,6 @@ fn search_grafeo(
             &hits,
             "decision_id",
             "decision",
-            0.9,
             &mut candidates,
         );
     }
@@ -258,36 +250,30 @@ fn search_grafeo(
         query,
         20,
     ) {
-        collect_hits(
-            grafeo,
-            &hits,
-            "entity_id",
-            "entity",
-            0.7,
-            &mut candidates,
-        );
+        collect_hits(grafeo, &hits, "entity_id", "entity", &mut candidates);
     }
 
     candidates
 }
 
 /// Collect search hits from Grafeo into scored candidates.
+///
+/// Uses the actual score returned by Grafeo's BM25/hybrid search.
 fn collect_hits(
     grafeo: &GrafeoDB,
     hits: &[(grafeo::NodeId, f64)],
     id_property: &str,
     artifact_type: &str,
-    base_score: f64,
     candidates: &mut Vec<ScoredCandidate>,
 ) {
-    for (node_id, _score) in hits {
+    for (node_id, score) in hits {
         if let Some(node) = grafeo.get_node(*node_id) {
             if let Some(id_val) = node.get_property(id_property) {
                 if let Some(id_str) = id_val.as_str() {
                     if let Ok(raw_id) = id_str.parse() {
                         candidates.push(ScoredCandidate {
                             id: raw_id,
-                            score: base_score,
+                            score: *score,
                             artifact_type: artifact_type.into(),
                         });
                     }
