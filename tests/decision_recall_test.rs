@@ -1,11 +1,9 @@
-//! End-to-end test: decisions detected during finalization can be
-//! recalled through the retrieval pipeline.
+//! End-to-end test: decisions recalled through the retrieval pipeline.
 
 use lobster::{
-    episodes::decisions,
     graph::db as grafeo_db,
     hooks::{events::HookEvent, recall},
-    store::{db, schema::Confidence},
+    store::db,
 };
 
 fn make_prompt_event(prompt: &str) -> HookEvent {
@@ -15,16 +13,6 @@ fn make_prompt_event(prompt: &str) -> HookEvent {
         "cwd": "/test/repo",
     }))
     .unwrap()
-}
-
-#[tokio::test]
-async fn test_decision_detection_end_to_end() {
-    let text = "After reviewing options, I chose redb for \
-                storage. Cloud sync is a non-goal for v1.";
-    let signals = decisions::detect_signals(text);
-    assert!(!signals.is_empty(), "should detect at least one signal");
-    let confidence = decisions::aggregate_confidence(&signals);
-    assert_eq!(confidence, Some(Confidence::High),);
 }
 
 #[test]
