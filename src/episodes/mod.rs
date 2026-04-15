@@ -5,4 +5,3 @@ pub mod finalize;
 pub mod rig_summarizer;
 pub mod segmenter;
 pub mod sequences;
-pub mod summarizer;

@@ -1,22 +1,14 @@
 //! Episode finalization pipeline.
 //!
-//! When an episode closes, this module orchestrates the 10-step
-//! finalization flow: persist as Pending, summarize, detect
-//! decisions, embed, extract, project to Grafeo, mark Ready.
+//! When an episode closes, this module orchestrates the finalization
+//! flow: persist as Pending, analyze (summarize + extract in one LLM
+//! call), embed, project to Grafeo, mark Ready.
 
 use grafeo::GrafeoDB;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    episodes::{
-        rig_summarizer::RigSummarizer,
-        summarizer::{Summarizer, SummaryInput},
-    },
-    extract::{
-        rig_extractor::RigExtractor,
-        traits::{ExtractionInput, Extractor},
-        validate,
-    },
+    extract::{rig_extractor, traits::ExtractionOutput, validate},
     graph::projection,
     store::{
         crud,
@@ -137,39 +129,86 @@ pub async fn finalize_episode_at(
         ));
     }
 
-    // ── Steps 2-3: Summarize and persist ─────────────────
+    // ── Step 2: Unified LLM call (summarize + extract) ────
     let file_reads = extract_file_reads(events_json);
-    let summarizer = RigSummarizer::default();
-    let summary_input = SummaryInput {
-        episode_events_json: events_json.to_vec(),
-        repo_path: repo_path.to_string(),
-        task_title: task_title.clone(),
-        file_reads,
-    };
+    let events_text = crate::episodes::rig_summarizer::strip_tool_markup(
+        &String::from_utf8_lossy(events_json),
+    );
 
-    let mut summary = match summarizer.summarize(summary_input).await {
-        Ok(s) => s,
+    let mut file_context = String::new();
+    if !file_reads.is_empty() {
+        file_context.push_str("\nFiles read during this session:\n");
+        for (path, content) in &file_reads {
+            use std::fmt::Write;
+            let _ = writeln!(file_context, "\n--- {path} ---");
+            let _ = writeln!(file_context, "{content}");
+        }
+    }
+
+    let prompt = format!(
+        "Repository: {repo}\n\
+         Task: {task}\n\
+         \n\
+         Events from this work session:\n\
+         {events}\n\
+         {files}",
+        repo = repo_path,
+        task = task_title.as_deref().unwrap_or("(none)"),
+        events = events_text,
+        files = file_context,
+    );
+
+    let analysis = match rig_extractor::analyze(&prompt).await {
+        Ok(a) => a,
         Err(e) => {
-            return FinalizeResult::Failed(format!(
-                "steps 2-3 (summarize): {e}"
-            ));
+            let mut retry_ep = episode.clone();
+            retry_ep.processing_state = ProcessingState::RetryQueued;
+            retry_ep.retry_count += 1;
+            let _ = crud::put_episode(db, &retry_ep);
+            return FinalizeResult::RetryQueued {
+                episode_id,
+                reason: format!("analysis failed: {e}"),
+            };
         }
     };
-    // Fix: the summary must reference our actual episode_id,
-    // not one derived from repo_path alone.
-    summary.episode_id = episode_id;
+
+    let summary_text = &analysis.summary;
+    let extraction_output = ExtractionOutput::from(&analysis);
+
+    // ── Step 3: Validate extraction ─────────────────────
+    if let Err(errors) = validate::validate(&extraction_output) {
+        let mut retry_ep = episode.clone();
+        retry_ep.processing_state = ProcessingState::RetryQueued;
+        retry_ep.retry_count += 1;
+        let _ = crud::put_episode(db, &retry_ep);
+        return FinalizeResult::RetryQueued {
+            episode_id,
+            reason: format!("validation failed: {errors:?}"),
+        };
+    }
+
+    // ── Step 4: Persist summary artifact ────────────────
+    let mut hasher = Sha256::new();
+    hasher.update(summary_text.as_bytes());
+    let summary_checksum: [u8; 32] = hasher.finalize().into();
+
+    let summary = crate::store::schema::SummaryArtifact {
+        episode_id,
+        revision: "rig-v2".to_string(),
+        summary_text: summary_text.clone(),
+        payload_checksum: summary_checksum,
+    };
 
     if let Err(e) = crud::put_summary_artifact(db, &summary) {
         return FinalizeResult::Failed(format!(
-            "steps 2-3 (persist summary): {e}"
+            "step 4 (persist summary): {e}"
         ));
     }
 
     // Decisions will be created from extraction output below
-    // (not from heuristic text pattern matching).
     let mut created_decisions: Vec<Decision> = Vec::new();
 
-    // ── Step 5b: Create/update Task record if task_title present
+    // ── Step 5: Create/update Task record if task_title present
     if let Some(tid) = task_id {
         if let Some(title) = &task_title {
             let task = crate::store::schema::Task {
@@ -184,18 +223,17 @@ pub async fn finalize_episode_at(
         }
     }
 
-    // ── Step 6-7: Embedding (runs first, doesn't depend on extraction)
+    // ── Step 6: Embedding ───────────────────────────────
     let artifact_id = crate::store::ids::ArtifactId::derive(
         format!("emb:{episode_id}").as_bytes(),
     );
     let policy = crate::embeddings::proxy::policy_for("summary");
 
-    // Encode summary with ColBERT. Model is expected to be installed.
     let proxy_vector = match crate::embeddings::encoder::load_model() {
         Ok(mut model) => {
             match crate::embeddings::encoder::encode_text(
                 &mut model,
-                &summary.summary_text,
+                summary_text,
                 artifact_id,
                 policy,
             ) {
@@ -224,63 +262,26 @@ pub async fn finalize_episode_at(
         }
     };
 
-    // ── Steps 6-8: Extract, validate, persist ────────────
-    let extractor = RigExtractor;
-    let extraction_input = ExtractionInput {
-        summary_text: summary.summary_text.clone(),
-        decisions_json: extract_decisions_json(events_json),
-        tool_outcomes_json: extract_tool_outcomes_json(events_json),
-        conversation_spans_json: extract_conversation_spans_json(events_json),
-        repo_path: repo_path.to_string(),
-    };
-
-    let extraction_output = match extractor.extract(extraction_input).await {
-        Ok(output) => output,
-        Err(e) => {
-            // Spec: mark RetryQueued on first failure, increment
-            // retry count. The dreaming scheduler will attempt
-            // re-extraction and mark FailedFinal if it fails again.
-            let mut retry_ep = episode.clone();
-            retry_ep.processing_state = ProcessingState::RetryQueued;
-            retry_ep.retry_count += 1;
-            let _ = crud::put_episode(db, &retry_ep);
-            return FinalizeResult::RetryQueued {
-                episode_id,
-                reason: format!("extraction failed: {e}"),
-            };
-        }
-    };
-
-    if let Err(errors) = validate::validate(&extraction_output) {
-        let mut retry_ep = episode.clone();
-        retry_ep.processing_state = ProcessingState::RetryQueued;
-        retry_ep.retry_count += 1;
-        let _ = crud::put_episode(db, &retry_ep);
-        return FinalizeResult::RetryQueued {
-            episode_id,
-            reason: format!("validation failed: {errors:?}"),
-        };
-    }
-
+    // ── Step 7: Persist extraction artifact ───────────────
     let output_json =
         serde_json::to_vec(&extraction_output).unwrap_or_default();
-    let mut hasher = Sha256::new();
-    hasher.update(&output_json);
-    let payload_checksum: [u8; 32] = hasher.finalize().into();
+    let mut ext_hasher = Sha256::new();
+    ext_hasher.update(&output_json);
+    let payload_checksum: [u8; 32] = ext_hasher.finalize().into();
 
     let extraction_artifact = ExtractionArtifact {
         episode_id,
-        revision: "rig-v1".to_string(),
+        revision: "rig-v2".to_string(),
         output_json,
         payload_checksum,
     };
     if let Err(e) = crud::put_extraction_artifact(db, &extraction_artifact) {
         return FinalizeResult::Failed(format!(
-            "step 8 (persist extraction): {e}"
+            "step 7 (persist extraction): {e}"
         ));
     }
 
-    // ── Step 8b: Create decisions from extraction output ──
+    // ── Step 8: Create decisions from extraction output ──
     // Use canon::decision_id for repo-scoped, normalized dedup.
     // Decisions with the same normalized statement within the same
     // repo are considered duplicates and skipped.
@@ -470,100 +471,6 @@ const FILE_READ_MAX_CHARS: usize = 2000;
 
 /// Max number of file reads to include in summarizer input.
 const FILE_READ_MAX_FILES: usize = 10;
-
-/// Extract decision signals from events for the extractor.
-///
-/// Looks for user messages containing decision-like language and
-/// assistant responses that confirm decisions.
-fn extract_decisions_json(events_json: &[u8]) -> Vec<u8> {
-    let Ok(events) =
-        serde_json::from_slice::<Vec<serde_json::Value>>(events_json)
-    else {
-        return b"[]".to_vec();
-    };
-
-    let mut decisions = Vec::new();
-    for event in &events {
-        // Detect decision signals from user prompts and assistant responses
-        if let Some(prompt) = event
-            .get("tool_input")
-            .and_then(|v| v.get("prompt"))
-            .and_then(|v| v.as_str())
-        {
-            let signals = crate::episodes::decisions::detect_signals(prompt);
-            if !signals.is_empty() {
-                decisions.push(serde_json::json!({
-                    "source": "user_prompt",
-                    "text": prompt,
-                    "signal_count": signals.len(),
-                }));
-            }
-        }
-    }
-
-    serde_json::to_vec(&decisions).unwrap_or_else(|_| b"[]".to_vec())
-}
-
-/// Extract tool use/result pairs from events.
-fn extract_tool_outcomes_json(events_json: &[u8]) -> Vec<u8> {
-    let Ok(events) =
-        serde_json::from_slice::<Vec<serde_json::Value>>(events_json)
-    else {
-        return b"[]".to_vec();
-    };
-
-    let mut outcomes = Vec::new();
-    for event in &events {
-        if let Some(tool) = event.get("tool_name").and_then(|v| v.as_str()) {
-            let mut outcome = serde_json::json!({ "tool": tool });
-            if let Some(input) = event.get("tool_input") {
-                // Include key input fields (file path, command, etc.)
-                if let Some(path) = input
-                    .get("file_path")
-                    .or_else(|| input.get("path"))
-                    .or_else(|| input.get("command"))
-                {
-                    outcome["input_key"] = path.clone();
-                }
-            }
-            outcomes.push(outcome);
-        }
-    }
-
-    serde_json::to_vec(&outcomes).unwrap_or_else(|_| b"[]".to_vec())
-}
-
-/// Extract conversation spans (user/assistant message pairs).
-fn extract_conversation_spans_json(events_json: &[u8]) -> Vec<u8> {
-    let Ok(events) =
-        serde_json::from_slice::<Vec<serde_json::Value>>(events_json)
-    else {
-        return b"[]".to_vec();
-    };
-
-    let mut spans = Vec::new();
-    for event in &events {
-        let hook_type = event
-            .get("hook_event_name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-
-        if hook_type == "UserPromptSubmit" {
-            if let Some(prompt) = event
-                .get("tool_input")
-                .and_then(|v| v.get("prompt"))
-                .and_then(|v| v.as_str())
-            {
-                spans.push(serde_json::json!({
-                    "role": "user",
-                    "text": prompt,
-                }));
-            }
-        }
-    }
-
-    serde_json::to_vec(&spans).unwrap_or_else(|_| b"[]".to_vec())
-}
 
 /// Extract file read contents from raw episode events.
 ///

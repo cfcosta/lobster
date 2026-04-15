@@ -71,34 +71,32 @@ pub fn run_cycle(db: &LobsterDb, config: &DreamConfig) -> DreamCycleResult {
                 let _ = crud::put_episode(db, &ep);
                 result.episodes_failed_final += 1;
             } else {
-                // Re-attempt extraction with the LLM
-                // extractor (tighter constraints on retry)
+                // Re-attempt analysis with the unified LLM call
                 let summary_text =
                     crud::get_summary_artifact(db, &ep.episode_id.raw())
                         .map(|s| s.summary_text)
                         .unwrap_or_default();
 
-                let extractor = crate::extract::rig_extractor::RigExtractor;
-                let input = crate::extract::traits::ExtractionInput {
-                    summary_text,
-                    decisions_json: b"[]".to_vec(),
-                    tool_outcomes_json: b"[]".to_vec(),
-                    conversation_spans_json: b"[]".to_vec(),
-                    repo_path: String::new(),
-                };
+                let prompt = format!(
+                    "Repository: (retry)\n\n\
+                     Summary from previous attempt:\n{summary_text}"
+                );
 
-                // Use block_on since we're not in async context
-                let extraction_ok =
+                let analysis_ok =
                     tokio::runtime::Handle::try_current().ok().and_then(|h| {
                         tokio::task::block_in_place(|| {
                             h.block_on(async {
-                                use crate::extract::traits::Extractor;
-                                extractor.extract(input).await.ok()
+                                crate::extract::rig_extractor::analyze(&prompt)
+                                    .await
+                                    .ok()
                             })
                         })
                     });
 
-                if let Some(output) = extraction_ok {
+                if let Some(analysis) = analysis_ok {
+                    let output = crate::extract::traits::ExtractionOutput::from(
+                        &analysis,
+                    );
                     if crate::extract::validate::validate(&output).is_ok() {
                         ep.processing_state = ProcessingState::Ready;
                         let _ = crud::put_episode(db, &ep);

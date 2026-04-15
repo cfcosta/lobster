@@ -1,20 +1,10 @@
-//! Async Extractor trait interface and typed output schema.
+//! Typed output schema for graph extraction.
 //!
 //! The extractor emits typed structured facts, not freeform graph
 //! queries. Lobster's deterministic compiler converts these facts
 //! into Grafeo CRUD operations.
 
 use serde::{Deserialize, Serialize};
-
-/// Input for graph extraction: the full episode bundle.
-#[derive(Debug, Clone)]
-pub struct ExtractionInput {
-    pub summary_text: String,
-    pub decisions_json: Vec<u8>,
-    pub tool_outcomes_json: Vec<u8>,
-    pub conversation_spans_json: Vec<u8>,
-    pub repo_path: String,
-}
 
 /// A typed entity reference in the extraction output.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,18 +80,6 @@ impl std::fmt::Display for ExtractionError {
 
 impl std::error::Error for ExtractionError {}
 
-/// Async graph extraction interface.
-///
-/// Implementations:
-/// - `rig-core`-backed LLM extractor (structured output)
-/// - Heuristic deterministic extractor (offline fallback)
-pub trait Extractor: Send + Sync {
-    fn extract(
-        &self,
-        input: ExtractionInput,
-    ) -> impl Future<Output = Result<ExtractionOutput, ExtractionError>> + Send;
-}
-
 #[cfg(test)]
 mod tests {
     use hegel::{TestCase, generators as gs};
@@ -163,40 +141,5 @@ mod tests {
         let json = serde_json::to_string(&rt).unwrap();
         let parsed: RelationType = serde_json::from_str(&json).unwrap();
         assert_eq!(rt, parsed);
-    }
-
-    struct MockExtractor;
-
-    impl Extractor for MockExtractor {
-        async fn extract(
-            &self,
-            _input: ExtractionInput,
-        ) -> Result<ExtractionOutput, ExtractionError> {
-            Ok(ExtractionOutput {
-                task_refs: vec![],
-                decision_refs: vec![],
-                entities: vec![ExtractedEntity {
-                    kind: "component".into(),
-                    name: "Grafeo".into(),
-                }],
-                relations: vec![],
-                decisions: vec![],
-            })
-        }
-    }
-
-    #[tokio::test]
-    async fn test_mock_extractor() {
-        let extractor = MockExtractor;
-        let input = ExtractionInput {
-            summary_text: "test".into(),
-            decisions_json: b"[]".to_vec(),
-            tool_outcomes_json: b"[]".to_vec(),
-            conversation_spans_json: b"[]".to_vec(),
-            repo_path: "/test".into(),
-        };
-        let result = extractor.extract(input).await;
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().entities[0].name, "Grafeo");
     }
 }

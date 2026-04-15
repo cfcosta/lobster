@@ -1,93 +1,13 @@
-//! rig-core backed LLM summarizer.
+//! Pre-processing utilities for episode event text.
 //!
-//! Uses `app::llm::call` which reads provider and model from env:
-//! - `ANTHROPIC_API_KEY` + `ANTHROPIC_MODEL` (default: claude-sonnet-4-6)
-//! - `OPENAI_API_KEY` + `OPENAI_MODEL` (default: gpt-5.4-mini)
-
-use sha2::{Digest, Sha256};
-
-use crate::{
-    episodes::summarizer::{Summarizer, SummaryError, SummaryInput},
-    store::{ids::EpisodeId, schema::SummaryArtifact},
-};
-
-pub struct RigSummarizer {
-    pub revision: String,
-}
-
-impl Default for RigSummarizer {
-    fn default() -> Self {
-        Self {
-            revision: "rig-v1".to_string(),
-        }
-    }
-}
-
-impl Summarizer for RigSummarizer {
-    async fn summarize(
-        &self,
-        input: SummaryInput,
-    ) -> Result<SummaryArtifact, SummaryError> {
-        let events_text = strip_tool_markup(&String::from_utf8_lossy(
-            &input.episode_events_json,
-        ));
-
-        let mut file_context = String::new();
-        if !input.file_reads.is_empty() {
-            file_context.push_str("\nFiles read during this session:\n");
-            for (path, content) in &input.file_reads {
-                use std::fmt::Write;
-                let _ = writeln!(file_context, "\n--- {path} ---");
-                let _ = writeln!(file_context, "{content}");
-            }
-        }
-
-        let prompt = format!(
-            "Repository: {repo}\n\
-             Task: {task}\n\
-             \n\
-             Events from this work session:\n\
-             {events}\n\
-             {files}",
-            repo = input.repo_path,
-            task = input.task_title.as_deref().unwrap_or("(none)"),
-            events = events_text,
-            files = file_context,
-        );
-
-        let response = crate::app::llm::call(
-            "You produce concise third-person summaries of developer work sessions.\n\
-             \n\
-             Rules:\n\
-             - Write in third person past tense (\"The developer added...\", not \"I will...\").\n\
-             - Focus on: what changed, why, what was decided, what files were touched.\n\
-             - Omit tool call syntax, JSON payloads, and raw command output.\n\
-             - If the session contains no meaningful work, write \"No significant changes.\"\n\
-             - Keep the summary under 300 words.\n\
-             - Do NOT use markdown headers, bullet points, or formatting.\n\
-             - Write plain prose paragraphs only.",
-            &prompt,
-        )
-        .await
-        .map_err(SummaryError::ModelUnavailable)?;
-
-        let mut hasher = Sha256::new();
-        hasher.update(response.as_bytes());
-        let checksum: [u8; 32] = hasher.finalize().into();
-
-        Ok(SummaryArtifact {
-            episode_id: EpisodeId::derive(input.repo_path.as_bytes()),
-            revision: self.revision.clone(),
-            summary_text: response,
-            payload_checksum: checksum,
-        })
-    }
-}
+//! Strips tool call markup and large JSON blobs from raw event text
+//! before it is sent to the LLM for analysis.
 
 /// Strip tool call/response markup and large JSON blobs from event
-/// text before sending to the summarizer. This prevents the LLM from
-/// parroting raw XML and command output back in the summary.
-fn strip_tool_markup(text: &str) -> String {
+/// text. This prevents the LLM from parroting raw XML and command
+/// output back in the summary.
+#[must_use]
+pub fn strip_tool_markup(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let mut skip_depth: u32 = 0;
 
@@ -154,25 +74,6 @@ fn strip_tool_markup(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn test_rig_summarizer_requires_api_key() {
-        if std::env::var("ANTHROPIC_API_KEY").is_err()
-            && std::env::var("OPENAI_API_KEY").is_err()
-        {
-            let summarizer = RigSummarizer::default();
-            let input = SummaryInput {
-                episode_events_json: b"[]".to_vec(),
-                repo_path: "/test".into(),
-                task_title: None,
-                file_reads: vec![],
-            };
-            let result = summarizer.summarize(input).await;
-            assert!(matches!(result, Err(SummaryError::ModelUnavailable(_))));
-        }
-    }
-
-    // ── strip_tool_markup ───────────────────────────────────
 
     #[test]
     fn test_strip_removes_tool_call_blocks() {

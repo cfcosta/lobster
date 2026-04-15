@@ -1,115 +1,143 @@
-//! rig-core backed LLM extractor.
+//! rig-core backed unified episode analyzer.
 //!
-//! Uses `app::llm::call` which reads provider and model from env:
+//! Merges summarization and extraction into a single LLM call using
+//! rig's structured extraction (tool-call based). The model returns
+//! a typed `EpisodeAnalysis` matching the `JsonSchema` derive.
+//!
+//! Uses `app::llm::extract` which reads provider and model from env:
 //! - `ANTHROPIC_API_KEY` + `ANTHROPIC_MODEL` (default: claude-sonnet-4-6)
 //! - `OPENAI_API_KEY` + `OPENAI_MODEL` (default: gpt-5.4-mini)
+
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
 use crate::extract::traits::{
     ExtractedDecision,
     ExtractedEntity,
     ExtractedRelation,
     ExtractionError,
-    ExtractionInput,
     ExtractionOutput,
-    Extractor,
     RelationType,
 };
 
-pub struct RigExtractor;
+/// Unified LLM output: summary + structured extraction in one call.
+///
+/// Every field is annotated with `schemars` doc attributes so the
+/// JSON schema sent to the model describes what each field expects.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct EpisodeAnalysis {
+    /// A concise third-person past-tense summary of the work session
+    /// (plain prose, no markdown, under 300 words). Focus on what
+    /// changed, why, what was decided, and what files were touched.
+    /// If the session contains no meaningful work, write
+    /// "No significant changes."
+    pub summary: String,
 
-impl Extractor for RigExtractor {
-    async fn extract(
-        &self,
-        input: ExtractionInput,
-    ) -> Result<ExtractionOutput, ExtractionError> {
-        let prompt = format!(
-            "Repository: {repo}\n\
-             \n\
-             Summary of work session:\n\
-             {summary}\n",
-            repo = input.repo_path,
-            summary = input.summary_text,
-        );
+    /// Technical decisions made during the session. Only include
+    /// genuine decisions (architecture, design, tool choice,
+    /// approach), not routine actions. Empty array if none.
+    #[serde(default)]
+    pub decisions: Vec<AnalysisDecision>,
 
-        let response = crate::app::llm::call(
-            "You extract structured facts from developer work session summaries.\n\
-             Output a single JSON object with these fields:\n\
-             \n\
-             \"decisions\": array of decisions made during the session. Each has:\n\
-             - \"statement\": one clear sentence stating what was decided\n\
-             - \"rationale\": why it was decided (one sentence)\n\
-             - \"confidence\": \"high\" (explicit choice), \"medium\" (implied), or \"low\" (uncertain)\n\
-             Only include genuine technical decisions (architecture, design, tool choice, approach).\n\
-             Do NOT include routine actions like \"ran tests\" or \"read a file\".\n\
-             \n\
-             \"entities\": array of notable things mentioned. Each has:\n\
-             - \"kind\": one of \"component\", \"constraint\", \"file-lite\", \"concept\", \"repo\"\n\
-             - \"name\": canonical name\n\
-             Only include entities that would be useful to recall in future sessions.\n\
-             Prefer components and constraints over generic concepts.\n\
-             \n\
-             \"relations\": array of relationships. Each has:\n\
-             - \"relation_type\": \"EntityEntity\", \"DecisionEntity\", \"TaskEntity\", or \"TaskDecision\"\n\
-             - \"from\": name of source entity\n\
-             - \"to\": name of target entity\n\
-             \n\
-             \"task_refs\": array of task title strings (empty if none)\n\
-             \"decision_refs\": array of decision statement strings (empty if none)\n\
-             \n\
-             Rules:\n\
-             - Output ONLY valid JSON, no markdown fences or prose.\n\
-             - Only extract what is explicitly stated. Do not invent.\n\
-             - If nothing meaningful was decided, return an empty \"decisions\" array.\n\
-             - Prefer fewer, higher-quality items over exhaustive extraction.\n\
-             - IMPORTANT: Only extract entities that belong to or are directly relevant to the repository shown above.\n\
-               Do NOT extract entities from other projects, test fixtures, or example code from unrelated domains.\n\
-               If the session references code from another repository, ignore those entities.",
-            &prompt,
-        )
-        .await
-        .map_err(ExtractionError::ModelUnavailable)?;
+    /// Notable entities mentioned that would be useful to recall in
+    /// future sessions. Prefer components and constraints over
+    /// generic concepts.
+    #[serde(default)]
+    pub entities: Vec<AnalysisEntity>,
 
-        parse_extraction_response(&response)
-    }
+    /// Relationships between entities, decisions, and tasks.
+    #[serde(default)]
+    pub relations: Vec<AnalysisRelation>,
+
+    /// Task title strings referenced in the session.
+    #[serde(default)]
+    pub task_refs: Vec<String>,
+
+    /// Decision statement strings referenced in the session.
+    #[serde(default)]
+    pub decision_refs: Vec<String>,
 }
 
-#[allow(clippy::too_many_lines)]
-fn parse_extraction_response(
-    response: &str,
-) -> Result<ExtractionOutput, ExtractionError> {
-    // Try to find JSON in the response (LLMs sometimes add prose)
-    let json_str = extract_json_from_response(response);
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AnalysisDecision {
+    /// One clear sentence stating what was decided.
+    pub statement: String,
+    /// Why it was decided (one sentence).
+    pub rationale: String,
+    /// "high" (explicit choice), "medium" (implied), or "low" (uncertain).
+    pub confidence: String,
+}
 
-    let parsed: serde_json::Value =
-        serde_json::from_str(json_str).map_err(|e| {
-            ExtractionError::InvalidOutput(format!(
-                "failed to parse LLM JSON: {e}\nresponse: {response}"
-            ))
-        })?;
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AnalysisEntity {
+    /// One of: "component", "constraint", "file-lite", "concept", "repo".
+    pub kind: String,
+    /// Canonical name of the entity.
+    pub name: String,
+}
 
-    let entities: Vec<ExtractedEntity> = parsed
-        .get("entities")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|e| {
-                    Some(ExtractedEntity {
-                        kind: e.get("kind")?.as_str()?.to_string(),
-                        name: e.get("name")?.as_str()?.to_string(),
-                    })
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AnalysisRelation {
+    /// One of: `EntityEntity`, `DecisionEntity`, `TaskEntity`, `TaskDecision`.
+    pub relation_type: String,
+    /// Name of the source entity.
+    pub from: String,
+    /// Name of the target entity.
+    pub to: String,
+}
+
+const PREAMBLE: &str = "\
+You analyze developer work sessions and produce both a summary and structured facts.\n\
+\n\
+Summary rules:\n\
+- Write in third person past tense (\"The developer added...\", not \"I will...\").\n\
+- Focus on: what changed, why, what was decided, what files were touched.\n\
+- Omit tool call syntax, JSON payloads, and raw command output.\n\
+- If the session contains no meaningful work, write \"No significant changes.\"\n\
+- Keep the summary under 300 words.\n\
+- Do NOT use markdown headers, bullet points, or formatting.\n\
+- Write plain prose paragraphs only.\n\
+\n\
+Extraction rules:\n\
+- Only extract what is explicitly stated. Do not invent.\n\
+- Only include genuine technical decisions (architecture, design, tool choice, approach).\n\
+  Do NOT include routine actions like \"ran tests\" or \"read a file\".\n\
+- Only extract entities that belong to or are directly relevant to the repository.\n\
+  Do NOT extract entities from other projects, test fixtures, or example code.\n\
+- Prefer fewer, higher-quality items over exhaustive extraction.\n\
+- If nothing meaningful was decided, return an empty decisions array.";
+
+/// Analyze an episode in a single LLM call: summarize + extract.
+///
+/// # Errors
+///
+/// Returns `ExtractionError` if the API key is missing or the call fails.
+pub async fn analyze(prompt: &str) -> Result<EpisodeAnalysis, ExtractionError> {
+    crate::app::llm::extract::<EpisodeAnalysis>(PREAMBLE, prompt)
+        .await
+        .map_err(ExtractionError::ModelUnavailable)
+}
+
+/// Convert an `EpisodeAnalysis` into the `ExtractionOutput` used by
+/// downstream pipeline stages.
+impl From<&EpisodeAnalysis> for ExtractionOutput {
+    fn from(a: &EpisodeAnalysis) -> Self {
+        Self {
+            task_refs: a.task_refs.clone(),
+            decision_refs: a.decision_refs.clone(),
+            entities: a
+                .entities
+                .iter()
+                .map(|e| ExtractedEntity {
+                    kind: e.kind.clone(),
+                    name: e.name.clone(),
                 })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let relations: Vec<ExtractedRelation> = parsed
-        .get("relations")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
+                .collect(),
+            relations: a
+                .relations
+                .iter()
                 .filter_map(|r| {
-                    let rt_str = r.get("relation_type")?.as_str()?;
-                    let relation_type = match rt_str {
+                    let relation_type = match r.relation_type.as_str() {
                         "TaskDecision" => RelationType::TaskDecision,
                         "TaskEntity" => RelationType::TaskEntity,
                         "DecisionEntity" => RelationType::DecisionEntity,
@@ -118,71 +146,22 @@ fn parse_extraction_response(
                     };
                     Some(ExtractedRelation {
                         relation_type,
-                        from: r.get("from")?.as_str()?.to_string(),
-                        to: r.get("to")?.as_str()?.to_string(),
+                        from: r.from.clone(),
+                        to: r.to.clone(),
                     })
                 })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let task_refs: Vec<String> = parsed
-        .get("task_refs")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let decision_refs: Vec<String> = parsed
-        .get("decision_refs")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let decisions: Vec<ExtractedDecision> = parsed
-        .get("decisions")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|d| {
-                    Some(ExtractedDecision {
-                        statement: d.get("statement")?.as_str()?.to_string(),
-                        rationale: d.get("rationale")?.as_str()?.to_string(),
-                        confidence: d
-                            .get("confidence")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("low")
-                            .to_string(),
-                    })
+                .collect(),
+            decisions: a
+                .decisions
+                .iter()
+                .map(|d| ExtractedDecision {
+                    statement: d.statement.clone(),
+                    rationale: d.rationale.clone(),
+                    confidence: d.confidence.clone(),
                 })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    Ok(ExtractionOutput {
-        task_refs,
-        decision_refs,
-        entities,
-        relations,
-        decisions,
-    })
-}
-
-fn extract_json_from_response(response: &str) -> &str {
-    // Try to find JSON object in the response
-    if let Some(start) = response.find('{') {
-        if let Some(end) = response.rfind('}') {
-            return &response[start..=end];
+                .collect(),
         }
     }
-    response
 }
 
 #[cfg(test)]
@@ -190,61 +169,76 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_valid_extraction() {
-        let json = r#"{
-            "entities": [
-                {"kind": "component", "name": "redb"},
-                {"kind": "constraint", "name": "offline-first"}
-            ],
-            "relations": [
-                {"relation_type": "DecisionEntity", "from": "dec-1", "to": "redb"}
-            ],
-            "task_refs": [],
-            "decision_refs": ["dec-1"]
-        }"#;
+    fn test_analysis_to_extraction_output() {
+        let analysis = EpisodeAnalysis {
+            summary: "The developer fixed a bug.".into(),
+            decisions: vec![AnalysisDecision {
+                statement: "Use redb for storage".into(),
+                rationale: "ACID compliance".into(),
+                confidence: "high".into(),
+            }],
+            entities: vec![AnalysisEntity {
+                kind: "component".into(),
+                name: "redb".into(),
+            }],
+            relations: vec![AnalysisRelation {
+                relation_type: "DecisionEntity".into(),
+                from: "Use redb for storage".into(),
+                to: "redb".into(),
+            }],
+            task_refs: vec![],
+            decision_refs: vec![],
+        };
 
-        let result = parse_extraction_response(json).unwrap();
-        assert_eq!(result.entities.len(), 2);
-        assert_eq!(result.relations.len(), 1);
-        assert_eq!(result.decision_refs, vec!["dec-1"]);
+        let output = ExtractionOutput::from(&analysis);
+        assert_eq!(output.decisions.len(), 1);
+        assert_eq!(output.entities.len(), 1);
+        assert_eq!(output.relations.len(), 1);
+        assert_eq!(output.decisions[0].statement, "Use redb for storage");
     }
 
     #[test]
-    fn test_parse_empty_extraction_is_valid() {
-        let json = r#"{
-            "entities": [],
-            "relations": [],
-            "task_refs": [],
-            "decision_refs": []
-        }"#;
+    fn test_unknown_relation_type_filtered() {
+        let analysis = EpisodeAnalysis {
+            summary: String::new(),
+            decisions: vec![],
+            entities: vec![],
+            relations: vec![AnalysisRelation {
+                relation_type: "Unknown".into(),
+                from: "a".into(),
+                to: "b".into(),
+            }],
+            task_refs: vec![],
+            decision_refs: vec![],
+        };
 
-        let result = parse_extraction_response(json).unwrap();
-        // Empty extraction is valid — no fake entities injected
-        assert!(result.entities.is_empty());
+        let output = ExtractionOutput::from(&analysis);
+        assert!(output.relations.is_empty());
     }
 
     #[test]
-    fn test_parse_with_markdown_fences() {
-        let response = "Here's the extraction:\n```json\n{\"entities\": [{\"kind\": \"component\", \"name\": \"grafeo\"}], \"relations\": [], \"task_refs\": [], \"decision_refs\": []}\n```";
+    fn test_empty_analysis() {
+        let analysis = EpisodeAnalysis {
+            summary: "No significant changes.".into(),
+            decisions: vec![],
+            entities: vec![],
+            relations: vec![],
+            task_refs: vec![],
+            decision_refs: vec![],
+        };
 
-        let result = parse_extraction_response(response).unwrap();
-        assert_eq!(result.entities[0].name, "grafeo");
+        let output = ExtractionOutput::from(&analysis);
+        assert!(output.decisions.is_empty());
+        assert!(output.entities.is_empty());
+        assert!(output.relations.is_empty());
     }
 
     #[tokio::test]
-    async fn test_rig_extractor_requires_api_key() {
+    async fn test_analyze_requires_api_key() {
         if std::env::var("ANTHROPIC_API_KEY").is_err()
             && std::env::var("OPENAI_API_KEY").is_err()
         {
-            let extractor = RigExtractor;
-            let input = ExtractionInput {
-                summary_text: "test".into(),
-                decisions_json: b"[]".to_vec(),
-                tool_outcomes_json: b"[]".to_vec(),
-                conversation_spans_json: b"[]".to_vec(),
-                repo_path: "/test".into(),
-            };
-            let result = extractor.extract(input).await;
+            let result = analyze("test").await;
             assert!(matches!(
                 result,
                 Err(ExtractionError::ModelUnavailable(_))
@@ -252,123 +246,121 @@ mod tests {
         }
     }
 
-    // ── Decision extraction parsing ─────────────────────────
-
     #[test]
-    fn test_parse_with_decisions() {
-        let json = r#"{
-            "entities": [{"kind": "component", "name": "redb"}],
-            "relations": [],
-            "task_refs": [],
-            "decision_refs": [],
-            "decisions": [
-                {
-                    "statement": "Use redb for storage",
-                    "rationale": "Embedded, ACID, Rust-native",
-                    "confidence": "high"
-                }
-            ]
-        }"#;
-
-        let result = parse_extraction_response(json).unwrap();
-        assert_eq!(result.decisions.len(), 1);
-        assert_eq!(result.decisions[0].statement, "Use redb for storage");
-        assert_eq!(result.decisions[0].confidence, "high");
-    }
-
-    #[test]
-    fn test_parse_without_decisions_defaults_empty() {
-        let json = r#"{
-            "entities": [{"kind": "component", "name": "grafeo"}],
-            "relations": [],
-            "task_refs": [],
-            "decision_refs": []
-        }"#;
-
-        let result = parse_extraction_response(json).unwrap();
-        assert!(result.decisions.is_empty());
-    }
-
-    #[test]
-    fn test_parse_decisions_missing_fields_skipped() {
-        let json = r#"{
-            "entities": [],
-            "relations": [],
-            "task_refs": [],
-            "decision_refs": [],
-            "decisions": [
-                {"statement": "valid", "rationale": "reason", "confidence": "high"},
-                {"statement": "no rationale"},
-                {"rationale": "no statement"}
-            ]
-        }"#;
-
-        let result = parse_extraction_response(json).unwrap();
-        // Only the first decision has both required fields
-        assert_eq!(result.decisions.len(), 1);
-        assert_eq!(result.decisions[0].statement, "valid");
+    fn test_episode_analysis_json_schema() {
+        // Verify the schema generates without panic
+        let schema = schemars::schema_for!(EpisodeAnalysis);
+        let json = serde_json::to_string_pretty(&schema).unwrap();
+        assert!(json.contains("summary"));
+        assert!(json.contains("decisions"));
+        assert!(json.contains("entities"));
     }
 
     use hegel::{TestCase, generators as gs};
 
-    /// `ExtractedDecision` serde round-trip.
     #[hegel::test(test_cases = 200)]
-    fn prop_extracted_decision_roundtrip(tc: TestCase) {
-        let dec = ExtractedDecision {
-            statement: tc.draw(gs::text().min_size(1).max_size(100)),
-            rationale: tc.draw(gs::text().min_size(1).max_size(100)),
-            confidence: tc.draw(gs::sampled_from(vec![
-                "high".to_string(),
-                "medium".to_string(),
-                "low".to_string(),
-            ])),
+    fn prop_analysis_serde_roundtrip(tc: TestCase) {
+        let n_decisions: usize =
+            tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
+        let n_entities: usize =
+            tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
+
+        let decisions: Vec<AnalysisDecision> = (0..n_decisions)
+            .map(|_| AnalysisDecision {
+                statement: tc.draw(
+                    gs::text()
+                        .min_size(1)
+                        .max_size(50)
+                        .alphabet("abcdefghijklmnopqrstuvwxyz "),
+                ),
+                rationale: tc.draw(
+                    gs::text()
+                        .min_size(1)
+                        .max_size(50)
+                        .alphabet("abcdefghijklmnopqrstuvwxyz "),
+                ),
+                confidence: tc.draw(gs::sampled_from(vec![
+                    "high".to_string(),
+                    "medium".to_string(),
+                    "low".to_string(),
+                ])),
+            })
+            .collect();
+
+        let entities: Vec<AnalysisEntity> = (0..n_entities)
+            .map(|_| AnalysisEntity {
+                kind: tc.draw(gs::sampled_from(vec![
+                    "component".to_string(),
+                    "concept".to_string(),
+                    "constraint".to_string(),
+                ])),
+                name: tc.draw(
+                    gs::text()
+                        .min_size(1)
+                        .max_size(30)
+                        .alphabet("abcdefghijklmnopqrstuvwxyz"),
+                ),
+            })
+            .collect();
+
+        let analysis = EpisodeAnalysis {
+            summary: tc.draw(
+                gs::text()
+                    .min_size(1)
+                    .max_size(200)
+                    .alphabet("abcdefghijklmnopqrstuvwxyz ."),
+            ),
+            decisions,
+            entities,
+            relations: vec![],
+            task_refs: vec![],
+            decision_refs: vec![],
         };
-        let json = serde_json::to_string(&dec).unwrap();
-        let parsed: ExtractedDecision = serde_json::from_str(&json).unwrap();
-        assert_eq!(dec, parsed);
+
+        let json = serde_json::to_string(&analysis).unwrap();
+        let parsed: EpisodeAnalysis = serde_json::from_str(&json).unwrap();
+        assert_eq!(analysis.summary, parsed.summary);
+        assert_eq!(analysis.decisions.len(), parsed.decisions.len());
+        assert_eq!(analysis.entities.len(), parsed.entities.len());
     }
 
-    /// `parse_extraction_response` with decisions round-trips
-    /// the decision count.
-    #[hegel::test(test_cases = 100)]
-    fn prop_parse_preserves_decision_count(tc: TestCase) {
+    #[hegel::test(test_cases = 200)]
+    fn prop_conversion_preserves_decision_count(tc: TestCase) {
         let n: usize =
             tc.draw(gs::integers::<usize>().min_value(0).max_value(5));
-        let mut decisions = Vec::new();
-        for _ in 0..n {
-            let stmt: String = tc.draw(
-                gs::text()
-                    .min_size(1)
-                    .max_size(50)
-                    .alphabet("abcdefghijklmnopqrstuvwxyz "),
-            );
-            let rationale: String = tc.draw(
-                gs::text()
-                    .min_size(1)
-                    .max_size(50)
-                    .alphabet("abcdefghijklmnopqrstuvwxyz "),
-            );
-            let conf: String = tc.draw(gs::sampled_from(vec![
-                "high".to_string(),
-                "medium".to_string(),
-                "low".to_string(),
-            ]));
-            decisions.push(serde_json::json!({
-                "statement": stmt,
-                "rationale": rationale,
-                "confidence": conf,
-            }));
-        }
 
-        let json = serde_json::json!({
-            "entities": [{"kind": "repo", "name": "test"}],
-            "relations": [],
-            "task_refs": [],
-            "decision_refs": [],
-            "decisions": decisions,
-        });
+        let decisions: Vec<AnalysisDecision> = (0..n)
+            .map(|_| AnalysisDecision {
+                statement: tc.draw(
+                    gs::text()
+                        .min_size(1)
+                        .max_size(50)
+                        .alphabet("abcdefghijklmnopqrstuvwxyz "),
+                ),
+                rationale: tc.draw(
+                    gs::text()
+                        .min_size(1)
+                        .max_size(50)
+                        .alphabet("abcdefghijklmnopqrstuvwxyz "),
+                ),
+                confidence: tc.draw(gs::sampled_from(vec![
+                    "high".to_string(),
+                    "medium".to_string(),
+                    "low".to_string(),
+                ])),
+            })
+            .collect();
 
-        let result = parse_extraction_response(&json.to_string()).unwrap();
-        assert_eq!(result.decisions.len(), n);
+        let analysis = EpisodeAnalysis {
+            summary: "test".into(),
+            decisions,
+            entities: vec![],
+            relations: vec![],
+            task_refs: vec![],
+            decision_refs: vec![],
+        };
+
+        let output = ExtractionOutput::from(&analysis);
+        assert_eq!(output.decisions.len(), n);
     }
 }
