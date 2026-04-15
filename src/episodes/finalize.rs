@@ -229,34 +229,22 @@ pub async fn finalize_episode_at(
     );
     let policy = crate::embeddings::proxy::policy_for("summary");
 
-    let proxy_vector = match crate::embeddings::encoder::load_model() {
-        Ok(mut model) => {
-            match crate::embeddings::encoder::encode_text(
-                &mut model,
-                summary_text,
-                artifact_id,
-                policy,
-            ) {
-                Ok(art) => {
-                    let pv = crate::embeddings::proxy::bytes_to_vector(
-                        &art.pooled_vector_bytes,
-                    );
-                    let _ = crud::put_embedding_artifact(db, &art);
-                    pv
-                }
-                Err(e) => {
-                    tracing::error!(
-                        error = %e,
-                        "ColBERT encoding failed — run `lobster install`"
-                    );
-                    vec![]
-                }
-            }
+    let proxy_vector = match crate::embeddings::encoder::encode_text(
+        summary_text,
+        artifact_id,
+        policy,
+    ) {
+        Ok(art) => {
+            let pv = crate::embeddings::proxy::bytes_to_vector(
+                &art.pooled_vector_bytes,
+            );
+            let _ = crud::put_embedding_artifact(db, &art);
+            pv
         }
         Err(e) => {
             tracing::error!(
                 error = %e,
-                "ColBERT model not available — run `lobster install`"
+                "ColBERT encoding failed — run `lobster install`"
             );
             vec![]
         }

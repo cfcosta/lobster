@@ -30,10 +30,7 @@ pub fn rerank_score(
         return 0.0;
     }
 
-    let Ok(mut model) = encoder::load_model() else {
-        return 0.0;
-    };
-    let Ok(query_proxy) = encoder::encode_query(&mut model, query_text) else {
+    let Ok(query_proxy) = encoder::encode_query(query_text) else {
         return 0.0;
     };
 
@@ -59,30 +56,30 @@ mod tests {
 
     #[test]
     fn test_rerank_with_colbert() {
-        let mut model = match encoder::load_model() {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("skipping test_rerank_with_colbert: {e}");
-                return;
-            }
-        };
+        if !encoder::model_available() {
+            eprintln!("skipping test_rerank_with_colbert: model not installed");
+            return;
+        }
 
         let (database, _dir) = db::open_in_memory().unwrap();
 
         // Encode a real document and store its proxy
-        let texts = vec!["Use redb for ACID storage".to_string()];
-        let emb = model.encode(&texts, false).unwrap();
-        let shape = emb.shape();
-        let n_dims = *shape.dims().last().unwrap();
-        let flat: Vec<f32> = emb
-            .flatten(0, shape.dims().len() - 2)
-            .unwrap()
-            .to_vec2::<f32>()
-            .unwrap()
-            .into_iter()
-            .flatten()
-            .collect();
-        let doc_proxy = proxy::mean_pool(&flat, n_dims);
+        let doc_proxy = encoder::with_model(|model| {
+            let texts = vec!["Use redb for ACID storage".to_string()];
+            let emb = model
+                .encode(&texts, false)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let shape = emb.shape();
+            let n_dims = *shape.dims().last().unwrap();
+            let flat: Vec<f32> = emb
+                .flatten(0, shape.dims().len() - 2)?
+                .to_vec2::<f32>()?
+                .into_iter()
+                .flatten()
+                .collect();
+            Ok(proxy::mean_pool(&flat, n_dims))
+        })
+        .unwrap();
 
         let id = ArtifactId::derive(b"real-test");
         let art = EmbeddingArtifact {

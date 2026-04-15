@@ -441,7 +441,7 @@ mod tests {
     // Skipped if model is not installed.
     #[test]
     fn test_maxsim_supersession() {
-        if crate::embeddings::encoder::load_model().is_err() {
+        if !crate::embeddings::encoder::model_available() {
             eprintln!("skipping test_maxsim_supersession: model not installed");
             return;
         }

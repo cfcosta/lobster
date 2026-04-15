@@ -282,18 +282,14 @@ fn search_hybrid(
     query: &str,
     candidates: &mut Vec<ScoredCandidate>,
 ) {
-    let mut model = match crate::embeddings::encoder::load_model() {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::error!(
-                error = %e,
-                "ColBERT model not available — run `lobster install`"
-            );
-            return;
-        }
-    };
-    let query_vector =
-        crate::embeddings::encoder::encode_query(&mut model, query);
+    let query_vector = crate::embeddings::encoder::encode_query(query);
+    if let Err(e) = &query_vector {
+        tracing::error!(
+            error = %e,
+            "ColBERT model not available — run `lobster install`"
+        );
+        return;
+    }
     let qv_ref = query_vector.as_ref().ok().map(Vec::as_slice);
 
     // Hybrid search (BM25 + vector RRF) on episode summaries

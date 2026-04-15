@@ -4,8 +4,6 @@
 //! pairwise `MaxSim` similarity matrix. Used by the decision
 //! supersession worker to detect semantically related decisions.
 
-use pylate_rs::ColBERT;
-
 /// A pairwise similarity matrix from `MaxSim`.
 ///
 /// `scores[i][j]` is the `MaxSim` similarity between text `i` (as
@@ -77,40 +75,42 @@ impl std::error::Error for MaxSimError {}
 
 /// Compute pairwise `MaxSim` similarity for a batch of texts.
 ///
-/// Encodes all texts as both queries and documents using `ColBERT`,
-/// then computes the full N×N similarity matrix using late
-/// interaction (token-level max-similarity summed over query tokens).
+/// Uses the lazy-loaded model singleton internally.
 ///
 /// # Errors
 ///
 /// Returns an error if encoding or similarity computation fails.
 pub fn pairwise_maxsim(
-    model: &mut ColBERT,
     texts: &[String],
 ) -> Result<PairwiseSimilarity, MaxSimError> {
     if texts.len() < 2 {
         return Err(MaxSimError::TooFewTexts);
     }
 
-    // Encode as queries (for the query side of MaxSim)
-    let query_embeddings = model
-        .encode(texts, true)
-        .map_err(|e| MaxSimError::ComputationFailed(e.to_string()))?;
+    crate::embeddings::encoder::with_model(|model| {
+        // Encode as queries (for the query side of MaxSim)
+        let query_embeddings = model.encode(texts, true).map_err(|e| {
+            anyhow::anyhow!(MaxSimError::ComputationFailed(e.to_string()))
+        })?;
 
-    // Encode as documents (for the document side of MaxSim)
-    let doc_embeddings = model
-        .encode(texts, false)
-        .map_err(|e| MaxSimError::ComputationFailed(e.to_string()))?;
+        // Encode as documents (for the document side of MaxSim)
+        let doc_embeddings = model.encode(texts, false).map_err(|e| {
+            anyhow::anyhow!(MaxSimError::ComputationFailed(e.to_string()))
+        })?;
 
-    // Compute the similarity matrix: queries × documents
-    let similarities = model
-        .similarity(&query_embeddings, &doc_embeddings)
-        .map_err(|e| MaxSimError::ComputationFailed(e.to_string()))?;
+        // Compute the similarity matrix: queries × documents
+        let similarities = model
+            .similarity(&query_embeddings, &doc_embeddings)
+            .map_err(|e| {
+                anyhow::anyhow!(MaxSimError::ComputationFailed(e.to_string()))
+            })?;
 
-    Ok(PairwiseSimilarity {
-        n: texts.len(),
-        scores: similarities.data,
+        Ok(PairwiseSimilarity {
+            n: texts.len(),
+            scores: similarities.data,
+        })
     })
+    .map_err(|e| MaxSimError::ModelUnavailable(e.to_string()))
 }
 
 /// Try to compute pairwise `MaxSim`, returning None if the model is
@@ -121,8 +121,7 @@ pub fn try_pairwise_maxsim(texts: &[String]) -> Option<PairwiseSimilarity> {
         return None;
     }
 
-    let mut model = crate::embeddings::encoder::load_model().ok()?;
-    pairwise_maxsim(&mut model, texts).ok()
+    pairwise_maxsim(texts).ok()
 }
 
 #[cfg(test)]
@@ -235,13 +234,12 @@ mod tests {
     // -- Unit: PairwiseSimilarity with model (skipped if model absent) --
     #[test]
     fn test_pairwise_maxsim_with_model() {
-        let mut model = match crate::embeddings::encoder::load_model() {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("skipping test_pairwise_maxsim_with_model: {e}");
-                return;
-            }
-        };
+        if !crate::embeddings::encoder::model_available() {
+            eprintln!(
+                "skipping test_pairwise_maxsim_with_model: model not installed"
+            );
+            return;
+        }
 
         let texts = vec![
             "Use redb for storage because it is ACID compliant".into(),
@@ -249,7 +247,7 @@ mod tests {
             "Deploy to production on Fridays for maximum excitement".into(),
         ];
 
-        let result = pairwise_maxsim(&mut model, &texts);
+        let result = pairwise_maxsim(&texts);
         match result {
             Ok(sim) => {
                 assert_eq!(sim.n, 3);

@@ -1,8 +1,10 @@
 //! `ColBERT` model loading and encoding via pylate-rs.
 //!
-//! Loads the model once, encodes text as document embeddings,
-//! applies `hierarchical_pooling` per the artifact-specific policy,
-//! and produces proxy vectors via mean-pooling.
+//! The model is loaded lazily on first use and cached for the
+//! lifetime of the process. All access goes through [`with_model`],
+//! which holds a `Mutex` guard for the duration of the callback.
+
+use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 use candle_core::Device;
@@ -13,29 +15,58 @@ use crate::{
     store::schema::{EmbeddingArtifact, EmbeddingBackend},
 };
 
-/// Load the GTE-ModernColBERT-v1 model on CPU.
+/// Process-wide lazy singleton for the ColBERT model.
 ///
-/// # Errors
+/// `Option::None` means not yet attempted. `Some(model)` means
+/// successfully loaded. If loading fails, we leave it as `None` so
+/// a later call can retry (e.g. after `lobster install`).
+static MODEL: Mutex<Option<ColBERT>> = Mutex::new(None);
+
+/// Run `f` with exclusive access to the lazily-loaded ColBERT model.
 ///
-/// Returns an error if the model files aren't cached locally.
-/// Run `lobster install` first.
-pub fn load_model() -> Result<ColBERT> {
-    let model: ColBERT = ColBERT::from("lightonai/GTE-ModernColBERT-v1")
-        .with_device(Device::Cpu)
-        .try_into()
-        .context(
-            "failed to load ColBERT model — run `lobster install` first",
-        )?;
-    Ok(model)
+/// The model is initialized on the first call and reused for every
+/// subsequent call. Returns an error if the model files aren't
+/// cached locally (`lobster install` not run).
+pub fn with_model<T>(f: impl FnOnce(&mut ColBERT) -> Result<T>) -> Result<T> {
+    let mut guard = MODEL.lock().expect("ColBERT mutex poisoned");
+
+    if guard.is_none() {
+        let model: ColBERT = ColBERT::from("lightonai/GTE-ModernColBERT-v1")
+            .with_device(Device::Cpu)
+            .try_into()
+            .context(
+                "failed to load ColBERT model — run `lobster install` first",
+            )?;
+        *guard = Some(model);
+    }
+
+    f(guard.as_mut().expect("just initialized"))
+}
+
+/// Returns `true` if the model can be loaded (files are cached).
+///
+/// Intended for tests that need to skip when the model is absent.
+pub fn model_available() -> bool {
+    with_model(|_| Ok(())).is_ok()
 }
 
 /// Encode a text string into a document embedding and produce
 /// both pooled proxy vector and optional late-interaction bytes.
 ///
+/// Uses the lazy-loaded model singleton internally.
+///
 /// # Errors
 ///
-/// Returns an error if encoding fails.
+/// Returns an error if the model is unavailable or encoding fails.
 pub fn encode_text(
+    text: &str,
+    artifact_id: crate::store::ids::ArtifactId,
+    policy: PoolingPolicy,
+) -> Result<EmbeddingArtifact> {
+    with_model(|model| encode_text_inner(model, text, artifact_id, policy))
+}
+
+fn encode_text_inner(
     model: &mut ColBERT,
     text: &str,
     artifact_id: crate::store::ids::ArtifactId,
@@ -95,14 +126,16 @@ pub fn encode_text(
 /// # Errors
 ///
 /// Returns an error if the model is not installed or encoding fails.
-pub fn encode_query(model: &mut ColBERT, query: &str) -> Result<Vec<f32>> {
-    let texts = vec![query.to_string()];
-    let embeddings = model
-        .encode(&texts, true)
-        .context("ColBERT query encode failed")?;
+pub fn encode_query(query: &str) -> Result<Vec<f32>> {
+    with_model(|model| {
+        let texts = vec![query.to_string()];
+        let embeddings = model
+            .encode(&texts, true)
+            .context("ColBERT query encode failed")?;
 
-    let proxy = mean_pool_tensor(&embeddings)?;
-    Ok(crate::embeddings::proxy::bytes_to_vector(&proxy))
+        let proxy = mean_pool_tensor(&embeddings)?;
+        Ok(crate::embeddings::proxy::bytes_to_vector(&proxy))
+    })
 }
 
 /// Mean-pool a candle Tensor [1, tokens, dims] into a proxy vector.
@@ -145,17 +178,13 @@ mod tests {
     // where it may not be available.
     #[test]
     fn test_load_and_encode() {
-        let mut model = match load_model() {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("skipping test_load_and_encode: {e}");
-                return;
-            }
-        };
+        if !model_available() {
+            eprintln!("skipping test_load_and_encode: model not installed");
+            return;
+        }
 
         let artifact_id = crate::store::ids::ArtifactId::derive(b"test");
         let result = encode_text(
-            &mut model,
             "I chose redb for storage",
             artifact_id,
             PoolingPolicy::Full,
@@ -182,17 +211,13 @@ mod tests {
 
     #[test]
     fn test_encode_with_light_pooling() {
-        let mut model = match load_model() {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("skipping: {e}");
-                return;
-            }
-        };
+        if !model_available() {
+            eprintln!("skipping: model not installed");
+            return;
+        }
 
         let artifact_id = crate::store::ids::ArtifactId::derive(b"test2");
         let result = encode_text(
-            &mut model,
             "Episode summary about testing",
             artifact_id,
             PoolingPolicy::Light,
@@ -208,17 +233,13 @@ mod tests {
 
     #[test]
     fn test_encode_proxy_only() {
-        let mut model = match load_model() {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("skipping: {e}");
-                return;
-            }
-        };
+        if !model_available() {
+            eprintln!("skipping: model not installed");
+            return;
+        }
 
         let artifact_id = crate::store::ids::ArtifactId::derive(b"test3");
         let result = encode_text(
-            &mut model,
             "Old episode summary",
             artifact_id,
             PoolingPolicy::ProxyOnly,
