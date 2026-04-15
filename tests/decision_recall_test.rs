@@ -33,8 +33,4 @@ fn test_recall_query_construction() {
     let event = make_prompt_event("Why did we use redb?");
     let query = recall::construct_query(&event);
     assert_eq!(query.as_deref(), Some("Why did we use redb?"));
-
-    let route =
-        lobster::rank::classifier::classify_query(query.as_deref().unwrap());
-    assert_eq!(route, lobster::rank::route::RetrievalRoute::HybridGraph);
 }

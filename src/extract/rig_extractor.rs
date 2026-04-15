@@ -56,6 +56,15 @@ pub struct EpisodeAnalysis {
     /// Decision statement strings referenced in the session.
     #[serde(default)]
     pub decision_refs: Vec<String>,
+
+    /// Repository conventions detected from the session: build tools,
+    /// test frameworks, VCS, languages, etc. Each string is a short
+    /// factual statement like "Rust project using Cargo" or "uses
+    /// jujutsu (jj) for version control". Only include conventions
+    /// that are clearly evidenced by the session events. Empty array
+    /// if none detected.
+    #[serde(default)]
+    pub conventions: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -105,7 +114,17 @@ Extraction rules:\n\
 - Only extract entities that belong to or are directly relevant to the repository.\n\
   Do NOT extract entities from other projects, test fixtures, or example code.\n\
 - Prefer fewer, higher-quality items over exhaustive extraction.\n\
-- If nothing meaningful was decided, return an empty decisions array.";
+- If nothing meaningful was decided, return an empty decisions array.\n\
+\n\
+Convention detection rules:\n\
+- Detect repository conventions from the session events: build tools, test\n\
+  frameworks, VCS, languages, CI systems, linters, formatters, etc.\n\
+- Each convention should be a short factual statement (e.g., \"Rust project\n\
+  using Cargo\", \"uses nix flakes for builds\", \"uses jujutsu for version\n\
+  control\", \"uses hegel property-based testing\").\n\
+- Only include conventions clearly evidenced in the events (file paths,\n\
+  commands, tool usage). Do not guess or infer from entity names alone.\n\
+- Conventions should be stable facts about the repository, not session-specific.";
 
 /// Analyze an episode in a single LLM call: summarize + extract.
 ///
@@ -160,6 +179,7 @@ impl From<&EpisodeAnalysis> for ExtractionOutput {
                     confidence: d.confidence.clone(),
                 })
                 .collect(),
+            conventions: a.conventions.clone(),
         }
     }
 }
@@ -188,6 +208,7 @@ mod tests {
             }],
             task_refs: vec![],
             decision_refs: vec![],
+            conventions: vec!["Rust project using Cargo".into()],
         };
 
         let output = ExtractionOutput::from(&analysis);
@@ -195,6 +216,7 @@ mod tests {
         assert_eq!(output.entities.len(), 1);
         assert_eq!(output.relations.len(), 1);
         assert_eq!(output.decisions[0].statement, "Use redb for storage");
+        assert_eq!(analysis.conventions, vec!["Rust project using Cargo"]);
     }
 
     #[test]
@@ -210,6 +232,7 @@ mod tests {
             }],
             task_refs: vec![],
             decision_refs: vec![],
+            conventions: vec![],
         };
 
         let output = ExtractionOutput::from(&analysis);
@@ -225,6 +248,7 @@ mod tests {
             relations: vec![],
             task_refs: vec![],
             decision_refs: vec![],
+            conventions: vec![],
         };
 
         let output = ExtractionOutput::from(&analysis);
@@ -254,6 +278,7 @@ mod tests {
         assert!(json.contains("summary"));
         assert!(json.contains("decisions"));
         assert!(json.contains("entities"));
+        assert!(json.contains("conventions"));
     }
 
     use hegel::{TestCase, generators as gs};
@@ -315,6 +340,7 @@ mod tests {
             relations: vec![],
             task_refs: vec![],
             decision_refs: vec![],
+            conventions: vec![],
         };
 
         let json = serde_json::to_string(&analysis).unwrap();
@@ -358,6 +384,7 @@ mod tests {
             relations: vec![],
             task_refs: vec![],
             decision_refs: vec![],
+            conventions: vec![],
         };
 
         let output = ExtractionOutput::from(&analysis);

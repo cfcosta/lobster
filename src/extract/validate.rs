@@ -115,6 +115,7 @@ mod tests {
                 to: "decision:9d2".into(),
             }],
             decisions: vec![],
+            conventions: vec![],
         }
     }
 
@@ -167,6 +168,7 @@ mod tests {
             entities: vec![],
             relations: vec![],
             decisions: vec![],
+            conventions: vec![],
         };
         // Empty extraction is valid — not every episode produces facts
         assert!(validate(&output).is_ok());

@@ -50,6 +50,9 @@ pub struct ExtractionOutput {
     pub relations: Vec<ExtractedRelation>,
     #[serde(default)]
     pub decisions: Vec<ExtractedDecision>,
+    /// Repository conventions detected from the episode.
+    #[serde(default)]
+    pub conventions: Vec<String>,
 }
 
 /// Error from the extraction pipeline.
@@ -123,6 +126,7 @@ mod tests {
             entities,
             relations,
             decisions: vec![],
+            conventions: vec![],
         };
         let json = serde_json::to_string(&output).unwrap();
         let parsed: ExtractionOutput = serde_json::from_str(&json).unwrap();
