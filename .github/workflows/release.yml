@@ -1,0 +1,235 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_type:
+        description: Release type
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    name: Bump version
+    runs-on: ubuntu-latest
+    outputs:
+      old_version: ${{ steps.version.outputs.old_version }}
+      new_version: ${{ steps.version.outputs.new_version }}
+      tag: ${{ steps.version.outputs.tag }}
+      commit_sha: ${{ steps.push.outputs.commit_sha }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.ref }}
+
+      - name: Bump crate versions
+        id: version
+        shell: bash
+        run: |
+          python <<'PY'
+          import os
+          import pathlib
+          import re
+          import tomllib
+
+          release_type = "${{ github.event.inputs.release_type }}"
+
+          # All crate Cargo.toml files in the workspace.
+          crate_tomls = [
+              pathlib.Path("crates/docbert/Cargo.toml"),
+              pathlib.Path("crates/docbert-core/Cargo.toml"),
+          ]
+
+          cargo_lock_path = pathlib.Path("Cargo.lock")
+
+          # Read the current version from the first crate's Cargo.toml.
+          root_toml = crate_tomls[0].read_text(encoding="utf-8")
+          root_manifest = tomllib.loads(root_toml)
+          old_version = root_manifest["package"]["version"]
+
+          match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", old_version)
+          if not match:
+              raise SystemExit(f"Unsupported version format: {old_version}")
+
+          major, minor, patch = map(int, match.groups())
+          if release_type == "major":
+              major, minor, patch = major + 1, 0, 0
+          elif release_type == "minor":
+              minor, patch = minor + 1, 0
+          elif release_type == "patch":
+              patch += 1
+          else:
+              raise SystemExit(f"Unsupported release type: {release_type}")
+
+          new_version = f"{major}.{minor}.{patch}"
+
+          # Update version in each crate's Cargo.toml.
+          for toml_path in crate_tomls:
+              text = toml_path.read_text(encoding="utf-8")
+              text, n = re.subn(
+                  r'(?m)^version = "' + re.escape(old_version) + r'"$',
+                  f'version = "{new_version}"',
+                  text,
+                  count=1,
+              )
+              if n != 1:
+                  raise SystemExit(f"Could not update version in {toml_path}")
+              toml_path.write_text(text, encoding="utf-8")
+
+          # Update all workspace package versions in Cargo.lock.
+          package_names = ["docbert", "docbert-core"]
+          cargo_lock = cargo_lock_path.read_text(encoding="utf-8")
+          for name in package_names:
+              cargo_lock, n = re.subn(
+                  r'(\[\[package\]\]\nname = "'
+                  + re.escape(name)
+                  + r'"\nversion = ")'
+                  + re.escape(old_version)
+                  + r'(")',
+                  r'\g<1>' + new_version + r'\g<2>',
+                  cargo_lock,
+                  count=1,
+              )
+              if n != 1:
+                  raise SystemExit(f"Could not update {name} version in Cargo.lock")
+          cargo_lock_path.write_text(cargo_lock, encoding="utf-8")
+
+          github_output = pathlib.Path(os.environ["GITHUB_OUTPUT"])
+          with github_output.open("a", encoding="utf-8") as fh:
+              fh.write(f"old_version={old_version}\n")
+              fh.write(f"new_version={new_version}\n")
+              fh.write(f"tag=v{new_version}\n")
+          PY
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Create release commit
+        run: |
+          git add Cargo.lock crates/docbert/Cargo.toml crates/docbert-core/Cargo.toml
+          git commit -m "release: v${{ steps.version.outputs.new_version }}"
+
+      - name: Push release commit
+        id: push
+        run: |
+          git push origin HEAD:${{ github.ref_name }}
+          echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: bump
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            features: ""
+            artifact: docbert-x86_64-unknown-linux-musl
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            features: ""
+            artifact: docbert-aarch64-unknown-linux-musl
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            features: metal
+            artifact: docbert-aarch64-apple-darwin
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.bump.outputs.commit_sha }}
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Add musl target
+        if: contains(matrix.target, 'musl')
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Build UI
+        run: |
+          bun install --frozen-lockfile
+          bun run build
+        working-directory: crates/docbert/ui
+
+      - name: Build binary
+        run: |
+          FEATURES="${{ matrix.features }}"
+          if [ -n "$FEATURES" ]; then
+            cargo build --release --target ${{ matrix.target }} --features "$FEATURES"
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+
+      - name: Package binary
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/docbert dist/docbert
+          cd dist
+          tar czf ${{ matrix.artifact }}.tar.gz docbert
+          shasum -a 256 ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}.tar.gz*
+
+  release:
+    name: Create GitHub Release
+    needs: [bump, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.bump.outputs.commit_sha }}
+
+      - name: Create and push tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag "${{ needs.bump.outputs.tag }}"
+          git push origin "${{ needs.bump.outputs.tag }}"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.bump.outputs.tag }}
+          name: ${{ needs.bump.outputs.tag }}
+          generate_release_notes: true
+          files: artifacts/*
