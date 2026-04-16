@@ -135,20 +135,53 @@ pub fn rebuild_from_redb(
             {
                 let mut entity_nodes = std::collections::HashMap::new();
 
+                // Load persisted entities from redb rather than
+                // re-deriving IDs from extraction output. The
+                // entities table uses the canonical entity_id
+                // from store::canon.
+                let entity_rtxn = db.env.read_txn().ok();
                 for entity_fact in &output.entities {
-                    let Some(kind) = parse_entity_kind(&entity_fact.kind)
-                    else {
-                        continue;
-                    };
-                    let eid = EntityId::derive(entity_fact.name.as_bytes());
-                    let ent = crate::store::schema::Entity {
-                        entity_id: eid,
-                        repo_id: episode.repo_id,
-                        kind,
-                        canonical_name: entity_fact.name.clone(),
-                        first_seen_episode: None,
-                        last_seen_ts_utc_ms: None,
-                        mention_count: 0,
+                    // Try to find the entity in redb by scanning
+                    // for a matching canonical_name. Fall back to
+                    // re-deriving if not found (shouldn't happen
+                    // for well-formed data).
+                    let stored = entity_rtxn.as_ref().and_then(|rtxn| {
+                        db.entities.iter(rtxn).ok().and_then(|iter| {
+                            iter.flatten().find_map(|(_, v)| {
+                                serde_json::from_slice::<
+                                    crate::store::schema::Entity,
+                                >(v)
+                                .ok()
+                                .filter(|e| {
+                                    e.canonical_name == entity_fact.name
+                                        && e.repo_id == episode.repo_id
+                                })
+                            })
+                        })
+                    });
+
+                    let ent = match stored {
+                        Some(e) => e,
+                        None => {
+                            let Some(kind) =
+                                parse_entity_kind(&entity_fact.kind)
+                            else {
+                                continue;
+                            };
+                            // Fallback: use same canon derivation as
+                            // finalize.
+                            crate::store::schema::Entity {
+                                entity_id: EntityId::derive(
+                                    entity_fact.name.as_bytes(),
+                                ),
+                                repo_id: episode.repo_id,
+                                kind,
+                                canonical_name: entity_fact.name.clone(),
+                                first_seen_episode: None,
+                                last_seen_ts_utc_ms: None,
+                                mention_count: 0,
+                            }
+                        }
                     };
                     let en = projection::project_entity(grafeo, &ent, ep_node);
                     entity_nodes.insert(entity_fact.name.clone(), en);
@@ -181,12 +214,27 @@ pub fn rebuild_from_redb(
                                 stats.relations_projected += 1;
                             }
                         }
-                        RelationType::TaskEntity
-                        | RelationType::EntityEntity => {
-                            // These use the same edge creation; use
-                            // MENTIONED_ENTITY for task→entity and
-                            // ENTITY_ENTITY for entity→entity
-                            stats.relations_projected += 1;
+                        RelationType::TaskEntity => {
+                            if let (Some(&tn), Some(&en)) = (
+                                task_nodes.get(&rel.from),
+                                entity_nodes.get(&rel.to),
+                            ) {
+                                projection::link_task_entity(
+                                    grafeo, tn, en, ts,
+                                );
+                                stats.relations_projected += 1;
+                            }
+                        }
+                        RelationType::EntityEntity => {
+                            if let (Some(&from_en), Some(&to_en)) = (
+                                entity_nodes.get(&rel.from),
+                                entity_nodes.get(&rel.to),
+                            ) {
+                                projection::link_entity_entity(
+                                    grafeo, from_en, to_en, ts,
+                                );
+                                stats.relations_projected += 1;
+                            }
                         }
                     }
                 }
