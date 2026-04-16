@@ -123,11 +123,39 @@ async fn try_finalize(
         }
     };
 
+    // Load all raw events in the episode range so finalization
+    // sees the complete episode content, not just the trigger event.
+    let events_json = match crate::store::crud::get_raw_events_range(
+        db, start_seq, end_seq,
+    ) {
+        Ok(raw_events) => {
+            let payloads: Vec<&[u8]> = raw_events
+                .iter()
+                .map(|e| e.payload_bytes.as_slice())
+                .collect();
+            // Build a JSON array from the individual payloads
+            let mut buf = Vec::new();
+            buf.push(b'[');
+            for (i, p) in payloads.iter().enumerate() {
+                if i > 0 {
+                    buf.push(b',');
+                }
+                buf.extend_from_slice(p);
+            }
+            buf.push(b']');
+            buf
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load episode events");
+            return false;
+        }
+    };
+
     let result = crate::episodes::finalize::finalize_episode(
         db,
         grafeo,
         &repo_path,
-        &serde_json::to_vec(&[event]).unwrap_or_default(),
+        &events_json,
         start_seq,
         end_seq,
         event.user_prompt(),
