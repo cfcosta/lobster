@@ -348,9 +348,11 @@ pub async fn finalize_episode_at(
         decision_nodes.insert(dec.statement.clone(), dec_node);
     }
 
-    // Project entities and persist to redb (skip invalid kinds)
+    // Project entities and persist to redb (skip invalid kinds).
+    // Preserve existing metadata (first_seen, mention_count) for
+    // entities that have been seen before.
     for entity_fact in &extraction_output.entities {
-        let Some(ent) = make_entity(repo_path, repo_id, entity_fact) else {
+        let Some(mut ent) = make_entity(repo_path, repo_id, entity_fact) else {
             tracing::warn!(
                 kind = %entity_fact.kind,
                 name = %entity_fact.name,
@@ -358,6 +360,17 @@ pub async fn finalize_episode_at(
             );
             continue;
         };
+
+        // Merge with existing entity record if present
+        if let Ok(existing) = crud::get_entity(db, &ent.entity_id.raw()) {
+            ent.first_seen_episode = existing.first_seen_episode;
+            ent.mention_count = existing.mention_count.saturating_add(1);
+        } else {
+            ent.first_seen_episode = Some(episode_id);
+            ent.mention_count = 1;
+        }
+        ent.last_seen_ts_utc_ms = Some(now_ms);
+
         let _ = crud::put_entity(db, &ent);
         let ent_node = projection::project_entity(grafeo, &ent, ep_node);
         entity_nodes.insert(entity_fact.name.clone(), ent_node);
