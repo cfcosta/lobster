@@ -31,8 +31,10 @@ pub fn with_model<T>(f: impl FnOnce(&mut ColBERT) -> Result<T>) -> Result<T> {
     let mut guard = MODEL.lock().expect("ColBERT mutex poisoned");
 
     if guard.is_none() {
+        let device = select_device();
+        tracing::info!(?device, "loading ColBERT model");
         let model: ColBERT = ColBERT::from("lightonai/GTE-ModernColBERT-v1")
-            .with_device(Device::Cpu)
+            .with_device(device)
             .try_into()
             .context(
                 "failed to load ColBERT model — run `lobster install` first",
@@ -48,6 +50,18 @@ pub fn with_model<T>(f: impl FnOnce(&mut ColBERT) -> Result<T>) -> Result<T> {
 /// Intended for tests that need to skip when the model is absent.
 pub fn model_available() -> bool {
     with_model(|_| Ok(())).is_ok()
+}
+
+/// Select the best available device: CUDA when the feature is
+/// enabled and a GPU is present, CPU otherwise.
+pub fn select_device() -> Device {
+    #[cfg(feature = "cuda")]
+    {
+        if let Ok(device) = Device::new_cuda(0) {
+            return device;
+        }
+    }
+    Device::Cpu
 }
 
 /// Encode a text string into a document embedding and produce

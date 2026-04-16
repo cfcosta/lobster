@@ -469,16 +469,19 @@ fn cmd_init(storage_dir: &std::path::Path) -> Result<()> {
 }
 
 fn cmd_install(_storage_dir: &std::path::Path) -> Result<()> {
-    use candle_core::Device;
     use pylate_rs::ColBERT;
 
-    println!("Downloading GTE-ModernColBERT-v1 from HuggingFace...");
+    let device = lobster::embeddings::encoder::select_device();
+    let device_name = format!("{device:?}");
+    println!(
+        "Downloading GTE-ModernColBERT-v1 from HuggingFace ({device_name})..."
+    );
 
     let _model: ColBERT = ColBERT::from("lightonai/GTE-ModernColBERT-v1")
-        .with_device(Device::Cpu)
+        .with_device(device)
         .try_into()
         .context("failed to download/load ColBERT model")?;
 
-    println!("Model installed successfully (CPU backend).");
+    println!("Model installed successfully ({device_name} backend).");
     Ok(())
 }
