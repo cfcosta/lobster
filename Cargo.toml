@@ -1,6 +1,6 @@
 [package]
 name = "lobster"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2024"
 description = "A local, deterministic, per-repo memory system for Claude Code"
 license = "MIT"
