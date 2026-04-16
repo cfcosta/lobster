@@ -31,11 +31,6 @@ jobs:
           toolchain: nightly
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - uses: oven-sh/setup-bun@v2
-      - run: bun install --frozen-lockfile
-        working-directory: crates/docbert/ui
-      - run: bun run build
-        working-directory: crates/docbert/ui
       - run: cargo clippy --all --all-targets
 
   test:
@@ -51,11 +46,6 @@ jobs:
         with:
           toolchain: nightly
       - uses: Swatinem/rust-cache@v2
-      - uses: oven-sh/setup-bun@v2
-      - run: bun install --frozen-lockfile
-        working-directory: crates/docbert/ui
-      - run: bun run build
-        working-directory: crates/docbert/ui
       - run: cargo test --all
 
   build:
@@ -71,9 +61,4 @@ jobs:
         with:
           toolchain: nightly
       - uses: Swatinem/rust-cache@v2
-      - uses: oven-sh/setup-bun@v2
-      - run: bun install --frozen-lockfile
-        working-directory: crates/docbert/ui
-      - run: bun run build
-        working-directory: crates/docbert/ui
       - run: cargo build --release

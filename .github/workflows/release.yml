@@ -35,7 +35,7 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.ref }}
 
-      - name: Bump crate versions
+      - name: Bump crate version
         id: version
         shell: bash
         run: |
@@ -47,18 +47,12 @@ jobs:
 
           release_type = "${{ github.event.inputs.release_type }}"
 
-          # All crate Cargo.toml files in the workspace.
-          crate_tomls = [
-              pathlib.Path("crates/docbert/Cargo.toml"),
-              pathlib.Path("crates/docbert-core/Cargo.toml"),
-          ]
-
+          cargo_toml_path = pathlib.Path("Cargo.toml")
           cargo_lock_path = pathlib.Path("Cargo.lock")
 
-          # Read the current version from the first crate's Cargo.toml.
-          root_toml = crate_tomls[0].read_text(encoding="utf-8")
-          root_manifest = tomllib.loads(root_toml)
-          old_version = root_manifest["package"]["version"]
+          # Read the current version from Cargo.toml.
+          manifest = tomllib.loads(cargo_toml_path.read_text(encoding="utf-8"))
+          old_version = manifest["package"]["version"]
 
           match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", old_version)
           if not match:
@@ -76,35 +70,30 @@ jobs:
 
           new_version = f"{major}.{minor}.{patch}"
 
-          # Update version in each crate's Cargo.toml.
-          for toml_path in crate_tomls:
-              text = toml_path.read_text(encoding="utf-8")
-              text, n = re.subn(
-                  r'(?m)^version = "' + re.escape(old_version) + r'"$',
-                  f'version = "{new_version}"',
-                  text,
-                  count=1,
-              )
-              if n != 1:
-                  raise SystemExit(f"Could not update version in {toml_path}")
-              toml_path.write_text(text, encoding="utf-8")
+          # Update version in Cargo.toml.
+          text = cargo_toml_path.read_text(encoding="utf-8")
+          text, n = re.subn(
+              r'(?m)^version = "' + re.escape(old_version) + r'"$',
+              f'version = "{new_version}"',
+              text,
+              count=1,
+          )
+          if n != 1:
+              raise SystemExit("Could not update version in Cargo.toml")
+          cargo_toml_path.write_text(text, encoding="utf-8")
 
-          # Update all workspace package versions in Cargo.lock.
-          package_names = ["docbert", "docbert-core"]
+          # Update lobster package version in Cargo.lock.
           cargo_lock = cargo_lock_path.read_text(encoding="utf-8")
-          for name in package_names:
-              cargo_lock, n = re.subn(
-                  r'(\[\[package\]\]\nname = "'
-                  + re.escape(name)
-                  + r'"\nversion = ")'
-                  + re.escape(old_version)
-                  + r'(")',
-                  r'\g<1>' + new_version + r'\g<2>',
-                  cargo_lock,
-                  count=1,
-              )
-              if n != 1:
-                  raise SystemExit(f"Could not update {name} version in Cargo.lock")
+          cargo_lock, n = re.subn(
+              r'(\[\[package\]\]\nname = "lobster"\nversion = ")'
+              + re.escape(old_version)
+              + r'(")',
+              r'\g<1>' + new_version + r'\g<2>',
+              cargo_lock,
+              count=1,
+          )
+          if n != 1:
+              raise SystemExit("Could not update lobster version in Cargo.lock")
           cargo_lock_path.write_text(cargo_lock, encoding="utf-8")
 
           github_output = pathlib.Path(os.environ["GITHUB_OUTPUT"])
@@ -121,7 +110,7 @@ jobs:
 
       - name: Create release commit
         run: |
-          git add Cargo.lock crates/docbert/Cargo.toml crates/docbert-core/Cargo.toml
+          git add Cargo.toml Cargo.lock
           git commit -m "release: v${{ steps.version.outputs.new_version }}"
 
       - name: Push release commit
@@ -138,18 +127,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-musl
+          - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
-            features: ""
-            artifact: docbert-x86_64-unknown-linux-musl
-          - target: aarch64-unknown-linux-musl
+            artifact: lobster-x86_64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
-            features: ""
-            artifact: docbert-aarch64-unknown-linux-musl
+            artifact: lobster-aarch64-unknown-linux-gnu
           - target: aarch64-apple-darwin
             runner: macos-latest
-            features: metal
-            artifact: docbert-aarch64-apple-darwin
+            artifact: lobster-aarch64-apple-darwin
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -158,43 +144,22 @@ jobs:
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Add musl target
-        if: contains(matrix.target, 'musl')
-        run: rustup target add ${{ matrix.target }}
-
-      - name: Install musl tools
-        if: contains(matrix.target, 'musl')
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+        with:
+          targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
 
-      - name: Set up Bun
-        uses: oven-sh/setup-bun@v2
-
-      - name: Build UI
-        run: |
-          bun install --frozen-lockfile
-          bun run build
-        working-directory: crates/docbert/ui
-
       - name: Build binary
-        run: |
-          FEATURES="${{ matrix.features }}"
-          if [ -n "$FEATURES" ]; then
-            cargo build --release --target ${{ matrix.target }} --features "$FEATURES"
-          else
-            cargo build --release --target ${{ matrix.target }}
-          fi
+        run: cargo build --release --target ${{ matrix.target }} --bin lobster
 
       - name: Package binary
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/docbert dist/docbert
+          cp target/${{ matrix.target }}/release/lobster dist/lobster
           cd dist
-          tar czf ${{ matrix.artifact }}.tar.gz docbert
+          tar czf ${{ matrix.artifact }}.tar.gz lobster
           shasum -a 256 ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
 
       - name: Upload artifact
