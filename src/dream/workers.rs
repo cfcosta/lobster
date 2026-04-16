@@ -12,12 +12,16 @@ use crate::store::{
     schema::{Entity, Task, TaskStatus},
 };
 
-/// Scan for tasks that haven't been seen in recent episodes and
-/// mark them as potentially stale.
+/// Tasks not seen in this many milliseconds are considered stale.
+const STALE_THRESHOLD_MS: i64 = 7 * 24 * 3600 * 1000; // 7 days
+
+/// Scan for open tasks that haven't been seen in recent episodes.
 ///
-/// Returns the number of stale tasks found.
+/// A task is stale if its `last_seen_in` episode's finalized
+/// timestamp is older than `STALE_THRESHOLD_MS`.
 #[must_use]
 pub fn scan_stale_tasks(db: &LobsterDb) -> Vec<(RawId, String)> {
+    let now_ms = chrono::Utc::now().timestamp_millis();
     let mut stale = Vec::new();
 
     let Ok(rtxn) = db.env.read_txn() else {
@@ -30,7 +34,16 @@ pub fn scan_stale_tasks(db: &LobsterDb) -> Vec<(RawId, String)> {
     for entry in iter.flatten() {
         let (key, value) = entry;
         if let Ok(task) = serde_json::from_slice::<Task>(value) {
-            if task.status == TaskStatus::Open {
+            if task.status != TaskStatus::Open {
+                continue;
+            }
+
+            // Resolve the last-seen episode's timestamp
+            let last_seen_ts =
+                crate::store::crud::get_episode(db, &task.last_seen_in.raw())
+                    .map_or(0, |ep| ep.finalized_ts_utc_ms);
+
+            if now_ms.saturating_sub(last_seen_ts) >= STALE_THRESHOLD_MS {
                 let key_bytes: [u8; 16] = key.try_into().unwrap_or([0; 16]);
                 stale.push((RawId::from_bytes(key_bytes), task.title.clone()));
             }
