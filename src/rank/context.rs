@@ -16,7 +16,7 @@ pub fn find_current_task(db: &LobsterDb, repo_id: &RepoId) -> Option<TaskId> {
     let rtxn = db.env.read_txn().ok()?;
     let iter = db.tasks.iter(&rtxn).ok()?;
 
-    let mut best: Option<Task> = None;
+    let mut best: Option<(Task, i64)> = None;
 
     for entry in iter.flatten() {
         let (_, value) = entry;
@@ -24,14 +24,20 @@ pub fn find_current_task(db: &LobsterDb, repo_id: &RepoId) -> Option<TaskId> {
             if task.repo_id == *repo_id
                 && task.status == crate::store::schema::TaskStatus::Open
             {
+                // Resolve the actual timestamp of the last-seen episode.
+                // EpisodeId is hash-based (not monotonic), so we cannot
+                // compare IDs directly — must compare timestamps.
+                let ts = crate::store::crud::get_episode(
+                    db,
+                    &task.last_seen_in.raw(),
+                )
+                .map_or(0, |ep| ep.finalized_ts_utc_ms);
+
                 match &best {
-                    None => best = Some(task),
-                    Some(existing) => {
-                        // Compare by last_seen_in — higher
-                        // episode IDs are more recent (they're
-                        // derived from seq numbers)
-                        if task.last_seen_in > existing.last_seen_in {
-                            best = Some(task);
+                    None => best = Some((task, ts)),
+                    Some((_, best_ts)) => {
+                        if ts > *best_ts {
+                            best = Some((task, ts));
                         }
                     }
                 }
@@ -39,7 +45,7 @@ pub fn find_current_task(db: &LobsterDb, repo_id: &RepoId) -> Option<TaskId> {
         }
     }
 
-    best.map(|t| t.task_id)
+    best.map(|(t, _)| t.task_id)
 }
 
 /// Compute `task_overlap_score` for a candidate.
