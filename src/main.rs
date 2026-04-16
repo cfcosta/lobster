@@ -378,6 +378,13 @@ fn cmd_reset(storage_dir: &std::path::Path, force: bool) -> Result<()> {
     if db_path.exists() {
         std::fs::remove_dir_all(&db_path).context("remove database")?;
     }
+
+    // Also remove staged events so they cannot repopulate the DB
+    let staging_path = lobster::store::staging::staging_dir(storage_dir);
+    if staging_path.exists() {
+        std::fs::remove_dir_all(&staging_path).context("remove staging dir")?;
+    }
+
     println!("Memory reset complete.");
 
     Ok(())
