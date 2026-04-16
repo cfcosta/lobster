@@ -224,9 +224,10 @@ pub async fn finalize_episode_at(
     }
 
     // ── Step 6: Embedding ───────────────────────────────
-    let artifact_id = crate::store::ids::ArtifactId::derive(
-        format!("emb:{episode_id}").as_bytes(),
-    );
+    // Key the embedding artifact by the episode's raw ID so that
+    // retrieval (rerank, load_proxy_vectors, rebuild) can look it
+    // up directly by episode_id.
+    let artifact_id = crate::store::ids::ArtifactId::from_raw(episode_id.raw());
     let policy = crate::embeddings::proxy::policy_for("summary");
 
     let proxy_vector = match crate::embeddings::encoder::encode_text(
