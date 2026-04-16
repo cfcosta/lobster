@@ -211,13 +211,22 @@ pub async fn finalize_episode_at(
     // ── Step 5: Create/update Task record if task_title present
     if let Some(tid) = task_id {
         if let Some(title) = &task_title {
-            let task = crate::store::schema::Task {
-                task_id: tid,
-                repo_id,
-                title: title.clone(),
-                status: crate::store::schema::TaskStatus::Open,
-                opened_in: episode_id,
-                last_seen_in: episode_id,
+            // Preserve opened_in for existing tasks — only update
+            // last_seen_in. Creating a new task sets both to the
+            // current episode.
+            let task = match crud::get_task(db, &tid.raw()) {
+                Ok(mut existing) => {
+                    existing.last_seen_in = episode_id;
+                    existing
+                }
+                Err(_) => crate::store::schema::Task {
+                    task_id: tid,
+                    repo_id,
+                    title: title.clone(),
+                    status: crate::store::schema::TaskStatus::Open,
+                    opened_in: episode_id,
+                    last_seen_in: episode_id,
+                },
             };
             let _ = crud::put_task(db, &task);
         }
