@@ -447,12 +447,8 @@ pub fn memory_neighbors(
             let edge = row[4].as_str().unwrap_or("RELATED").to_string();
 
             neighbors.push(NeighborEntry {
-                node_id: if name.is_empty() {
-                    node_label.clone()
-                } else {
-                    name
-                },
-                label: node_label,
+                node_id: node_label,
+                label: if name.is_empty() { String::new() } else { name },
                 edge_type: edge,
             });
         }
