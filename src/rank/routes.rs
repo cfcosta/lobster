@@ -135,10 +135,26 @@ pub fn execute_query_with_context(
             }
         })
         .filter(|c| {
-            // Compute real recency from episode timestamp
             let now_ms = chrono::Utc::now().timestamp_millis();
-            let artifact_ts = crate::store::crud::get_episode(db, &c.id)
-                .map_or(now_ms, |ep| ep.finalized_ts_utc_ms);
+
+            // Resolve the parent episode for this candidate.
+            // Summaries are keyed by episode_id directly;
+            // decisions carry an episode_id field; entities and
+            // tasks fall back to 0 (oldest possible recency).
+            let parent_episode = match c.artifact_type.as_str() {
+                "summary" => crate::store::crud::get_episode(db, &c.id).ok(),
+                "decision" => crate::store::crud::get_decision(db, &c.id)
+                    .ok()
+                    .and_then(|d| {
+                        crate::store::crud::get_episode(db, &d.episode_id.raw())
+                            .ok()
+                    }),
+                _ => None,
+            };
+
+            let artifact_ts = parent_episode
+                .as_ref()
+                .map_or(0, |ep| ep.finalized_ts_utc_ms);
             let recency = crate::rank::recency::recency_score_default(
                 artifact_ts,
                 now_ms,
@@ -165,8 +181,7 @@ pub fn execute_query_with_context(
                 task_overlap: task_ol,
                 graph_support: graph_sup,
                 is_decision: c.artifact_type == "decision",
-                is_noisy: crate::store::crud::get_episode(db, &c.id)
-                    .is_ok_and(|ep| ep.is_noisy),
+                is_noisy: parent_episode.is_some_and(|ep| ep.is_noisy),
             };
             let raw = composite_score(&input, &DEFAULT_WEIGHTS, route);
             let normalized = normalize_score(raw, &DEFAULT_WEIGHTS, route);
