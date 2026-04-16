@@ -165,7 +165,9 @@ fn scan_superseded_decisions_inner(
                 },
             );
 
-            if similarity >= config.topic_similarity_threshold {
+            if similarity >= config.topic_similarity_threshold
+                && decisions[i].confidence <= config.max_confidence_to_supersede
+            {
                 // Newer decision supersedes older one
                 to_supersede.push((i, decisions[j].valid_from_ts_utc_ms));
                 break; // Only supersede by the first (earliest) match

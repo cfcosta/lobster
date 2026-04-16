@@ -98,7 +98,21 @@ pub struct Episode {
 // ── Confidence + Decision (d49.4) ────────────────────────────
 
 /// Discrete confidence level for detected decisions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// Variant order matters: derives `PartialOrd`/`Ord` so
+/// `Low < Medium < High`.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+)]
 pub enum Confidence {
     Low,
     Medium,
