@@ -13,7 +13,7 @@ use crate::{
     store::{
         crud,
         db::LobsterDb,
-        ids::{EpisodeId, RepoId},
+        ids::EpisodeId,
         schema::{
             Confidence,
             Decision,

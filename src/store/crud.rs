@@ -126,10 +126,7 @@ pub fn get_raw_events_range(
     let rtxn = db.env.read_txn().map_err(StoreError::db)?;
     let mut events = Vec::new();
     let range = start_seq..=end_seq;
-    let iter = db
-        .raw_events
-        .range(&rtxn, &range)
-        .map_err(StoreError::db)?;
+    let iter = db.raw_events.range(&rtxn, &range).map_err(StoreError::db)?;
     for entry in iter {
         let (_, value) = entry.map_err(StoreError::db)?;
         let event: RawEvent = serde_json::from_slice(value)?;

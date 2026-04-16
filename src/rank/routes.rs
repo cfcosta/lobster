@@ -1,8 +1,10 @@
-//! Route execution: run the appropriate search strategy for each
-//! retrieval route.
+//! Route execution: MaxSim-first retrieval with graph expansion.
 //!
-//! Each route fetches candidates from Grafeo, applies scoring,
-//! MMR diversity, ready-set intersection, and confidence rejection.
+//! The pipeline:
+//! 1. Score ALL episode embeddings via ColBERT MaxSim
+//! 2. BM25 text search on decisions, entities, tasks
+//! 3. Graph expansion on top hits (1-hop neighbors)
+//! 4. Composite scoring, MMR diversity, threshold filtering
 
 use grafeo::GrafeoDB;
 
@@ -34,12 +36,6 @@ pub struct RetrievalResult {
 }
 
 /// Execute a retrieval query end-to-end.
-///
-/// 1. Classify the query into a route
-/// 2. Execute the route-specific search
-/// 3. Score, apply MMR, reject below threshold
-/// 4. Intersect with ready set
-/// 5. Return results (or empty if Abstain)
 pub fn execute_query(
     query: &str,
     db: &LobsterDb,
@@ -78,23 +74,20 @@ pub fn execute_query_with_context(
         scoring::auto_surface_budget(route)
     };
 
-    let mut candidates = search_grafeo(grafeo, query, route);
+    // ── Step 1: MaxSim on all episode embeddings ────────────
+    let mut candidates = maxsim_rank_episodes(db, query);
 
-    // Rerank candidates with ColBERT query→candidate similarity.
-    for candidate in &mut candidates {
-        let reranked =
-            crate::rank::rerank::rerank_score(db, query, &candidate.id);
-        if reranked > 0.0 {
-            candidate.score = reranked;
-        }
+    // ── Step 2: BM25 on decisions, entities, tasks ──────────
+    bm25_search_structured(grafeo, query, &mut candidates);
+
+    // ── Step 3: Graph expansion on initial hits ─────────────
+    if route == RetrievalRoute::HybridGraph {
+        expand_graph_neighbors(grafeo, &mut candidates);
     }
 
-    // Apply stable tie-breakers before MMR per spec
+    // ── Step 4: Stable sort + MMR diversity ─────────────────
     crate::rank::retrieval::stable_sort(&mut candidates);
 
-    // Rerank with cosine similarity on proxy vectors when available.
-    // Load proxy vectors for each candidate from redb, then use
-    // cosine similarity for MMR pairwise comparison.
     let proxy_vectors = load_proxy_vectors(db, &candidates);
     let diverse = apply_mmr(&candidates, budget, lambda, |a, b| {
         if a == b {
@@ -108,10 +101,7 @@ pub fn execute_query_with_context(
         }
     });
 
-    // Intersect with ready set and apply threshold.
-    // Decisions and entities inherit visibility from their parent
-    // episode (which was Ready when projected). Only filter
-    // episode-typed candidates against the ready set directly.
+    // ── Step 5: Visibility + composite scoring + threshold ──
     let candidate_ids: Vec<_> = diverse.iter().map(|c| c.id).collect();
     diverse
         .into_iter()
@@ -119,18 +109,12 @@ pub fn execute_query_with_context(
             if c.artifact_type == "summary" {
                 visibility::is_episode_visible(db, &c.id)
             } else {
-                // Decisions/entities were only projected from
-                // Ready episodes, so they're implicitly visible
                 true
             }
         })
         .filter(|c| {
             let now_ms = chrono::Utc::now().timestamp_millis();
 
-            // Resolve the parent episode for this candidate.
-            // Summaries are keyed by episode_id directly;
-            // decisions carry an episode_id field; entities and
-            // tasks fall back to 0 (oldest possible recency).
             let parent_episode = match c.artifact_type.as_str() {
                 "summary" => crate::store::crud::get_episode(db, &c.id).ok(),
                 "decision" => crate::store::crud::get_decision(db, &c.id)
@@ -150,11 +134,9 @@ pub fn execute_query_with_context(
                 now_ms,
             );
 
-            // Compute task_overlap from current task context
             let task_ol =
                 crate::rank::context::task_overlap(db, &c.id, current_task_id);
 
-            // Compute graph_support for HybridGraph route
             let graph_sup = if route == RetrievalRoute::HybridGraph {
                 crate::rank::context::graph_support(
                     grafeo,
@@ -186,131 +168,76 @@ pub fn execute_query_with_context(
         .collect()
 }
 
-/// Load proxy vectors for candidates from embedding artifacts.
-fn load_proxy_vectors(
-    db: &LobsterDb,
-    candidates: &[ScoredCandidate],
-) -> std::collections::HashMap<crate::store::ids::RawId, Vec<f32>> {
-    use crate::store::crud;
-
-    let mut vectors = std::collections::HashMap::new();
-    for c in candidates {
-        // Try loading embedding artifact keyed by the candidate's
-        // episode ID. The artifact stores pooled_vector_bytes.
-        if let Ok(emb) = crud::get_embedding_artifact(db, &c.id) {
-            let proxy = crate::embeddings::proxy::bytes_to_vector(
-                &emb.pooled_vector_bytes,
-            );
-            if !proxy.is_empty() {
-                vectors.insert(c.id, proxy);
-            }
-        }
-    }
-    vectors
-}
-
-/// Search Grafeo for candidates matching the query.
+/// Score ALL episode embedding artifacts against the query via MaxSim.
 ///
-/// Route-aware search using `ColBERT` + Grafeo.
-///
-/// - **Exact**: BM25 text search only on decisions and entities
-///   (no summary search, no vector encoding needed).
-/// - **Hybrid**: `ColBERT` query encoding + hybrid search (BM25 +
-///   vector RRF) on summaries, BM25 on decisions and entities.
-/// - **`HybridGraph`**: same as Hybrid, plus 1-hop graph neighbor
-///   expansion on initial hits.
-fn search_grafeo(
-    grafeo: &GrafeoDB,
-    query: &str,
-    route: RetrievalRoute,
-) -> Vec<ScoredCandidate> {
+/// This is the primary retrieval signal: ColBERT late-interaction
+/// scoring on stored hierarchically-pooled embeddings. Falls back
+/// to proxy-vector cosine when late-interaction bytes are absent.
+fn maxsim_rank_episodes(db: &LobsterDb, query: &str) -> Vec<ScoredCandidate> {
     let mut candidates = Vec::new();
 
-    if grafeo.node_count() == 0 {
+    let Ok(rtxn) = db.env.read_txn() else {
+        return candidates;
+    };
+    let Ok(iter) = db.embedding_artifacts.iter(&rtxn) else {
+        return candidates;
+    };
+
+    // Collect all embedding artifacts keyed by their raw ID
+    let mut artifacts: Vec<(RawId, crate::store::schema::EmbeddingArtifact)> =
+        Vec::new();
+    for entry in iter.flatten() {
+        let (key, value) = entry;
+        let key_bytes: [u8; 16] = match key.try_into() {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let Ok(emb) = serde_json::from_slice::<
+            crate::store::schema::EmbeddingArtifact,
+        >(value) else {
+            continue;
+        };
+        artifacts.push((RawId::from_bytes(key_bytes), emb));
+    }
+    drop(rtxn);
+
+    if artifacts.is_empty() {
         return candidates;
     }
 
-    match route {
-        RetrievalRoute::Exact => {
-            search_exact(grafeo, query, &mut candidates);
+    // Score each artifact via rerank_score (MaxSim with fallback)
+    for (raw_id, _) in &artifacts {
+        let score = crate::rank::rerank::rerank_score(db, query, raw_id);
+        if score > 0.0 {
+            candidates.push(ScoredCandidate {
+                id: *raw_id,
+                score,
+                artifact_type: "summary".into(),
+            });
         }
-        RetrievalRoute::Hybrid => {
-            search_hybrid(grafeo, query, &mut candidates);
-        }
-        RetrievalRoute::HybridGraph => {
-            search_hybrid(grafeo, query, &mut candidates);
-            expand_graph_neighbors(grafeo, &mut candidates);
-        }
-        RetrievalRoute::Abstain => {}
     }
+
+    // Sort by score descending and keep top-k for downstream
+    candidates.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    candidates.truncate(30);
 
     candidates
 }
 
-/// Exact route: BM25 text search on decisions and entities only.
-/// No `ColBERT` encoding — these are exact/lexical queries.
-fn search_exact(
+/// BM25 text search on decisions, entities, and tasks.
+fn bm25_search_structured(
     grafeo: &GrafeoDB,
     query: &str,
     candidates: &mut Vec<ScoredCandidate>,
 ) {
-    if let Ok(hits) = grafeo.text_search(
-        crate::graph::db::labels::DECISION,
-        "statement",
-        query,
-        20,
-    ) {
-        collect_hits(grafeo, &hits, "decision_id", "decision", candidates);
-    }
-
-    if let Ok(hits) = grafeo.text_search(
-        crate::graph::db::labels::ENTITY,
-        "canonical_name",
-        query,
-        20,
-    ) {
-        collect_hits(grafeo, &hits, "entity_id", "entity", candidates);
-    }
-
-    // BM25 text search on task titles
-    if let Ok(hits) =
-        grafeo.text_search(crate::graph::db::labels::TASK, "title", query, 20)
-    {
-        collect_hits(grafeo, &hits, "task_id", "task", candidates);
-    }
-}
-
-/// Hybrid route: `ColBERT` query encoding + hybrid search on
-/// summaries, BM25 on decisions and entities.
-fn search_hybrid(
-    grafeo: &GrafeoDB,
-    query: &str,
-    candidates: &mut Vec<ScoredCandidate>,
-) {
-    let query_vector = crate::embeddings::encoder::encode_query(query);
-    if let Err(e) = &query_vector {
-        tracing::error!(
-            error = %e,
-            "ColBERT model not available — run `lobster install`"
-        );
+    if grafeo.node_count() == 0 {
         return;
     }
-    let qv_ref = query_vector.as_ref().ok().map(Vec::as_slice);
 
-    // Hybrid search (BM25 + vector RRF) on episode summaries
-    if let Ok(hits) = grafeo.hybrid_search(
-        crate::graph::db::labels::EPISODE,
-        "summary_text",
-        "embedding",
-        query,
-        qv_ref,
-        20,
-        None,
-    ) {
-        collect_hits(grafeo, &hits, "episode_id", "summary", candidates);
-    }
-
-    // BM25 text search on decisions
     if let Ok(hits) = grafeo.text_search(
         crate::graph::db::labels::DECISION,
         "statement",
@@ -320,7 +247,6 @@ fn search_hybrid(
         collect_hits(grafeo, &hits, "decision_id", "decision", candidates);
     }
 
-    // BM25 text search on entities
     if let Ok(hits) = grafeo.text_search(
         crate::graph::db::labels::ENTITY,
         "canonical_name",
@@ -330,7 +256,6 @@ fn search_hybrid(
         collect_hits(grafeo, &hits, "entity_id", "entity", candidates);
     }
 
-    // BM25 text search on tasks
     if let Ok(hits) =
         grafeo.text_search(crate::graph::db::labels::TASK, "title", query, 20)
     {
@@ -338,8 +263,8 @@ fn search_hybrid(
     }
 }
 
-/// `HybridGraph` expansion: for each initial candidate, add its
-/// 1-hop Grafeo neighbors as additional candidates.
+/// 1-hop graph expansion: for each initial candidate, add its
+/// Grafeo neighbors as additional candidates.
 fn expand_graph_neighbors(
     grafeo: &GrafeoDB,
     candidates: &mut Vec<ScoredCandidate>,
@@ -362,7 +287,6 @@ fn expand_graph_neighbors(
         };
 
         for row in result.iter() {
-            // Try each possible ID column
             let neighbor = [
                 (row[0].as_str(), "summary"),
                 (row[1].as_str(), "decision"),
@@ -371,12 +295,9 @@ fn expand_graph_neighbors(
             for (id_val, artifact_type) in &neighbor {
                 if let Some(id) = id_val {
                     if let Ok(raw_id) = id.parse() {
-                        // Avoid duplicates
                         if !candidates.iter().any(|c| c.id == raw_id) {
                             candidates.push(ScoredCandidate {
                                 id: raw_id,
-                                // Neighbors get a discount — they
-                                // weren't direct search hits
                                 score: 0.5,
                                 artifact_type: (*artifact_type).into(),
                             });
@@ -388,11 +309,28 @@ fn expand_graph_neighbors(
     }
 }
 
-/// Collect search hits from Grafeo into scored candidates.
-///
-/// Uses the actual score returned by Grafeo's BM25/hybrid search.
-/// Deduplicates by `RawId`, keeping the higher score when the same
-/// artifact appears from multiple search paths.
+/// Load proxy vectors for MMR pairwise comparison.
+fn load_proxy_vectors(
+    db: &LobsterDb,
+    candidates: &[ScoredCandidate],
+) -> std::collections::HashMap<crate::store::ids::RawId, Vec<f32>> {
+    use crate::store::crud;
+
+    let mut vectors = std::collections::HashMap::new();
+    for c in candidates {
+        if let Ok(emb) = crud::get_embedding_artifact(db, &c.id) {
+            let proxy = crate::embeddings::proxy::bytes_to_vector(
+                &emb.pooled_vector_bytes,
+            );
+            if !proxy.is_empty() {
+                vectors.insert(c.id, proxy);
+            }
+        }
+    }
+    vectors
+}
+
+/// Collect BM25 search hits from Grafeo into scored candidates.
 fn collect_hits(
     grafeo: &GrafeoDB,
     hits: &[(grafeo::NodeId, f64)],
@@ -405,8 +343,6 @@ fn collect_hits(
             if let Some(id_val) = node.get_property(id_property) {
                 if let Some(id_str) = id_val.as_str() {
                     if let Ok(raw_id) = id_str.parse() {
-                        // Dedup: if this ID already exists, keep
-                        // the higher score
                         if let Some(existing) =
                             candidates.iter_mut().find(|c| c.id == raw_id)
                         {
@@ -447,23 +383,6 @@ mod tests {
 
         let results =
             execute_query("how does memory work", &database, &grafeo, false);
-
-        // No data in Grafeo → no results
-        assert!(results.is_empty());
-    }
-
-    #[test]
-    fn test_execute_query_classifies_correctly() {
-        let (database, _dir) = db::open_in_memory().unwrap();
-        let grafeo = grafeo_db::new_in_memory();
-
-        // File path → exact route
-        let results = execute_query("src/main.rs", &database, &grafeo, false);
-        assert!(results.is_empty()); // no data, but route was Exact
-
-        // Relational → hybrid+graph route
-        let results =
-            execute_query("why did we choose redb", &database, &grafeo, false);
         assert!(results.is_empty());
     }
 
@@ -472,7 +391,6 @@ mod tests {
         let (database, _dir) = db::open_in_memory().unwrap();
         let grafeo = grafeo_db::new_in_memory();
 
-        // Create a Pending episode — should not appear in results
         let ep = Episode {
             episode_id: EpisodeId::derive(b"pending"),
             repo_id: RepoId::derive(b"repo"),
@@ -487,27 +405,22 @@ mod tests {
         crud::put_episode(&database, &ep).unwrap();
 
         let results = execute_query("test query", &database, &grafeo, false);
-        // Even if Grafeo had data for this episode, the
-        // visibility filter would exclude it
         assert!(results.is_empty());
     }
 
     #[test]
     fn test_mcp_uses_lower_threshold() {
-        // MCP threshold is lower than auto threshold
         assert!(
             scoring::mcp_threshold(RetrievalRoute::Hybrid)
                 < scoring::auto_threshold(RetrievalRoute::Hybrid)
         );
     }
 
-    // -- Property: collect_hits deduplicates by ID, keeping max score --
     #[test]
     fn test_collect_hits_dedup() {
         let grafeo = grafeo_db::new_in_memory();
         let session = grafeo.session();
 
-        // Create two nodes with the same episode_id
         let _ = session.execute(
             "CREATE (e:Episode {episode_id: 'aaa', summary_text: 'test'})",
         );
@@ -516,7 +429,6 @@ mod tests {
         );
         crate::graph::indexes::ensure_indexes(&grafeo);
 
-        // BM25 search may return both nodes for the same ID
         let mut candidates = Vec::new();
         if let Ok(hits) = grafeo.text_search(
             crate::graph::db::labels::EPISODE,
@@ -533,36 +445,12 @@ mod tests {
             );
         }
 
-        // Even if two nodes match, same episode_id should appear once
         let unique_ids: std::collections::HashSet<_> =
             candidates.iter().map(|c| c.id).collect();
         assert_eq!(
             candidates.len(),
             unique_ids.len(),
             "candidates should have no duplicate IDs"
-        );
-    }
-
-    // -- Property: search_grafeo returns no duplicate IDs --
-    #[hegel::test(test_cases = 20)]
-    fn prop_search_no_duplicates(tc: hegel::TestCase) {
-        use hegel::generators as gs;
-
-        let grafeo = grafeo_db::new_in_memory();
-        let query: String = tc.draw(
-            gs::text()
-                .min_size(1)
-                .max_size(30)
-                .alphabet("abcdefghijklmnop "),
-        );
-
-        let candidates = search_grafeo(&grafeo, &query, RetrievalRoute::Hybrid);
-        let unique_ids: std::collections::HashSet<_> =
-            candidates.iter().map(|c| c.id).collect();
-        assert_eq!(
-            candidates.len(),
-            unique_ids.len(),
-            "search_grafeo must return unique IDs"
         );
     }
 }
