@@ -98,6 +98,35 @@ pub fn run_cycle(db: &LobsterDb, config: &DreamConfig) -> DreamCycleResult {
                         &analysis,
                     );
                     if crate::extract::validate::validate(&output).is_ok() {
+                        // Persist the extraction artifact so downstream
+                        // (rebuild, retrieval) can access it.
+                        let output_json =
+                            serde_json::to_vec(&output).unwrap_or_default();
+                        let mut ext_hasher = sha2::Sha256::new();
+                        use sha2::Digest as _;
+                        ext_hasher.update(&output_json);
+                        let checksum: [u8; 32] = ext_hasher.finalize().into();
+                        let ext_artifact =
+                            crate::store::schema::ExtractionArtifact {
+                                episode_id: ep.episode_id,
+                                revision: "retry-v1".into(),
+                                output_json,
+                                payload_checksum: checksum,
+                            };
+                        let _ =
+                            crud::put_extraction_artifact(db, &ext_artifact);
+
+                        // Update the summary from the retry analysis
+                        let summary_artifact =
+                            crate::store::schema::SummaryArtifact {
+                                episode_id: ep.episode_id,
+                                revision: "retry-v1".into(),
+                                summary_text: analysis.summary.clone(),
+                                payload_checksum: checksum,
+                            };
+                        let _ =
+                            crud::put_summary_artifact(db, &summary_artifact);
+
                         ep.processing_state = ProcessingState::Ready;
                         let _ = crud::put_episode(db, &ep);
                         result.retries_succeeded += 1;
