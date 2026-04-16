@@ -63,14 +63,7 @@ pub fn execute_query_with_context(
         return vec![];
     }
 
-    // Hooks run as a separate short-lived process and must not load
-    // the ColBERT model (spec: MCP process owns the model pool).
-    // Force Exact (BM25-only) route for hooks to avoid model loading.
-    let route = if is_mcp {
-        classified_route
-    } else {
-        RetrievalRoute::Exact
-    };
+    let route = classified_route;
 
     let threshold = if is_mcp {
         scoring::mcp_threshold(route)
@@ -88,14 +81,11 @@ pub fn execute_query_with_context(
     let mut candidates = search_grafeo(grafeo, query, route);
 
     // Rerank candidates with ColBERT query→candidate similarity.
-    // Only for MCP path — hooks use BM25 scores directly.
-    if is_mcp {
-        for candidate in &mut candidates {
-            let reranked =
-                crate::rank::rerank::rerank_score(db, query, &candidate.id);
-            if reranked > 0.0 {
-                candidate.score = reranked;
-            }
+    for candidate in &mut candidates {
+        let reranked =
+            crate::rank::rerank::rerank_score(db, query, &candidate.id);
+        if reranked > 0.0 {
+            candidate.score = reranked;
         }
     }
 
