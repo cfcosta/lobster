@@ -29,7 +29,7 @@ pub fn capture_event(
 ) -> Result<u64, crud::StoreError> {
     let repo_id = event.working_directory().map_or_else(
         || RepoId::derive(b"unknown"),
-        |d| RepoId::derive(d.as_bytes()),
+        |d| crate::store::canon::repo_id(&d),
     );
 
     let event_kind = if event.is_prompt_submit() {

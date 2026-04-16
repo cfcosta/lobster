@@ -105,7 +105,7 @@ async fn try_finalize(
     let repo_path = event
         .working_directory()
         .unwrap_or_else(|| "unknown".to_string());
-    let repo_id = crate::store::ids::RepoId::derive(repo_path.as_bytes());
+    let repo_id = crate::store::canon::repo_id(&repo_path);
     let config = crate::episodes::segmenter::SegmentationConfig::default();
 
     let action = segmentation::check_segmentation(

@@ -93,9 +93,10 @@ pub async fn finalize_episode_at(
     task_title: Option<String>,
     now_ms: i64,
 ) -> FinalizeResult {
-    let repo_id = RepoId::derive(repo_path.as_bytes());
+    let repo_id = crate::store::canon::repo_id(repo_path);
+    let canonical_repo = crate::store::canon::normalize_path(repo_path);
     let episode_id = EpisodeId::derive(
-        &format!("{repo_path}:{episode_seq_start}:{episode_seq_end}")
+        &format!("{canonical_repo}:{episode_seq_start}:{episode_seq_end}")
             .into_bytes(),
     );
 

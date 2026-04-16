@@ -75,7 +75,7 @@ pub fn run_recall(
     // Find current task for task_overlap scoring
     let repo_id = event
         .working_directory()
-        .map(|d| crate::store::ids::RepoId::derive(d.as_bytes()));
+        .map(|d| crate::store::canon::repo_id(&d));
     let current_task = repo_id
         .as_ref()
         .and_then(|r| crate::rank::context::find_current_task(db, r));

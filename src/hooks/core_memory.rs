@@ -121,7 +121,7 @@ pub fn load_repo_profile(
     db: &LobsterDb,
     repo_path: &str,
 ) -> Option<RepoProfile> {
-    let repo_id = crate::store::ids::RepoId::derive(repo_path.as_bytes());
+    let repo_id = crate::store::canon::repo_id(repo_path);
     crate::store::crud::get_repo_profile(db, &repo_id.raw()).ok()
 }
 
