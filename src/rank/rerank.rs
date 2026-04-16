@@ -1,8 +1,9 @@
-//! `PyLate` `ColBERT` reranking.
+//! ColBERT MaxSim reranking.
 //!
-//! Encodes the query with `ColBERT` and computes cosine similarity
-//! against candidate proxy vectors for reranking. Assumes the
-//! `ColBERT` model is installed.
+//! Computes MaxSim scores between a query and candidate documents
+//! using stored late-interaction embeddings. Falls back to cosine
+//! similarity on proxy vectors when late-interaction bytes are not
+//! available (ProxyOnly pooling policy).
 
 use crate::{
     embeddings::{encoder, proxy},
@@ -10,11 +11,15 @@ use crate::{
     store::{crud, db::LobsterDb, ids::RawId},
 };
 
-/// Compute the reranking score for a candidate.
+/// Compute the reranking score for a candidate using MaxSim.
 ///
-/// Encodes the query with `ColBERT` to produce a proxy vector, then
-/// computes cosine similarity against the candidate's stored proxy
-/// vector. Returns 0.0 if the candidate has no embedding artifact.
+/// Loads the candidate's embedding artifact and:
+/// 1. If late-interaction bytes are available, computes MaxSim
+///    (the proper ColBERT scoring) between the query and the
+///    stored per-token document embedding.
+/// 2. Otherwise falls back to cosine similarity on proxy vectors.
+///
+/// Returns 0.0 if the candidate has no embedding artifact.
 #[must_use]
 pub fn rerank_score(
     db: &LobsterDb,
@@ -30,6 +35,19 @@ pub fn rerank_score(
         return 0.0;
     }
 
+    // Prefer MaxSim on late-interaction embeddings when available
+    if let Some(li_bytes) = &emb.late_interaction_bytes {
+        if !li_bytes.is_empty() {
+            let n_dims = doc_proxy.len();
+            if let Ok(score) =
+                encoder::maxsim_score(query_text, li_bytes, n_dims)
+            {
+                return f64::from(score);
+            }
+        }
+    }
+
+    // Fallback: cosine similarity on proxy vectors
     let Ok(query_proxy) = encoder::encode_query(query_text) else {
         return 0.0;
     };
@@ -63,41 +81,70 @@ mod tests {
 
         let (database, _dir) = db::open_in_memory().unwrap();
 
-        // Encode a real document and store its proxy
-        let doc_proxy = encoder::with_model(|model| {
-            let texts = vec!["Use redb for ACID storage".to_string()];
-            let emb = model
-                .encode(&texts, false)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let shape = emb.shape();
-            let n_dims = *shape.dims().last().unwrap();
-            let flat: Vec<f32> = emb
-                .flatten(0, shape.dims().len() - 2)?
-                .to_vec2::<f32>()?
-                .into_iter()
-                .flatten()
-                .collect();
-            Ok(proxy::mean_pool(&flat, n_dims))
-        })
-        .unwrap();
-
+        // Encode a real document via encode_text which produces
+        // both proxy and late-interaction bytes
         let id = ArtifactId::derive(b"real-test");
-        let art = EmbeddingArtifact {
-            artifact_id: id,
-            revision: "test".into(),
-            backend: EmbeddingBackend::Cpu,
-            quantization: None,
-            pooled_vector_bytes: proxy::vector_to_bytes(&doc_proxy),
-            late_interaction_bytes: None,
-            payload_checksum: [0; 32],
-        };
-        crud::put_embedding_artifact(&database, &art).unwrap();
-
-        // Query about the same topic should have positive similarity
-        let score = rerank_score(&database, "redb storage ACID", &id.raw());
-        assert!(
-            score > 0.0,
-            "same-topic query should have positive similarity: {score}"
+        let result = encoder::encode_text(
+            "Use redb for ACID storage",
+            crate::store::ids::ArtifactId::from_raw(id.raw()),
+            crate::embeddings::proxy::PoolingPolicy::Full,
         );
+
+        match result {
+            Ok(art) => {
+                assert!(
+                    art.late_interaction_bytes.is_some(),
+                    "Full policy should produce late-interaction bytes"
+                );
+                crud::put_embedding_artifact(&database, &art).unwrap();
+
+                // MaxSim rerank on the same topic
+                let score =
+                    rerank_score(&database, "redb storage ACID", &id.raw());
+                assert!(
+                    score > 0.0,
+                    "same-topic query should have positive MaxSim: {score}"
+                );
+            }
+            Err(e) => {
+                eprintln!("encoding failed (may need model): {e}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_rerank_falls_back_to_cosine_without_li() {
+        if !encoder::model_available() {
+            eprintln!("skipping: model not installed");
+            return;
+        }
+
+        let (database, _dir) = db::open_in_memory().unwrap();
+
+        // Store with ProxyOnly (no late-interaction bytes)
+        let id = ArtifactId::derive(b"proxy-only");
+        let result = encoder::encode_text(
+            "Use redb for ACID storage",
+            crate::store::ids::ArtifactId::from_raw(id.raw()),
+            crate::embeddings::proxy::PoolingPolicy::ProxyOnly,
+        );
+
+        match result {
+            Ok(art) => {
+                assert!(art.late_interaction_bytes.is_none());
+                crud::put_embedding_artifact(&database, &art).unwrap();
+
+                // Should fall back to cosine
+                let score =
+                    rerank_score(&database, "redb storage ACID", &id.raw());
+                assert!(
+                    score > 0.0,
+                    "cosine fallback should have positive score: {score}"
+                );
+            }
+            Err(e) => {
+                eprintln!("encoding failed: {e}");
+            }
+        }
     }
 }

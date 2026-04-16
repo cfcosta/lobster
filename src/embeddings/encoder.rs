@@ -152,6 +152,53 @@ pub fn encode_query(query: &str) -> Result<Vec<f32>> {
     })
 }
 
+/// Encode a query and compute MaxSim against a stored document
+/// embedding. Returns the MaxSim score, or `None` if scoring
+/// fails.
+///
+/// `doc_li_bytes` is the stored `late_interaction_bytes` (flat
+/// f32s). `n_dims` is the embedding dimension (derivable from
+/// the proxy vector length).
+pub fn maxsim_score(
+    query: &str,
+    doc_li_bytes: &[u8],
+    n_dims: usize,
+) -> Result<f32> {
+    if doc_li_bytes.is_empty() || n_dims == 0 {
+        anyhow::bail!("empty document embedding");
+    }
+
+    with_model(|model| {
+        let texts = vec![query.to_string()];
+        let query_emb = model
+            .encode(&texts, true)
+            .context("ColBERT query encode failed")?;
+
+        // Reconstruct document tensor from stored bytes
+        let doc_floats =
+            crate::embeddings::proxy::bytes_to_vector(doc_li_bytes);
+        let n_tokens = doc_floats.len() / n_dims;
+        if n_tokens == 0 {
+            anyhow::bail!("degenerate document embedding: 0 tokens");
+        }
+
+        let doc_tensor = candle_core::Tensor::from_vec(
+            doc_floats,
+            (1, n_tokens, n_dims),
+            &model.device,
+        )
+        .context("reconstruct doc tensor")?;
+
+        // MaxSim: for each query token, find max similarity with
+        // any document token, then sum across query tokens.
+        let sim = model
+            .similarity(&query_emb, &doc_tensor)
+            .map_err(|e| anyhow::anyhow!("MaxSim failed: {e}"))?;
+
+        Ok(sim.data[0][0])
+    })
+}
+
 /// Mean-pool a candle Tensor [1, tokens, dims] into a proxy vector.
 fn mean_pool_tensor(tensor: &candle_core::Tensor) -> Result<Vec<u8>> {
     let shape = tensor.shape();
