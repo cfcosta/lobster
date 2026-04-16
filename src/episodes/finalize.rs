@@ -547,7 +547,10 @@ mod tests {
     use super::*;
     use crate::{
         graph::db as grafeo_db,
-        store::{db, ids::DecisionId},
+        store::{
+            db,
+            ids::{DecisionId, RepoId},
+        },
     };
 
     fn has_api_key() -> bool {
