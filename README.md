@@ -61,7 +61,7 @@ lobster init
 
 This command:
 
-1. Creates a `.lobster/` directory in your repo root with a `lobster.redb` database.
+1. Creates a `.lobster/` directory in your repo root with an `lmdb/` LMDB environment inside.
 2. Creates (or merges into) `.claude/settings.json` with hook entries for `UserPromptSubmit` and `PostToolUse`.
 3. Creates (or merges into) `.mcp.json` with the Lobster MCP server configuration.
 4. Adds `.lobster/` to `.gitignore` if not already present.
@@ -84,7 +84,7 @@ Once initialized, Lobster operates automatically:
 
 1. **Hooks** fire on every Claude Code interaction (`UserPromptSubmit`, `PostToolUse`). The hook process writes the event to a staging directory (`.lobster/staging/`) as a JSON file and exits. This is lock-free and fast.
 
-2. **The MCP server** (`lobster mcp`, started by Claude Code via `.mcp.json`) runs as a long-lived process. It watches the staging directory via inotify and ingests events into the redb database.
+2. **The MCP server** (`lobster mcp`, started by Claude Code via `.mcp.json`) runs as a long-lived process. It watches the staging directory via inotify and ingests events into the LMDB database.
 
 3. **Ingestion** processes raw events into episodes using idle gaps and repo transitions, then:
    - Produces episode summaries via LLM
@@ -174,7 +174,7 @@ lobster hook UserPromptSubmit
 
 Start the MCP server on stdio. This is a long-lived process started by Claude Code via the `.mcp.json` configuration. It:
 
-- Opens and owns the redb database
+- Opens and owns the LMDB database
 - Watches the staging directory for new events from hooks
 - Runs the ingestion pipeline (segmentation, summarization, extraction)
 - Exposes memory tools via MCP
@@ -264,23 +264,22 @@ All data lives in `.lobster/` inside your repository root:
 
 ```
 .lobster/
-  lobster.redb          # redb database (events, episodes, decisions, artifacts)
-  lobster.redb.snapshot  # temporary read-only copy used by hooks
-  staging/              # event files written by hooks, consumed by MCP server
+  lmdb/          # LMDB environment (data.mdb, lock.mdb)
+  staging/       # event files written by hooks, consumed by MCP server
 ```
 
 Lobster walks up from the current directory looking for an existing `.lobster/` directory, so you can run commands from subdirectories.
 
-The redb database is the canonical source of truth. The semantic graph (Grafeo) is rebuilt in-memory from redb on each MCP server start and hook recall invocation. If the database is lost, `lobster reset --force` followed by `lobster init` recreates it (but prior memory is gone).
+The LMDB database is the canonical source of truth. The semantic graph (Grafeo) is rebuilt in-memory from the LMDB store on each MCP server start and hook recall invocation. If the database is lost, `lobster reset --force` followed by `lobster init` recreates it (but prior memory is gone).
 
 ## Architecture
 
-- **redb** -- canonical source of truth (events, episodes, decisions, artifacts). ACID, crash-safe, embedded.
-- **Grafeo** -- semantic serving layer rebuilt in-memory from redb. Provides graph facts, BM25 text search, and hybrid retrieval.
+- **LMDB** (via `heed`) -- canonical source of truth (events, episodes, decisions, artifacts). ACID, crash-safe, embedded.
+- **Grafeo** -- semantic serving layer rebuilt in-memory from LMDB. Provides graph facts, BM25 text search, and hybrid retrieval.
 - **pylate-rs** -- local ColBERT embedding inference (optional). Used for vector reranking.
 - **rig-core** -- LLM adapter for summarization and extraction only. Supports Anthropic and OpenAI.
 
-Hooks never open the live database directly -- they write to the staging directory and read from a snapshot copy, avoiding lock contention with the MCP server.
+Hooks never write to the live database directly -- they append event files to the staging directory, which the MCP server ingests. Read-only CLI commands (`lobster status`) open a short-lived snapshot copy of `data.mdb`, avoiding writer-lock contention with the MCP server.
 
 See `ARCHITECTURE.md` for the full system design.
 
