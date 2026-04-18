@@ -230,6 +230,127 @@ mod tests {
         assert!(out.len() < 2_000, "digest too large: {} chars", out.len());
     }
 
+    /// Regression: a realistic serialized event array of the shape
+    /// `store::ingest::try_finalize` actually feeds the summarizer
+    /// must produce a digest that preserves the user prompt, tool
+    /// names, and tool-input fields — and must not be wiped by the
+    /// 500-char line-strip heuristic.
+    ///
+    /// Before the fix, the whole serialized array (a single JSON
+    /// line well over 500 chars) was replaced with
+    /// `[large JSON payload omitted]` *before* JSON extraction could
+    /// run, leaving the LLM with no event content and free to
+    /// invent plausible-sounding work narratives.
+    #[test]
+    fn test_digest_faithful_for_production_event_shape() {
+        // Pad the prompt to guarantee the serialized array exceeds
+        // the 500-char per-line strip threshold — that's the path
+        // where the old code wiped the payload before JSON
+        // extraction could run.
+        let long_prompt = format!(
+            "Please investigate the lock error and explain what \
+             src/store/db.rs does. {}",
+            "Walk me through the snapshot helper and all its callers. "
+                .repeat(6)
+        );
+        let events = serde_json::json!([
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "tool_input": {"prompt": long_prompt},
+                "cwd": "/repo"
+            },
+            {
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Read",
+                "tool_input": {"file_path": "src/store/db.rs"},
+                "cwd": "/repo"
+            },
+            {
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Grep",
+                "tool_input": {"pattern": "open_snapshot"},
+                "cwd": "/repo"
+            }
+        ]);
+        let serialized = serde_json::to_string(&events).unwrap();
+        assert!(
+            serialized.len() > 500,
+            "fixture must exceed the 500-char strip threshold to \
+             exercise the regression (got {} chars)",
+            serialized.len()
+        );
+
+        let digest = strip_tool_markup(&serialized);
+
+        assert!(
+            !digest.contains("[large JSON payload omitted]"),
+            "digest was wiped by line-strip: {digest:?}"
+        );
+        assert!(
+            digest.contains("investigate the lock error"),
+            "user prompt missing from digest: {digest:?}"
+        );
+        assert!(
+            digest.contains("src/store/db.rs"),
+            "Read file_path missing from digest: {digest:?}"
+        );
+        assert!(
+            digest.contains("open_snapshot"),
+            "Grep pattern missing from digest: {digest:?}"
+        );
+        assert!(
+            digest.contains("Read"),
+            "Read tool name missing from digest: {digest:?}"
+        );
+        assert!(
+            digest.contains("Grep"),
+            "Grep tool name missing from digest: {digest:?}"
+        );
+    }
+
+    /// Guards against a future extractor change that accidentally
+    /// injects outcome vocabulary into the digest. The digest for
+    /// an exploration-only session (only `Read`/`Grep` tool uses, no
+    /// writes, no builds, no test runs) must not itself contain
+    /// words that prime the LLM to claim a fix or resolution.
+    #[test]
+    fn test_digest_for_read_only_events_has_no_outcome_vocabulary() {
+        let events = serde_json::json!([
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "tool_input": {"prompt": "show me the structure of the graph module"}
+            },
+            {
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Read",
+                "tool_input": {"file_path": "src/graph/db.rs"}
+            },
+            {
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Read",
+                "tool_input": {"file_path": "src/graph/rebuild.rs"}
+            }
+        ]);
+        let digest =
+            strip_tool_markup(&serde_json::to_string(&events).unwrap());
+        let lower = digest.to_lowercase();
+
+        for word in [
+            "fixed",
+            "implemented",
+            "refactored",
+            "resolved",
+            "verified",
+            "succeeded",
+        ] {
+            assert!(
+                !lower.contains(word),
+                "digest must not contain outcome-biasing word {word:?}: \
+                 {digest:?}"
+            );
+        }
+    }
+
     use hegel::{TestCase, generators as gs};
 
     /// `strip_tool_markup` never produces output containing
