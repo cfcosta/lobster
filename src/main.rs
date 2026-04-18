@@ -343,7 +343,12 @@ fn cmd_status(storage_dir: &std::path::Path) -> Result<()> {
         return Ok(());
     }
 
-    let db = lobster::store::db::open(&db_path).context("open database")?;
+    // Read via a consistent snapshot so `lobster status` does not
+    // contend with a running `lobster mcp` process for the live
+    // writer lock. The TempDir must stay alive for as long as `db`
+    // is used.
+    let (db, _snapshot_guard) = lobster::store::db::open_snapshot(&db_path)
+        .context("open database snapshot")?;
 
     println!("Lobster status: initialized");
     println!("Storage: {}", storage_dir.display());
