@@ -13,6 +13,7 @@ use heed::{
     EnvOpenOptions,
     types::{Bytes, Str, U64},
 };
+use thiserror::Error;
 
 /// Default map size: 1 GiB. LMDB requires a pre-declared maximum.
 const DEFAULT_MAP_SIZE: usize = 1024 * 1024 * 1024;
@@ -56,6 +57,19 @@ pub struct LobsterDb {
     pub metadata: StrDb,
 }
 
+/// Errors returned by [`open_snapshot`].
+///
+/// The snapshot path copies the live `data.mdb` to a temporary
+/// directory before opening it, so failures split cleanly between
+/// the copy step and the heed open step.
+#[derive(Debug, Error)]
+pub enum SnapshotError {
+    #[error("I/O error preparing snapshot: {0}")]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Heed(#[from] heed::Error),
+}
+
 /// Open or create a Lobster database at the given directory path.
 ///
 /// Creates all named databases on first access. The path must be a
@@ -80,6 +94,33 @@ pub fn open(path: &Path) -> Result<LobsterDb, heed::Error> {
     };
 
     create_databases(&env)
+}
+
+/// Open a consistent snapshot of the Lobster database without
+/// contending for the live writer lock.
+///
+/// Copies `data.mdb` from `path` to a fresh temporary directory and
+/// opens that copy. LMDB commits write meta pages atomically, so a
+/// file-level copy of `data.mdb` always reflects some consistent
+/// committed state (possibly slightly stale — this is fine for the
+/// `lobster status` use case).
+///
+/// The returned [`tempfile::TempDir`] must stay alive for as long as
+/// the returned [`LobsterDb`] is used; dropping it removes the
+/// snapshot files.
+///
+/// # Errors
+///
+/// Returns [`SnapshotError::Io`] if the snapshot directory or
+/// `data.mdb` copy fails, or [`SnapshotError::Heed`] if the copied
+/// environment cannot be opened.
+pub fn open_snapshot(
+    path: &Path,
+) -> Result<(LobsterDb, tempfile::TempDir), SnapshotError> {
+    let snapshot_dir = tempfile::tempdir()?;
+    std::fs::copy(path.join("data.mdb"), snapshot_dir.path().join("data.mdb"))?;
+    let db = open(snapshot_dir.path())?;
+    Ok((db, snapshot_dir))
 }
 
 /// Create a temporary database for testing.
@@ -209,6 +250,57 @@ mod tests {
         let rtxn = db2.env.read_txn().expect("read");
         let val = db2.metadata.get(&rtxn, "test_key").expect("get");
         assert_eq!(val.unwrap(), b"test_val");
+    }
+
+    #[test]
+    fn test_open_snapshot_reads_committed_data() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Populate and close the writer so data.mdb is flushed.
+        {
+            let db = open(dir.path()).expect("open");
+            let mut wtxn = db.env.write_txn().expect("write");
+            db.metadata
+                .put(&mut wtxn, "schema_version", b"1")
+                .expect("put");
+            wtxn.commit().expect("commit");
+        }
+
+        let (ro, _guard) = open_snapshot(dir.path()).expect("snapshot");
+        let rtxn = ro.env.read_txn().expect("read");
+        let val = ro.metadata.get(&rtxn, "schema_version").expect("get");
+        assert_eq!(val, Some(b"1".as_slice()));
+    }
+
+    #[test]
+    fn test_open_snapshot_missing_store_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Never initialized — data.mdb does not exist.
+        let result = open_snapshot(dir.path());
+        assert!(result.is_err(), "snapshot of uninitialized dir must fail");
+    }
+
+    #[test]
+    fn test_open_snapshot_coexists_with_live_writer() {
+        // Exercises the fix for `lobster status` lock contention:
+        // opening a snapshot while a writer is attached to the live
+        // store must succeed, because the snapshot lives at a
+        // separate path.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let writer = open(dir.path()).expect("writer");
+
+        // Commit something so the snapshot has visible data.
+        {
+            let mut wtxn = writer.env.write_txn().expect("write");
+            writer.metadata.put(&mut wtxn, "k", b"v").expect("put");
+            wtxn.commit().expect("commit");
+        }
+
+        let (ro, _guard) = open_snapshot(dir.path())
+            .expect("snapshot while writer is attached");
+        let rtxn = ro.env.read_txn().expect("read");
+        let val = ro.metadata.get(&rtxn, "k").expect("get");
+        assert_eq!(val, Some(b"v".as_slice()));
     }
 
     #[test]
